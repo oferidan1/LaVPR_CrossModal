@@ -27,7 +27,7 @@ def parse_arguments():
     parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
     parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")    
     parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
-    parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")    
+    parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
     parser.add_argument("--is_trainable_text_encoder", type=int, default="1", help="train text encoder or not")
     parser.add_argument("--batch_size", type=int, default="10", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
