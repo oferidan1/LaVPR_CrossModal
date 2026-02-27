@@ -39,7 +39,6 @@ class LaVPR(pl.LightningModule):
                 model_name='Salesforce/blip-itm-base-coco',
                 embeds_dim=256,
                 is_freeze_text=True,
-                fusion_type='none',
                 is_trainable_text_encoder=True,
                 cross_modal=0,
                 lora_all_linear=False,
@@ -75,10 +74,11 @@ class LaVPR(pl.LightningModule):
         self.miner = utils.get_miner(miner_name, miner_margin)
         self.batch_acc = [] # we will keep track of the % of trivial pairs/triplets at the loss level 
        
-        self.my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')        
+        self.my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')                
         
-        self.fusion_type = fusion_type
         self.embeds_dim = embeds_dim        
+        self.is_trainable_text_encoder = is_trainable_text_encoder
+        
 
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -111,7 +111,7 @@ class LaVPR(pl.LightningModule):
         
         # Define LoRA configuration
         # TaskType.FEATURE_EXTRACTION is appropriate for sentence embedding tasks            
-        if is_trainable_text_encoder:                
+        if self.is_trainable_text_encoder:                
             lora_targets = lora_target_modules
             if lora_all_linear:
                 lora_targets = "all-linear"                    

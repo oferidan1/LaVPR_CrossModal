@@ -42,8 +42,8 @@ def get_matching_probs(S, dustbin_score = 1.0, num_iters=3, reg=1.0):
     # prepare normalized source and target log-weights
     norm = -torch.tensor(math.log(n + m), device=S.device)
     log_a, log_b = norm.expand(m + 1).contiguous(), norm.expand(n).contiguous()
-    if m > n:
-        log_a[-1] = log_a[-1] + math.log(m-n)
+    if n > m:
+        log_a[-1] = log_a[-1] + math.log(n-m)
     log_a, log_b = log_a.expand(batch_size, -1), log_b.expand(batch_size, -1)
     log_P = log_otp_solver(
         log_a,
@@ -124,17 +124,19 @@ class SALAD(nn.Module):
         p = self.score(fi).flatten(2)
         t = self.token_features(t_global)
 
+        # Transpose to [B, num_clusters, num_tokens] for Sinkhorn with row dustbin
+        p = p.transpose(1, 2)
+
         # Sinkhorn algorithm
         p = get_matching_probs(p, self.dust_bin, 3)
         p = torch.exp(p)
         # Normalize to maintain mass
         p = p[:, :-1, :]
 
-        # p has shape [B, num_tokens, num_clusters]
+        # p has shape [B, num_clusters, num_tokens]
         # f has shape [B, num_tokens, cluster_dim]
-        # We want to compute sum over tokens of p_ij * f_i for each cluster j
-        # This is a batch matrix multiplication
-        aggregated_features = torch.bmm(p.transpose(1, 2), f) # [B, num_clusters, cluster_dim]
+        # We want to compute sum over tokens of p_ji * f_i for each cluster j
+        aggregated_features = torch.bmm(p, f) # [B, num_clusters, cluster_dim]
 
         f_out = torch.cat([
             nn.functional.normalize(t, p=2, dim=-1),
