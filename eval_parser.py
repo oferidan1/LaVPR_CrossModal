@@ -89,7 +89,7 @@ def parse_arguments():
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--is_encode_image", type=int, default="1", help="encode image or not")
     parser.add_argument("--is_encode_text", type=int, default="1", help="encode text or not")    
-    parser.add_argument("--embeds_dim", type=int, default="768", help="embeds dimension")    
+    parser.add_argument("--embeds_dim", type=int, default="256", help="embeds dimension")    
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model")        
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
 

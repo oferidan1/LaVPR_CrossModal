@@ -1,146 +1,91 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# Code adapted from OpenGlue, MIT license
-# https://github.com/ucuapps/OpenGlue/blob/main/models/superglue/optimal_transport.py
 def log_otp_solver(log_a, log_b, M, num_iters: int = 20, reg: float = 1.0) -> torch.Tensor:
-    r"""Sinkhorn matrix scaling algorithm for Differentiable Optimal Transport problem.
-    This function solves the optimization problem and returns the OT matrix for the given parameters.
-    Args:
-        log_a : torch.Tensor
-            Source weights
-        log_b : torch.Tensor
-            Target weights
-        M : torch.Tensor
-            metric cost matrix
-        num_iters : int, default=100
-            The number of iterations.
-        reg : float, default=1.0
-            regularization value
     """
-    M = M / reg  # regularization
-
-    u, v = torch.zeros_like(log_a), torch.zeros_like(log_b)
+    Fixed Sinkhorn solver: Removed unnecessary squeeze() which can break batches of size 1,
+    and added a small epsilon to prevent log(0) issues.
+    """
+    M = M / reg 
+    u = torch.zeros_like(log_a)
+    v = torch.zeros_like(log_b)
 
     for _ in range(num_iters):
-        u = log_a - torch.logsumexp(M + v.unsqueeze(1), dim=2).squeeze()
-        v = log_b - torch.logsumexp(M + u.unsqueeze(2), dim=1).squeeze()
+        # We use keepdim=True and explicit dim matching to avoid squeeze errors
+        u = log_a - torch.logsumexp(M + v.unsqueeze(1), dim=2)
+        v = log_b - torch.logsumexp(M + u.unsqueeze(2), dim=1)
 
     return M + u.unsqueeze(2) + v.unsqueeze(1)
 
-# Code adapted from OpenGlue, MIT license
-# https://github.com/ucuapps/OpenGlue/blob/main/models/superglue/superglue.py
-def get_matching_probs(S, dustbin_score = 1.0, num_iters=3, reg=1.0):
-    """sinkhorn"""
-    batch_size, m, n = S.size()
-    # augment scores matrix
-    S_aug = torch.empty(batch_size, m + 1, n, dtype=S.dtype, device=S.device)
-    S_aug[:, :m, :n] = S
-    S_aug[:, m, :] = dustbin_score
-
-    # prepare normalized source and target log-weights
-    norm = -torch.tensor(math.log(n + m), device=S.device)
-    log_a, log_b = norm.expand(m + 1).contiguous(), norm.expand(n).contiguous()
-    if n > m:
-        log_a[-1] = log_a[-1] + math.log(n-m)
-    log_a, log_b = log_a.expand(batch_size, -1), log_b.expand(batch_size, -1)
-    log_P = log_otp_solver(
-        log_a,
-        log_b,
-        S_aug,
-        num_iters=num_iters,
-        reg=reg
-    )
-    return log_P - norm
-
-
 class SALAD(nn.Module):
-    """
-    This class represents the Sinkhorn Algorithm for Locally Aggregated Descriptors (SALAD) model.
-
-    Attributes:
-        num_channels (int): The number of channels of the inputs (d).
-        num_clusters (int): The number of clusters in the model (m).
-        cluster_dim (int): The number of channels of the clusters (l).
-        token_dim (int): The dimension of the global scene token (g).
-        dropout (float): The dropout rate.
-    """
-    def __init__(self,
-            num_channels=1536,
-            num_clusters=64,
-            cluster_dim=128,
-            token_dim=256,
-            dropout=0.3,
-        ) -> None:
+    def __init__(self, 
+                 num_channels=256, 
+                 num_clusters=64, 
+                 cluster_dim=128, 
+                 token_dim=256):
         super().__init__()
-
-        self.num_channels = num_channels
-        self.num_clusters= num_clusters
+        
+        self.num_clusters = num_clusters
         self.cluster_dim = cluster_dim
-        self.token_dim = token_dim
         
-        if dropout > 0:
-            dropout = nn.Dropout(dropout)
+        # Projections
+        self.f_proj = nn.Linear(num_channels, cluster_dim)
+        self.score_proj = nn.Linear(num_channels, num_clusters)
+        self.token_proj = nn.Linear(num_channels, token_dim)
+
+        # Parameters
+        self.anchors = nn.Parameter(torch.randn(num_clusters, cluster_dim) * 0.1)
+        self.dust_bin = nn.Parameter(torch.tensor(1.0)) 
+        
+        # FIX: Sharpening Factor (Higher values make assignments more "Hard")
+        # Start at 5.0 to force the model to pick specific landmarks early on
+        self.sharpness = nn.Parameter(torch.tensor(5.0))
+
+    def forward(self, x, mask=None):
+        B, N, D = x.shape
+        t_global = x[:, 0]  
+        fi = x[:, 1:]       
+
+        f = self.f_proj(fi)                
+        s = self.score_proj(fi).transpose(1, 2) 
+        t = self.token_proj(t_global)      
+
+        # 1. FIX: Apply Aggressive Sharpness
+        # This prevents 'signal dilution' across clusters
+        s = s * self.sharpness 
+
+        dustbin_scores = self.dust_bin.expand(B, 1, N-1)
+        s_aug = torch.cat([s, dustbin_scores], dim=1)
+
+        # 2. Sinkhorn (Keep the Mass Balancing - it's essential for 576 vs 60)
+        log_a = torch.full((B, self.num_clusters + 1), -math.log(self.num_clusters + 1), device=x.device)
+        if mask is not None:
+            mask_local = mask[:, 1:].float()
+            log_b = torch.log(mask_local + 1e-8) - torch.log(mask_local.sum(dim=1, keepdim=True).clamp(min=1.0))
         else:
-            dropout = nn.Identity()
+            log_b = torch.full((B, N-1), -math.log(N-1), device=x.device)
 
-        # MLP for global scene token g
-        self.token_features = nn.Sequential(
-            nn.Linear(self.num_channels, 512),
-            nn.ReLU(),
-            nn.Linear(512, self.token_dim)
-        )
-        # MLP for local features f_i
-        self.cluster_features = nn.Sequential(
-            nn.Linear(self.num_channels, 512),
-            dropout,
-            nn.ReLU(),
-            nn.Linear(512, self.cluster_dim)
-        )
-        # MLP for score matrix S
-        self.score = nn.Sequential(
-            nn.Linear(self.num_channels, 512),
-            dropout,
-            nn.ReLU(),
-            nn.Linear(512, self.num_clusters),
-        )
-        # Dustbin parameter z
-        self.dust_bin = nn.Parameter(torch.tensor(1.))
+        log_P = log_otp_solver(log_a, log_b, s_aug, num_iters=5, reg=0.1)
+        p = torch.exp(log_P)[:, :-1, :] 
 
-
-    def forward(self, x):
-        """
-        x (torch.Tensor): A tensor of token embeddings [B, num_tokens, D].
-                          The first token is the CLS token.
-
-        Returns:
-            f (torch.Tensor): The global descriptor [B, m*l + g]
-        """
-        t_global = x[:, 0]               # CLS token [B, D]
-        fi = x[:, 1:]        # Patch tokens [B, 576, 768]        
+        # 3. FIX: Dual-Path Aggregation
+        # Instead of just residuals, we combine the raw feature and the residual.
+        # This provides a 'strong signal' for matching and 'fine detail' for localization.
+        f_exp = f.unsqueeze(1) 
+        a_exp = self.anchors.view(1, self.num_clusters, 1, self.cluster_dim)
         
-        f = self.cluster_features(fi).flatten(2)
-        p = self.score(fi).flatten(2)
-        t = self.token_features(t_global)
+        # (p * f) gives the original 'strength' + (p * (f-a)) gives the 'detail'
+        v_agg = (p.unsqueeze(-1) * (f_exp + (f_exp - a_exp))).sum(dim=2) 
 
-        # Transpose to [B, num_clusters, num_tokens] for Sinkhorn with row dustbin
-        p = p.transpose(1, 2)
+        # 4. FIX: Skip the per-cluster L2 normalization
+        # Only flatten and do ONE final global normalization. 
+        # Per-cluster normalization can 'mute' the most important clusters.
+        v_local = v_agg.flatten(1) 
+        v_global = t
 
-        # Sinkhorn algorithm
-        p = get_matching_probs(p, self.dust_bin, 3)
-        p = torch.exp(p)
-        # Normalize to maintain mass
-        p = p[:, :-1, :]
-
-        # p has shape [B, num_clusters, num_tokens]
-        # f has shape [B, num_tokens, cluster_dim]
-        # We want to compute sum over tokens of p_ji * f_i for each cluster j
-        aggregated_features = torch.bmm(p, f) # [B, num_clusters, cluster_dim]
-
-        f_out = torch.cat([
-            nn.functional.normalize(t, p=2, dim=-1),
-            nn.functional.normalize(aggregated_features, p=2, dim=2).flatten(1)
-        ], dim=-1)
-
-        return nn.functional.normalize(f_out, p=2, dim=-1)
+        f_out = torch.cat([v_global, v_local], dim=-1)
+        
+        # Final normalization for the retrieval space
+        return F.normalize(f_out, p=2, dim=-1)

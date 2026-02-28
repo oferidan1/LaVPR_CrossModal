@@ -153,6 +153,7 @@ class LaVPR(pl.LightningModule):
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
             
         img_embeds = self.agg(img_embeds)
+        attention_mask = None        
 
         if 'blip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True)
@@ -172,7 +173,7 @@ class LaVPR(pl.LightningModule):
             text_embeds = self.text_encoder.encode_text(text_tokens)    
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)       
             
-        text_embeds = self.agg(text_embeds)
+        text_embeds = self.agg(text_embeds, attention_mask)
 
         return img_embeds, text_embeds, 
     
