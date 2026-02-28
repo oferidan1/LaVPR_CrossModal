@@ -10,7 +10,8 @@ from model.blip_model import BlipForImageTextRetrievalWrapper
 from transformers import BlipProcessor, BlipModel
 from transformers import AutoModel, AutoProcessor
 import open_clip
-from model.salad import SALAD
+from model.salad import SALAD, CosineSALAD
+from model.saladv1 import SALADv1
 
 class LaVPR(pl.LightningModule):
     """This is the main model for Visual Place Recognition
@@ -44,6 +45,7 @@ class LaVPR(pl.LightningModule):
                 lora_all_linear=False,
                 lora_target_modules=None,
                 lora_r=64,                
+                agg_type=1,
                  ):
         super().__init__()       
         
@@ -78,14 +80,20 @@ class LaVPR(pl.LightningModule):
         
         self.embeds_dim = embeds_dim        
         self.is_trainable_text_encoder = is_trainable_text_encoder
-        
+        self.agg_type = agg_type        
 
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
             self.contrastive_loss = utils.losses.contrastive_loss_cross_modal
             self.miner = None                            
         
-        self.agg = SALAD(num_channels=embeds_dim)
+        if agg_type == 0:
+            self.agg = SALAD(num_channels=embeds_dim)
+        elif agg_type == 1:
+            self.agg = CosineSALAD(num_channels=embeds_dim)
+        elif agg_type == 2:
+            self.text_agg = CosineSALAD(num_channels=embeds_dim)
+            self.img_agg = CosineSALAD(num_channels=embeds_dim)
                 
         # init weight of linear layers but not the pretrained backbones
         self.apply(self._init_weights)
@@ -152,7 +160,11 @@ class LaVPR(pl.LightningModule):
             img_embeds = self.text_encoder.encode_image(img)
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
             
-        img_embeds = self.agg(img_embeds)
+        if self.agg_type == 2:
+            img_embeds = self.img_agg(img_embeds)
+        else:
+            img_embeds = self.agg(img_embeds)
+        
         attention_mask = None        
 
         if 'blip' in self.model_name:
@@ -171,9 +183,12 @@ class LaVPR(pl.LightningModule):
         elif 'eva' in self.model_name:
             text_tokens = self.tokenizer(text).to(self.device)            
             text_embeds = self.text_encoder.encode_text(text_tokens)    
-            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)       
-            
-        text_embeds = self.agg(text_embeds, attention_mask)
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)                   
+        
+        if self.agg_type == 2:
+            text_embeds = self.text_agg(text_embeds, attention_mask)
+        else:
+            text_embeds = self.agg(text_embeds, attention_mask)
 
         return img_embeds, text_embeds, 
     

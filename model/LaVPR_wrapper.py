@@ -45,7 +45,8 @@ class LaVPR_wrapper():
                 embeds_dim=args.embeds_dim,           
                 lora_all_linear=args.lora_all_linear,
                 lora_target_modules=args.lora_target_modules,
-                lora_r=args.lora_r,                              
+                lora_r=args.lora_r,                  
+                agg_type=args.agg_type,            
             )
 
             if args.lora_path is not None:
