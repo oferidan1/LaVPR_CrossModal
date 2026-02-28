@@ -11,7 +11,7 @@ from transformers import BlipProcessor, BlipModel
 from transformers import AutoModel, AutoProcessor
 import open_clip
 from model.salad import SALAD, CosineSALAD
-from model.saladv1 import SALADv1
+#from model.saladv1 import SALADv1
 
 class LaVPR(pl.LightningModule):
     """This is the main model for Visual Place Recognition
