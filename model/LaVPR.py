@@ -11,7 +11,7 @@ from transformers import BlipProcessor, BlipModel
 from transformers import AutoModel, AutoProcessor
 import open_clip
 from model.salad import SALAD, CosineSALAD
-#from model.saladv1 import SALADv1
+from model.local_ot_loss import LocalOTLoss
 
 class LaVPR(pl.LightningModule):
     """This is the main model for Visual Place Recognition
@@ -45,7 +45,7 @@ class LaVPR(pl.LightningModule):
                 lora_all_linear=False,
                 lora_target_modules=None,
                 lora_r=64,                
-                agg_type=1,
+                agg_type=0,
                  ):
         super().__init__()       
         
@@ -73,6 +73,7 @@ class LaVPR(pl.LightningModule):
         self.save_hyperparameters() # write hyperparams into a file
         
         self.loss_fn = utils.get_loss(loss_name)
+        self.local_ot_loss = LocalOTLoss()
         self.miner = utils.get_miner(miner_name, miner_margin)
         self.batch_acc = [] # we will keep track of the % of trivial pairs/triplets at the loss level 
        
@@ -87,11 +88,11 @@ class LaVPR(pl.LightningModule):
             self.contrastive_loss = utils.losses.contrastive_loss_cross_modal
             self.miner = None                            
         
-        if agg_type == 0:
+        if agg_type == 1:
             self.agg = SALAD(num_channels=embeds_dim)
-        elif agg_type == 1:
-            self.agg = CosineSALAD(num_channels=embeds_dim)
         elif agg_type == 2:
+            self.agg = CosineSALAD(num_channels=embeds_dim)
+        elif agg_type == 3:
             self.text_agg = CosineSALAD(num_channels=embeds_dim)
             self.img_agg = CosineSALAD(num_channels=embeds_dim)
                 
@@ -153,17 +154,19 @@ class LaVPR(pl.LightningModule):
         text_embeds = None
 
         if 'blip' in self.model_name:
-            img_embeds = self.text_encoder.encode_image(img)            
+            img_local = self.text_encoder.encode_image(img)            
+            img_embeds = img_local[:,0]
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
             img_embeds = self.text_encoder.get_image_features(pixel_values=img)
         elif 'eva' in self.model_name:            
             img_embeds = self.text_encoder.encode_image(img)
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
             
-        if self.agg_type == 2:
-            img_embeds = self.img_agg(img_embeds)
-        else:
-            img_embeds = self.agg(img_embeds)
+        if self.agg_type:
+            if self.agg_type == 3:
+                img_embeds = self.img_agg(img_local)
+            else:
+                img_embeds = self.agg(img_local)
         
         attention_mask = None        
 
@@ -171,8 +174,8 @@ class LaVPR(pl.LightningModule):
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True)
             text_tokens = text_inputs.input_ids.to(img.device)
             attention_mask = text_inputs['attention_mask'].to(img.device)                
-            text_embeds = self.text_encoder.encode_text(input_ids=text_tokens, attention_mask=attention_mask)    
-            #text_embeds= text_embeds[:, 0]        
+            text_local = self.text_encoder.encode_text(input_ids=text_tokens, attention_mask=attention_mask)    
+            text_embeds= text_local[:, 0]        
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
             text_tokens = text_inputs.input_ids.to(img.device)
@@ -185,12 +188,13 @@ class LaVPR(pl.LightningModule):
             text_embeds = self.text_encoder.encode_text(text_tokens)    
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)                   
         
-        if self.agg_type == 2:
-            text_embeds = self.text_agg(text_embeds, attention_mask)
-        else:
-            text_embeds = self.agg(text_embeds, attention_mask)
+        if self.agg_type:
+            if self.agg_type == 3:
+                text_embeds = self.text_agg(text_local, attention_mask)
+            else:
+                text_embeds = self.agg(text_local, attention_mask)
 
-        return img_embeds, text_embeds, 
+        return img_embeds, text_embeds, img_local, text_local, attention_mask
     
     
     # configure the optimizer 
@@ -231,13 +235,15 @@ class LaVPR(pl.LightningModule):
 
             
     #  The loss function call (this method will be called at each training iteration)
-    def loss_function(self, descriptors, labels, text_embeds):
+    def loss_function(self, descriptors, labels, text_embeds, img_local=None, text_local=None, text_mask=None):
         
         # we mine the pairs/triplets if there is an online mining strategy
         if self.miner is not None:                        
             ref_labels = labels.clone()
             miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
-            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)            
+            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)              
+            loss_ot = self.local_ot_loss(img_local, text_local, t_mask=text_mask)
+            loss = loss + 0.3*loss_ot
 
             # calculate the % of trivial pairs/triplets
             # which do not contribute in the loss value
@@ -286,8 +292,8 @@ class LaVPR(pl.LightningModule):
                 flat_texts.append(texts[j][i])
 
         # Feed forward the batch to the model
-        descriptors, text_embeds = self(images, flat_texts) # Here we are calling the method forward that we defined above
-        loss = self.loss_function(descriptors, labels, text_embeds) # Call the loss_function we defined above
+        descriptors, text_embeds, img_local, text_local, text_mask = self(images, flat_texts) # Here we are calling the method forward that we defined above
+        loss = self.loss_function(descriptors, labels, text_embeds, img_local, text_local, text_mask) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
         
@@ -306,7 +312,7 @@ class LaVPR(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         places, _, texts = batch
         # calculate descriptors
-        descriptors, text_embeds = self(places, texts)
+        descriptors, text_embeds, _, _, _ = self(places, texts)
         #return descriptors.detach().cpu()
         descriptors = descriptors.detach().cpu()        
         text_embeds_cpu = text_embeds.detach().cpu()        
@@ -529,4 +535,3 @@ class MeanReweightingPooler(nn.Module):
             return pooled, weights  # return per-token weights
         return pooled   
     
-
