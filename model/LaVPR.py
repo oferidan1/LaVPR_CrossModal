@@ -46,6 +46,7 @@ class LaVPR(pl.LightningModule):
                 lora_target_modules=None,
                 lora_r=64,                
                 agg_type=0,
+                ot_loss=0.0,
                  ):
         super().__init__()       
         
@@ -82,6 +83,7 @@ class LaVPR(pl.LightningModule):
         self.embeds_dim = embeds_dim        
         self.is_trainable_text_encoder = is_trainable_text_encoder
         self.agg_type = agg_type        
+        self.ot_loss = ot_loss
 
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -152,6 +154,8 @@ class LaVPR(pl.LightningModule):
     # the forward pass of the lightning model
     def forward(self, img, text):
         text_embeds = None
+        img_local = None
+        text_local = None
 
         if 'blip' in self.model_name:
             img_local = self.text_encoder.encode_image(img)            
@@ -162,12 +166,6 @@ class LaVPR(pl.LightningModule):
             img_embeds = self.text_encoder.encode_image(img)
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
             
-        if self.agg_type:
-            if self.agg_type == 3:
-                img_embeds = self.img_agg(img_local)
-            else:
-                img_embeds = self.agg(img_local)
-        
         attention_mask = None        
 
         if 'blip' in self.model_name:
@@ -188,13 +186,27 @@ class LaVPR(pl.LightningModule):
             text_embeds = self.text_encoder.encode_text(text_tokens)    
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)                   
         
+        # Compute L-OT weights and loss if both modalities are present (Training)
+        ot_loss = 0.0
+        w_v, w_t = None, None
+        
+        if img_local is not None and text_local is not None:
+            t_mask = None
+            if attention_mask is not None:
+                t_mask = attention_mask[:, 1:]
+            
+            # Calculate L-OT weights and loss
+            ot_loss, w_v, w_t = self.local_ot_loss(img_local[:, 1:], text_local[:, 1:], t_mask=t_mask)
+
         if self.agg_type:
             if self.agg_type == 3:
-                text_embeds = self.text_agg(text_local, attention_mask)
+                img_embeds = self.img_agg(img_local, token_weights=w_v)
+                text_embeds = self.text_agg(text_local, attention_mask, token_weights=w_t)
             else:
-                text_embeds = self.agg(text_local, attention_mask)
+                img_embeds = self.agg(img_local, token_weights=w_v)
+                text_embeds = self.agg(text_local, attention_mask, token_weights=w_t)
 
-        return img_embeds, text_embeds, img_local, text_local, attention_mask
+        return img_embeds, text_embeds, img_local, text_local, attention_mask, ot_loss
     
     
     # configure the optimizer 
@@ -235,15 +247,14 @@ class LaVPR(pl.LightningModule):
 
             
     #  The loss function call (this method will be called at each training iteration)
-    def loss_function(self, descriptors, labels, text_embeds, img_local=None, text_local=None, text_mask=None):
+    def loss_function(self, descriptors, labels, text_embeds, ot_loss=0.0):
         
         # we mine the pairs/triplets if there is an online mining strategy
         if self.miner is not None:                        
             ref_labels = labels.clone()
             miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
             loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)              
-            loss_ot = self.local_ot_loss(img_local, text_local, t_mask=text_mask)
-            loss = loss + 0.3*loss_ot
+            loss = loss + self.ot_loss * ot_loss
 
             # calculate the % of trivial pairs/triplets
             # which do not contribute in the loss value
@@ -292,8 +303,8 @@ class LaVPR(pl.LightningModule):
                 flat_texts.append(texts[j][i])
 
         # Feed forward the batch to the model
-        descriptors, text_embeds, img_local, text_local, text_mask = self(images, flat_texts) # Here we are calling the method forward that we defined above
-        loss = self.loss_function(descriptors, labels, text_embeds, img_local, text_local, text_mask) # Call the loss_function we defined above
+        descriptors, text_embeds, _, _, _, ot_loss = self(images, flat_texts) # Here we are calling the method forward that we defined above
+        loss = self.loss_function(descriptors, labels, text_embeds, ot_loss) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
         
@@ -312,7 +323,7 @@ class LaVPR(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         places, _, texts = batch
         # calculate descriptors
-        descriptors, text_embeds, _, _, _ = self(places, texts)
+        descriptors, text_embeds, _, _, _, _ = self(places, texts)
         #return descriptors.detach().cpu()
         descriptors = descriptors.detach().cpu()        
         text_embeds_cpu = text_embeds.detach().cpu()        

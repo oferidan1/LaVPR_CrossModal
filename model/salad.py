@@ -43,7 +43,7 @@ class SALAD(nn.Module):
         # Start at 5.0 to force the model to pick specific landmarks early on
         self.sharpness = nn.Parameter(torch.tensor(5.0))
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, token_weights=None):
         B, N, D = x.shape
         t_global = x[:, 0]  
         fi = x[:, 1:]       
@@ -60,19 +60,14 @@ class SALAD(nn.Module):
         s_aug = torch.cat([s, dustbin_scores], dim=1)
 
         # 2. Sinkhorn (Keep the Mass Balancing - it's essential for 576 vs 60)
-        n_tokens = N - 1
-        n_clusters = self.num_clusters
-
-        if mask is not None:
+        log_a = torch.full((B, self.num_clusters + 1), -math.log(self.num_clusters + 1), device=x.device)
+        if token_weights is not None:
+            log_b = torch.log(token_weights + 1e-9)
+        elif mask is not None:
             mask_local = mask[:, 1:].float()
             log_b = torch.log(mask_local + 1e-8) - torch.log(mask_local.sum(dim=1, keepdim=True).clamp(min=1.0))
         else:
-            log_b = torch.full((B, n_tokens), -math.log(n_tokens), device=x.device)
-
-        log_a = torch.full((B, n_clusters + 1), -math.log(n_clusters + 1), device=x.device)
-        if n_tokens > n_clusters:
-            log_a[:, :-1] = -math.log(n_tokens)
-            log_a[:, -1] = math.log(n_tokens - n_clusters) - math.log(n_tokens)
+            log_b = torch.full((B, N-1), -math.log(N-1), device=x.device)
 
         log_P = log_otp_solver(log_a, log_b, s_aug, num_iters=5, reg=0.1)
         p = torch.exp(log_P)[:, :-1, :] 
@@ -129,7 +124,7 @@ class CosineSALAD(nn.Module):
         self.temperature = nn.Parameter(torch.tensor(5.0))
         self.reg = 0.1 
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, token_weights=None):
         B, N, D = x.shape
         x = self.ln(x) # Stabilize input
         
@@ -158,20 +153,15 @@ class CosineSALAD(nn.Module):
         s_aug = torch.cat([s, dustbin_scores], dim=1)
 
         # 4. Sinkhorn Mass Balancing
-        n_tokens = N - 1
-        n_clusters = self.num_clusters
-
-        if mask is not None:
+        log_a = torch.full((B, self.num_clusters + 1), -math.log(self.num_clusters + 1), device=x.device)
+        if token_weights is not None:
+            log_b = torch.log(token_weights + 1e-9)
+        elif mask is not None:
             mask_local = mask[:, 1:].float()
             num_v = mask_local.sum(dim=1, keepdim=True).clamp(min=1.0)
             log_b = torch.log(mask_local + 1e-8) - torch.log(num_v)
         else:
-            log_b = torch.full((B, n_tokens), -math.log(n_tokens), device=x.device)
-
-        log_a = torch.full((B, n_clusters + 1), -math.log(n_clusters + 1), device=x.device)
-        if n_tokens > n_clusters:
-            log_a[:, :-1] = -math.log(n_tokens)
-            log_a[:, -1] = math.log(n_tokens - n_clusters) - math.log(n_tokens)
+            log_b = torch.full((B, N-1), -math.log(N-1), device=x.device)
 
         log_P = log_otp_solver(log_a, log_b, s_aug, num_iters=5, reg=self.reg)
         p = torch.exp(log_P)[:, :-1, :] # [B, K, N-1]

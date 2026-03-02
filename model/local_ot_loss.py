@@ -3,15 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LocalOTLoss(nn.Module):
-    def __init__(self, epsilon=0.1, iterations=5, gamma=0.1):
+    def __init__(self, epsilon=0.1, iterations=5, gamma=0.1, tau=0.005):
         """
         gamma: Rejection cost. Low gamma = model easily 'gives up' on matching.
         epsilon: Entropy reg. Smaller = sparser, more 1-to-1 matching.
+        tau: Confidence threshold for filtering the transport plan.
         """
         super().__init__()
         self.epsilon = epsilon
         self.iterations = iterations
-        self.gamma = nn.Parameter(torch.tensor(gamma)) # Learnable rejection cost
+        self.tau = tau
+        self.register_buffer('gamma', torch.tensor(gamma)) # Fixed rejection cost
 
     def forward(self, v, t, v_mask=None, t_mask=None):
         batch_size, n_v, dim = v.shape
@@ -42,6 +44,11 @@ class LocalOTLoss(nn.Module):
         # Bottom-right corner (dustbin-to-dustbin) can be set to gamma or 0
         dust_row = gamma.view(1, 1, 1).expand(batch_size, 1, n_t + 1)
         A_aug = torch.cat([A_aug, dust_row], dim=1) # [B, Nv+1, Nt+1]
+
+        # Construct A_aug_raw for loss computation (using unmasked A_raw)
+        # This avoids numerical issues with -1e6 in the loss
+        A_aug_raw = torch.cat([A_raw, dust_col], dim=2)
+        A_aug_raw = torch.cat([A_aug_raw, dust_row], dim=1)
 
         # 4. Marginal Distributions (Mass)
         # mu: Distribution over visual tokens + 1 dustbin
@@ -77,8 +84,22 @@ class LocalOTLoss(nn.Module):
         T_star = torch.exp(log_T)
 
         # 7. Loss: Minimize Transport Cost (1 - Similarity)
-        # This ensures the loss is positive and minimizes the distance between matched tokens.
-        T_real = T_star[:, :n_v, :n_t]
-        loss = torch.sum(T_real * (1.0 - A_raw), dim=(1, 2))
+        # We sum over the WHOLE matrix (including dustbins) to prevent T_real -> 0 collapse.
+        # Cost for dustbin is (1 - gamma). Model prefers T_real only if A > gamma.
+        loss = torch.sum(T_star * (1.0 - A_aug_raw), dim=(1, 2))
 
-        return loss.mean()
+        T_real = T_star[:, :n_v, :n_t]
+
+        # 8. Compute Saliency Weights for Aggregation
+        # T_hat = ReLU(T* - tau)
+        T_hat = F.relu(T_real - self.tau)
+        
+        delta = 1e-9
+        # w_v = (sum_j T_hat_ij + delta) / sum_k (sum_j T_hat_kj + delta)
+        w_v_num = T_hat.sum(dim=2) + delta
+        w_v = w_v_num / w_v_num.sum(dim=1, keepdim=True)
+
+        w_t_num = T_hat.sum(dim=1) + delta
+        w_t = w_t_num / w_t_num.sum(dim=1, keepdim=True)
+
+        return loss.mean(), w_v, w_t
