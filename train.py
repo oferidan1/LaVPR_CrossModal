@@ -38,7 +38,7 @@ def parse_arguments():
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
     parser.add_argument("--agg_type", type=int, default="2", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
-    parser.add_argument("--ot_loss", type=float, default="0.2", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
+    parser.add_argument("--ot_loss", type=float, default="0.1", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
     
     args = parser.parse_args()
     
