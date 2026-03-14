@@ -1,5 +1,4 @@
-from time import time
-
+import time
 from matplotlib import colors
 import pandas as pd
 import os
