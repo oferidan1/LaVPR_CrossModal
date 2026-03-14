@@ -214,39 +214,48 @@ def augment_text_change_colors_description(description):
 
     return COLOR_PATTERN.sub(get_new_color, description)
 
-import numpy as np
 
 def generate_positive_viewpoint_description(base_text):    
+    # Expanded viewpoint list for higher dataset diversity
     view_change_list = [
-        "top-down", "ground-up", "distant", "close-up", 
-        "aerial oblique", "wide-angle", "street-level"
+        "top-down (nadir)", "ground-up (worm's-eye)", "distant (telephoto)", 
+        "close-up (macro)", "aerial oblique (45-degree)", "wide-angle (panoramic)", 
+        "street-level (eye-level)"
     ]
     
-    # Adding scenarios for the "Atmospheric" changes we discussed
-    scenarios = ["Golden Hour", "Blue Hour", "Overcast/Rainy", "Harsh Midday Sun"]
+    # Scenarios to simulate domain gaps (weather/lighting)
+    scenarios = [
+        "Golden Hour (warm, low-angle sun)", 
+        "Blue Hour (deep indigo twilight)", 
+        "Overcast/Rainy (flat light, muted tones)", 
+        "Harsh Midday Sun (high contrast, sharp shadows)"
+    ]
     
     viewpoint = np.random.choice(view_change_list)
-    scenario = np.random.choice(scenarios)
+    scenario = np.random.choice(scenarios)    
   
-    # Optimized Prompt for Llama-3.3-70B
+    # The "Scene Reconstructor" Prompt for Llama-3.3-70B
     prompt = f"""
     ### Task: Standalone Scene Reconstruction
-    You are a spatial reasoning engine. Reconstruct the following location from a {viewpoint} perspective during {scenario} conditions.
+    You are a spatial reasoning engine for a VPR dataset. Reconstruct the following location from a {viewpoint} perspective during {scenario} conditions.
     
-    ### Constraints:
-    1. **Reverse Order**: Identify all objects in the Source Data. You MUST describe them in the EXACT REVERSE order of their appearance in the source.
-    2. **Zero Transitions**: Do NOT use words like "now," "appears," "reveals," or "becomes."
-    3. **Physics-Based**: Describe shapes and colors as they physically look from {viewpoint}. Apply {scenario} lighting to all textures.
+    ### Hard Constraints:
+    1. **Linguistic Diversity**: Do NOT reuse more than 3 consecutive words from the Source Data. Paraphrase everything.
+    2. **Zero Transitions**: This is a standalone observation. Do NOT use "now," "appears," "reveals," "becomes," or "from this view."
+    3. **Geometric Translation**: Translate objects into shapes appropriate for the {viewpoint}. 
+       - If Top-Down: Use terms like "footprints," "polygons," "rectangles," or "roof-plates."
+       - If Ground-Up: Use terms like "monoliths," "soaring walls," or "converging lines."
+    4. **Atmospheric Physics**: Apply {scenario} lighting to all colors and textures (e.g., 'white' becomes 'amber' in Golden Hour).
     
     ### Source Data:
     "{base_text}"
     
     ### Reasoning Step:
-    First, list the objects from the source in reverse order. Then, write the standalone paragraph.
+    Step 1: List the objects from the source in reverse order.
+    Step 2: Describe the physical geometry of each object from the {viewpoint}.
     
     ### Output Format:
-    REVERSED OBJECTS: [list here]
-    DESCRIPTION: [paragraph here]
+    [standalone paragraph here]
     """
     return prompt
 
