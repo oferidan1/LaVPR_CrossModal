@@ -59,8 +59,8 @@ class LaVPR_wrapper():
             self.single_encoder = self.single_encoder.to(args.device)
             self.single_encoder.eval()            
              
-            self.encoder_dim = 8448           
-            #self.encoder_dim = self.embeds_dim
+            #self.encoder_dim = 8448           
+            self.encoder_dim = self.embeds_dim
             
         
     def mean_pooling(self, model_output, attention_mask):

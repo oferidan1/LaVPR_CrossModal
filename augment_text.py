@@ -1,6 +1,7 @@
 from matplotlib import colors
 import pandas as pd
 import os
+import re
 import numpy as np
 from numpy import nan
 
@@ -153,40 +154,91 @@ def build_context(new_paragraph, max_len):
     ]
     return messages
 
+def augment_text_flip_description(description):
+    # split the description into sentences, and flip the order of the sentences
+    sentences = description.split(',')
+    flipped_description = ','.join(sentences[::-1])
+    return flipped_description
 
-def generate_positive_description(base_text, pos_type):    
-    if pos_type == 1:
-        method = "Reverse Spatial Order: List mentioned objects from last to first"
-    elif pos_type == 2:
-        method = "Dynamic Lighting/Weather: Slightly alter colors and textures to simulate a different time/weather."
-    elif pos_type == 3:
-        method = "Perspective Shift: Describe the scene from a new viewpoint (e.g., top-down, side-view).t"
-    else:
-        method = "Rephrasing the sentence structure"
+# The Complete Master List for VPR Augmentation
+MASTER_COLORS = {
+    "Greyscale": ["black", "charcoal", "onyx", "slate", "gray", "grey", "silver", 
+                "metallic", "lead", "ash", "pewter", "stone", "smoke", "white", 
+                "ivory", "cream", "off-white", "pearl", "alabaster"],
+
+    "Reds": ["red", "crimson", "scarlet", "ruby", "maroon", "burgundy", "brick", 
+            "terracotta", "rust", "sienna", "clay", "rose", "pink", "magenta", "coral"],
+
+    "Blues": ["blue", "navy", "indigo", "cobalt", "azure", "sky-blue", "cyan", 
+              "teal", "turquoise", "aquamarine", "sapphire", "steel-blue"],
+
+    "Greens": ["green", "emerald", "forest-green", "olive", "moss", "sage", 
+              "lime", "pine", "jade", "mint", "seaweed", "khaki"],
+
+    "Yellows": ["yellow", "gold", "golden", "amber", "lemon", "saffron", "mustard", 
+                "orange", "tangerine", "apricot", "peach", "bronze", "copper"],
+
+    "Purples": ["purple", "violet", "lavender", "plum", "amethyst", "orchid", "lilac", "mauve"],
+
+    "Browns": ["brown", "chocolate", "espresso", "tan", "beige", "sand", "ochre", 
+                "tawny", "russet", "mahogany", "walnut", "cedar"]
+}
+
+# Flatten the MASTER_COLORS dictionary to get a list of all colors, sorted by length descending
+ALL_COLORS = sorted([color for color_list in MASTER_COLORS.values() for color in color_list], key=len, reverse=True)
+
+# Pre-compile the regex pattern to match whole words and avoid sequential overwriting bugs
+COLOR_PATTERN = re.compile(r'\b(' + '|'.join(ALL_COLORS) + r')\b', re.IGNORECASE)
+
+def augment_text_change_colors_description(description):
+    def get_new_color(match):
+        original_color = match.group(0)
+        lower_color = original_color.lower()
         
+        # Find which group the original color belongs to
+        color_group = next((group for group in MASTER_COLORS.values() if lower_color in group), None)
+        
+        if not color_group:
+            return original_color
+            
+        new_color = np.random.choice(color_group)
+        while new_color == lower_color:
+            new_color = np.random.choice(color_group)
+            
+        if original_color.isupper():
+            return new_color.upper()
+        elif original_color.istitle():
+            return new_color.capitalize()
+        return new_color
+
+    return COLOR_PATTERN.sub(get_new_color, description)
+
+
+
+def generate_positive_viewpoint_description(base_text):    
+    view_change_list = [
+        "top-down", "side-view", "ground-up", "low-angle", "distant", "close-up", "Interior-Outside", "Outside-Interior", "Wide-angle", "Narrow-angle", "Aerial", "Street-level"
+    ]
+    viewpoint = np.random.choice(view_change_list)
+  
     prompt = f"""
-    Transform the following description into a 'positive' variation by {method}, Output ONLY the augmented description without any introductory text.
+    ### Task: Standalone Scene Reconstruction
+    Create a description of this location from a {viewpoint} perspective.
     
-    Original Text: {base_text}
+    ### Constraints:
+    - Do NOT mention that the view has changed (No "now", "appears", "reveals").
+    - Do NOT mention the original text.
+    - Describe the objects as they physically appear from the {viewpoint}.
     
-    Return only the transformed text.
+    ### Source Data:
+    "{base_text}"
+    
+    ### Output:
+    (Provide only the final paragraph)
     """
     return prompt
 
-def augment_texts_from_csv(csv_file_in, csv_file_out, max_len, batch_size, model_id):    
-    results = []  
-     # parse csv file
-    df = pd.read_csv(csv_file_in)
-    i = 0    
-    # open csv_file_name and make short list of all files not in csv_file
-    if os.path.exists(csv_file_out):
-        df2 = pd.read_csv(csv_file_out)
-        files_in_csv = df2['image_path'].tolist()
-        description_in_csv = df2['description'].tolist()
-        original_description_in_csv = df2['original_description'].tolist()
-        results = list(zip(files_in_csv, description_in_csv, original_description_in_csv))        
-        df = df[~df['image_path'].isin(files_in_csv)]
-        
+def load_model(model_id):
     # 1. Define FP8 Quantization Config
     # Note: Ensure you have bitsandbytes installed
     quantization_config = BitsAndBytesConfig(
@@ -204,9 +256,33 @@ def augment_texts_from_csv(csv_file_in, csv_file_out, max_len, batch_size, model
         attn_implementation="flash_attention_2" # Enforce Flash Attention 2
     )
     
-    batch_items = []
+    return model, tokenizer
+    
+
+def augment_texts_from_csv(args):
+    results = []  
+     # parse csv file
+    df = pd.read_csv(args.csv_file)
+    i = 0    
+    # open csv_file_name and make short list of all files not in csv_file
+    if os.path.exists(args.out_file):
+        print(f"Output file {args.out_file} already exists. Loading existing descriptions to avoid duplicates.")
+        df2 = pd.read_csv(args.out_file)
+        files_in_csv = df2['image_path'].tolist()
+        description_in_csv = df2['description'].tolist()
+        original_description_in_csv = df2['original_description'].tolist()
+        results = list(zip(files_in_csv, description_in_csv, original_description_in_csv))        
+        df = df[~df['image_path'].isin(files_in_csv)]
+        
+    if args.augment_type == "llm":
+        print("Using LLM for augmentation")
+        model, tokenizer = load_model(args.model_id)
+    else:        
+        print("Using rule based augmentation")
+    
+    batch_llm_items = []
     batch_images = []
-    batch_descriptions = []    
+    orig_descriptions = []    
     
     # Defining the system role
     system_role = (
@@ -216,36 +292,53 @@ def augment_texts_from_csv(csv_file_in, csv_file_out, max_len, batch_size, model
         "transformation rules strictly and do not provide conversational filler."
     )
     
+    flip_descriptions = []
+    change_colors_descriptions = []
+    
     # go line by line and read columns
     for index, row in df.iterrows():
         image_path = row['image_path']
         description = row['description']    
-        
-        for pos_type in range(1, 4):
-            prompt = generate_positive_description(description, pos_type)
+
+        if args.augment_type == "llm":
+            prompt = generate_positive_viewpoint_description(description)
             messages = [
                 {"role": "system", "content": system_role},
                 {"role": "user", "content": f".'Description:\n\n{prompt}"}
-                ]
-            batch_items.append(messages)
-            batch_images.append(image_path)
-            batch_descriptions.append(description)
+            ]
+            batch_llm_items.append(messages)
+        if args.augment_type == "rule":
+            flip_descriptions.append(augment_text_flip_description(description))
+            change_colors_descriptions.append(augment_text_change_colors_description(description))
+        
+        batch_images.append(image_path)
+        orig_descriptions.append(description)
+        
+        if args.augment_type == "llm" and len(batch_llm_items) >= args.batch_size:
+            new_descriptions = update_descriptions_batch(model, tokenizer, batch_llm_items)
+            for img, new_desc, orig_desc in zip(batch_images, new_descriptions, orig_descriptions):
+                results.append([img, orig_desc, new_desc.strip()])        
             
-        if len(batch_items) >= batch_size:
-            new_descriptions = update_descriptions_batch(model, tokenizer, batch_items)
-            for img, new_desc, old_desc in zip(batch_images, new_descriptions, batch_descriptions):
-                results.append([img, new_desc.strip(), old_desc])
-                batch_items = []     
-                batch_images = []
-                batch_descriptions = []          
+            batch_llm_items, batch_images, orig_descriptions = [], [], []
 
-            df2 = pd.DataFrame(results, columns=['image_path', 'description', 'original_description'])
-            df2.to_csv(csv_file_out, index=False)
+            df2 = pd.DataFrame(results, columns=['image_path', 'description', 'view change'])
+            df2.to_csv(args.out_file, index=False)
+            
+        elif len(flip_descriptions) >= args.batch_size:
+            for img, orig_desc, flip_desc, color_desc in zip(batch_images, orig_descriptions, flip_descriptions, change_colors_descriptions):
+                results.append([img, orig_desc, flip_desc.strip(), color_desc.strip()])        
+            
+            batch_images, orig_descriptions, flip_descriptions, change_colors_descriptions = [], [], [], []             
+            
+            df2 = pd.DataFrame(results, columns=['image_path', 'description', 'flip', 'change_color'])
+            df2.to_csv(args.out_file, index=False)
     
-    # if len(batch_items)>0:
-    #     new_descriptions = update_descriptions_batch(model, tokenizer, batch_items)
-    #     for img, new_desc, old_desc in zip(batch_images, new_descriptions, batch_descriptions):
-    #         results.append([img, new_desc.strip(), old_desc])
+            
+        
+    # if len(batch_llm_items)>0:
+    #     new_descriptions = update_descriptions_batch(model, tokenizer, batch_llm_items)
+    #     for img, new_desc, orig_desc in zip(batch_images, new_descriptions, batch_descriptions):
+    #         results.append([img, new_desc.strip(), orig_desc])
             
     # save results to updated 
     # df2 = pd.DataFrame(results, columns=['image_path', 'description', 'original_description'])
@@ -259,13 +352,15 @@ if __name__ == "__main__":
     parser.add_argument("--out_file", type=str, default="pitts30k_val_800_queries_augmented.csv")
     parser.add_argument("--max_len", type=str, default="256", help="max number of words in the output description")
     parser.add_argument("--batch_size", type=int, default="100", help="batch size for processing descriptions")
-    args = parser.parse_args()       
+    parser.add_argument("--augment_type", type=str, default="rule", help="llm, rule")
+    parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.3-70B-Instruct", help="type of model to apply")
     
+    args = parser.parse_args()           
  
-    model_id = "meta-llama/Llama-3.3-70B-Instruct"
+    #model_id = "meta-llama/Llama-3.3-70B-Instruct"
     #model_id = "microsoft/Phi-4-mini-instruct"
 
-    augment_texts_from_csv(args.csv_file, args.out_file, args.max_len, args.batch_size, model_id)
-        
+    augment_texts_from_csv(args)
+
         
        

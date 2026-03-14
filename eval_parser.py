@@ -6,10 +6,10 @@ def parse_arguments():
 
     parser.add_argument("--positive_dist_threshold", type=int, default=25, help="distance (in meters) for a prediction to be considered a positive")
         
-    parser.add_argument("--database_folder", type=str, default="/mnt/d/data/amstertime/test/database")    
-    parser.add_argument("--queries_folder", type=str, default="/mnt/d/data/amstertime/test/queries")        
-    parser.add_argument("--image_root", type=str, default="/mnt/d/data/amstertime/test")
-    parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions.csv")
+    # parser.add_argument("--database_folder", type=str, default="/mnt/d/data/amstertime/test/database")    
+    # parser.add_argument("--queries_folder", type=str, default="/mnt/d/data/amstertime/test/queries")        
+    # parser.add_argument("--image_root", type=str, default="/mnt/d/data/amstertime/test")
+    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions.csv")
     #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions_subset.csv")            
     
     # parser.add_argument("--database_folder", type=str, default="/mnt/d/data/pitts30k/images/test/database")    
@@ -17,10 +17,10 @@ def parse_arguments():
     # parser.add_argument("--image_root", type=str, default="/mnt/d/data/pitts30k/images/test")    
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_test_descriptions.csv")
 
-    # parser.add_argument("--database_folder", type=str, default="/mnt/d/data/pitts30k/images/val/database")    
-    # parser.add_argument("--queries_folder", type=str, default="/mnt/d/data/pitts30k/images/val/queries")    
-    # parser.add_argument("--image_root", type=str, default="/mnt/d/data/pitts30k/images/val")    
-    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
+    parser.add_argument("--database_folder", type=str, default="/mnt/d/data/pitts30k/images/val/database")    
+    parser.add_argument("--queries_folder", type=str, default="/mnt/d/data/pitts30k/images/val/queries")    
+    parser.add_argument("--image_root", type=str, default="/mnt/d/data/pitts30k/images/val")    
+    parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
     
     # parser.add_argument("--database_folder", type=str, default="/mnt/d/data/msls/val/database")    
     # parser.add_argument("--queries_folder", type=str, default="/mnt/d/data/msls/val/query")   
@@ -79,7 +79,7 @@ def parse_arguments():
     )
     parser.add_argument("--gpu", type=str, default="0", help="which gpu to use")
     parser.add_argument("--model_name", type=str, default='Salesforce/blip-itm-base-coco')
-    parser.add_argument("--model_path", type=str, default='LOGS/blip_01/resnet50_epoch(09)_step(10420).ckpt')    
+    parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--lora_path", type=str, default=None)        
     parser.add_argument("--is_normalize", type=int, default="0", help="is normalize features")    
     parser.add_argument("--max_results_reranking", type=int, default="25000", help="max results for reranking")        
