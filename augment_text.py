@@ -1,3 +1,5 @@
+from time import time
+
 from matplotlib import colors
 import pandas as pd
 import os
@@ -213,30 +215,64 @@ def augment_text_change_colors_description(description):
 
     return COLOR_PATTERN.sub(get_new_color, description)
 
-
+import numpy as np
 
 def generate_positive_viewpoint_description(base_text):    
     view_change_list = [
-        "top-down", "side-view", "ground-up", "low-angle", "distant", "close-up", "Interior-Outside", "Outside-Interior", "Wide-angle", "Narrow-angle", "Aerial", "Street-level"
+        "top-down", "ground-up", "distant", "close-up", 
+        "aerial oblique", "wide-angle", "street-level"
     ]
+    
+    # Adding scenarios for the "Atmospheric" changes we discussed
+    scenarios = ["Golden Hour", "Blue Hour", "Overcast/Rainy", "Harsh Midday Sun"]
+    
     viewpoint = np.random.choice(view_change_list)
+    scenario = np.random.choice(scenarios)
   
+    # Optimized Prompt for Llama-3.3-70B
     prompt = f"""
     ### Task: Standalone Scene Reconstruction
-    Create a description of this location from a {viewpoint} perspective.
+    You are a spatial reasoning engine. Reconstruct the following location from a {viewpoint} perspective during {scenario} conditions.
     
     ### Constraints:
-    - Do NOT mention that the view has changed (No "now", "appears", "reveals").
-    - Do NOT mention the original text.
-    - Describe the objects as they physically appear from the {viewpoint}.
+    1. **Reverse Order**: Identify all objects in the Source Data. You MUST describe them in the EXACT REVERSE order of their appearance in the source.
+    2. **Zero Transitions**: Do NOT use words like "now," "appears," "reveals," or "becomes."
+    3. **Physics-Based**: Describe shapes and colors as they physically look from {viewpoint}. Apply {scenario} lighting to all textures.
     
     ### Source Data:
     "{base_text}"
     
-    ### Output:
-    (Provide only the final paragraph)
+    ### Reasoning Step:
+    First, list the objects from the source in reverse order. Then, write the standalone paragraph.
+    
+    ### Output Format:
+    REVERSED OBJECTS: [list here]
+    DESCRIPTION: [paragraph here]
     """
     return prompt
+
+# def generate_positive_viewpoint_description(base_text):    
+#     view_change_list = [
+#         "top-down", "side-view", "ground-up", "low-angle", "distant", "close-up", "Interior-Outside", "Outside-Interior", "Wide-angle", "Narrow-angle", "Aerial", "Street-level"
+#     ]
+#     viewpoint = np.random.choice(view_change_list)
+  
+#     prompt = f"""
+#     ### Task: Standalone Scene Reconstruction
+#     Create a description of this location from a {viewpoint} perspective.
+    
+#     ### Constraints:
+#     - Do NOT mention that the view has changed (No "now", "appears", "reveals").
+#     - Do NOT mention the original text.
+#     - Describe the objects as they physically appear from the {viewpoint}.
+    
+#     ### Source Data:
+#     "{base_text}"
+    
+#     ### Output:
+#     (Provide only the final paragraph)
+#     """
+#     return prompt
 
 def load_model(model_id):
     # 1. Define FP8 Quantization Config
@@ -265,7 +301,7 @@ def augment_texts_from_csv(args):
     df = pd.read_csv(args.csv_file)
     i = 0    
     # open csv_file_name and make short list of all files not in csv_file
-    if os.path.exists(args.out_file):
+    if args.continue_csv and os.path.exists(args.out_file):
         print(f"Output file {args.out_file} already exists. Loading existing descriptions to avoid duplicates.")
         df2 = pd.read_csv(args.out_file)
         files_in_csv = df2['image_path'].tolist()
@@ -295,6 +331,8 @@ def augment_texts_from_csv(args):
     flip_descriptions = []
     change_colors_descriptions = []
     
+    batch_index = 0
+    
     # go line by line and read columns
     for index, row in df.iterrows():
         image_path = row['image_path']
@@ -315,11 +353,15 @@ def augment_texts_from_csv(args):
         orig_descriptions.append(description)
         
         if args.augment_type == "llm" and len(batch_llm_items) >= args.batch_size:
+            #measure time for batch
+            start_time = time.time()
             new_descriptions = update_descriptions_batch(model, tokenizer, batch_llm_items)
+            end_time = time.time()
+            print(f"batch: {batch_index}, Processed batch of {len(batch_llm_items)} items in {end_time - start_time:.2f} seconds")
             for img, new_desc, orig_desc in zip(batch_images, new_descriptions, orig_descriptions):
                 results.append([img, orig_desc, new_desc.strip()])        
             
-            batch_llm_items, batch_images, orig_descriptions = [], [], []
+            batch_llm_items, batch_images, orig_descriptions = [], [], []            
 
             df2 = pd.DataFrame(results, columns=['image_path', 'description', 'view change'])
             df2.to_csv(args.out_file, index=False)
@@ -332,6 +374,9 @@ def augment_texts_from_csv(args):
             
             df2 = pd.DataFrame(results, columns=['image_path', 'description', 'flip', 'change_color'])
             df2.to_csv(args.out_file, index=False)
+            print(f"batch: {batch_index}")
+            
+        batch_index += 1
     
             
         
@@ -352,6 +397,7 @@ if __name__ == "__main__":
     parser.add_argument("--out_file", type=str, default="pitts30k_val_800_queries_augmented.csv")
     parser.add_argument("--max_len", type=str, default="256", help="max number of words in the output description")
     parser.add_argument("--batch_size", type=int, default="100", help="batch size for processing descriptions")
+    parser.add_argument("--continue_csv", type=int, default="0", help="continue from a specific batch in the CSV file")
     parser.add_argument("--augment_type", type=str, default="rule", help="llm, rule")
     parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.3-70B-Instruct", help="type of model to apply")
     
