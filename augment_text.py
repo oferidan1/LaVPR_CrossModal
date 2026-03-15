@@ -307,26 +307,27 @@ def augment_texts_from_csv(args):
     results = []  
      # parse csv file
     df = pd.read_csv(args.csv_file)
-    i = 0    
+    
     # open csv_file_name and make short list of all files not in csv_file
     if args.continue_csv and os.path.exists(args.out_file):
         print(f"Output file {args.out_file} already exists. Loading existing descriptions to avoid duplicates.")
         df2 = pd.read_csv(args.out_file)
         files_in_csv = df2['image_path'].tolist()
         description_in_csv = df2['description'].tolist()
-        original_description_in_csv = df2['original_description'].tolist()
-        results = list(zip(files_in_csv, description_in_csv, original_description_in_csv))        
+        if 'flip' in df2.columns:
+            flip_descriptions_in_csv = df2['flip'].tolist()
+            change_colors_descriptions_in_csv = df2['change_color'].tolist()
+            results = list(zip(files_in_csv, description_in_csv, flip_descriptions_in_csv, change_colors_descriptions_in_csv))        
+        else:
+            view_change_in_csv = df2['view_change'].tolist()            
+            results = list(zip(files_in_csv, description_in_csv, view_change_in_csv))                    
         df = df[~df['image_path'].isin(files_in_csv)]
         
     if args.augment_type == "llm":
         print("Using LLM for augmentation")
         model, tokenizer = load_model(args.model_id)
     else:        
-        print("Using rule based augmentation")
-    
-    batch_llm_items = []
-    batch_images = []
-    orig_descriptions = []    
+        print("Using rule based augmentation")    
     
     # Defining the system role
     system_role = (
@@ -336,6 +337,9 @@ def augment_texts_from_csv(args):
         "transformation rules strictly and do not provide conversational filler."
     )
     
+    batch_llm_items = []
+    batch_images = []
+    orig_descriptions = []    
     flip_descriptions = []
     change_colors_descriptions = []
     
@@ -360,21 +364,21 @@ def augment_texts_from_csv(args):
         batch_images.append(image_path)
         orig_descriptions.append(description)
         
-        if args.augment_type == "llm" and len(batch_llm_items) >= args.batch_size:
+        if args.augment_type == "llm" and len(batch_llm_items) == args.batch_size:
             #measure time for batch
             start_time = time.time()
             new_descriptions = update_descriptions_batch(model, tokenizer, batch_llm_items)
             end_time = time.time()
             print(f"batch: {batch_index}, Processed batch of {len(batch_llm_items)} items in {end_time - start_time:.2f} seconds")
-            for img, new_desc, orig_desc in zip(batch_images, new_descriptions, orig_descriptions):
+            for img, orig_desc, new_desc in zip(batch_images, orig_descriptions, new_descriptions):
                 results.append([img, orig_desc, new_desc.strip()])        
             
             batch_llm_items, batch_images, orig_descriptions = [], [], []            
 
-            df2 = pd.DataFrame(results, columns=['image_path', 'description', 'view change'])
+            df2 = pd.DataFrame(results, columns=['image_path', 'description', 'view_change'])
             df2.to_csv(args.out_file, index=False)
             
-        elif len(flip_descriptions) >= args.batch_size:
+        elif len(flip_descriptions) == args.batch_size:
             for img, orig_desc, flip_desc, color_desc in zip(batch_images, orig_descriptions, flip_descriptions, change_colors_descriptions):
                 results.append([img, orig_desc, flip_desc.strip(), color_desc.strip()])        
             
@@ -385,17 +389,22 @@ def augment_texts_from_csv(args):
             print(f"batch: {batch_index}")
             
         batch_index += 1
-    
-            
         
-    # if len(batch_llm_items)>0:
-    #     new_descriptions = update_descriptions_batch(model, tokenizer, batch_llm_items)
-    #     for img, new_desc, orig_desc in zip(batch_images, new_descriptions, batch_descriptions):
-    #         results.append([img, new_desc.strip(), orig_desc])
+    #save the last batch if exists        
+    if len(batch_llm_items)>0:
+        new_descriptions = update_descriptions_batch(model, tokenizer, batch_llm_items)
+        for img, orig_desc, new_desc in zip(batch_images, orig_descriptions, new_descriptions):
+                results.append([img, orig_desc, new_desc.strip()])        
+        df2 = pd.DataFrame(results, columns=['image_path', 'description', 'view_change'])
+        df2.to_csv(args.out_file, index=False)
+    
+    if len(flip_descriptions)>0:
+        for img, orig_desc, flip_desc, color_desc in zip(batch_images, orig_descriptions, flip_descriptions, change_colors_descriptions):
+            results.append([img, orig_desc, flip_desc.strip(), color_desc.strip()])                    
             
-    # save results to updated 
-    # df2 = pd.DataFrame(results, columns=['image_path', 'description', 'original_description'])
-    # df2.to_csv(csv_file_out, index=False)
+        df2 = pd.DataFrame(results, columns=['image_path', 'description', 'flip', 'change_color'])
+        df2.to_csv(args.out_file, index=False)
+            
 
     
 import argparse
