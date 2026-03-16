@@ -151,14 +151,10 @@ class LaVPR(pl.LightningModule):
             # For biases, it's common to initialize them to zero
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)        
-    
-    
-    # the forward pass of the lightning model
-    def forward(self, img, text):
-        text_embeds = None
+                
+    def encode_image(self, img):
+        img_embeds = None
         img_local = None
-        text_local = None
-
         if 'blip' in self.model_name:
             img_local = self.text_encoder.encode_image(img)            
             img_embeds = img_local[:,0]
@@ -167,26 +163,42 @@ class LaVPR(pl.LightningModule):
         elif 'eva' in self.model_name:            
             img_embeds = self.text_encoder.encode_image(img)
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
-            
-        attention_mask = None        
+        return img_embeds, img_local
+    
+    
+    def encode_text(self, text):
+        text_embeds = None
+        attention_mask = None
+        text_local = None
 
         if 'blip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True)
-            text_tokens = text_inputs.input_ids.to(img.device)
-            attention_mask = text_inputs['attention_mask'].to(img.device)                
+            text_tokens = text_inputs.input_ids.to(self.my_device)
+            attention_mask = text_inputs['attention_mask'].to(self.my_device)                
             text_local = self.text_encoder.encode_text(input_ids=text_tokens, attention_mask=attention_mask)    
             text_embeds= text_local[:, 0]        
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
-            text_tokens = text_inputs.input_ids.to(img.device)
+            text_tokens = text_inputs.input_ids.to(self.my_device)
             attention_mask = None
             if 'attention_mask' in text_inputs:
-                attention_mask = text_inputs['attention_mask'].to(img.device)                
+                attention_mask = text_inputs['attention_mask'].to(self.my_device)                
             text_embeds = self.text_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
         elif 'eva' in self.model_name:
-            text_tokens = self.tokenizer(text).to(self.device)            
+            text_tokens = self.tokenizer(text).to(self.my_device)            
             text_embeds = self.text_encoder.encode_text(text_tokens)    
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)                   
+        
+        return text_embeds, text_local, attention_mask
+    
+    
+    # the forward pass of the lightning model
+    def forward(self, img, text, flip_desc, color_change_desc):
+        #encode image and text and get local features if the model has them (e.g. BLIP) for L-OT loss
+        img_embeds, img_local = self.encode_image(img)
+        text_embeds, text_local, attention_mask = self.encode_text(text)
+        text_flip_embeds, _, _ = self.encode_text(flip_desc)
+        text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
@@ -208,7 +220,7 @@ class LaVPR(pl.LightningModule):
                 img_embeds = self.agg(img_local, token_weights=w_v)
                 text_embeds = self.agg(text_local, attention_mask, token_weights=w_t)
 
-        return img_embeds, text_embeds, img_local, text_local, attention_mask, ot_loss
+        return img_embeds, text_embeds, text_flip_embeds, text_color_change_embeds, ot_loss
     
     
     # configure the optimizer 
@@ -249,13 +261,16 @@ class LaVPR(pl.LightningModule):
 
             
     #  The loss function call (this method will be called at each training iteration)
-    def loss_function(self, descriptors, labels, text_embeds, ot_loss=0.0):
+    def loss_function(self, descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, ot_loss=0.0):
         
         # we mine the pairs/triplets if there is an online mining strategy
         if self.miner is not None:                        
             ref_labels = labels.clone()
-            miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
-            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)              
+            #add text_flip_embeds, text_color_change_embeds, to ref_emb with positive labels (same place), and add negative labels for them (different place)
+            ref_embs = torch.cat([text_embeds, text_flip_embeds, text_color_change_embeds], dim=0)
+            ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
+            miner_outputs = self.miner(descriptors, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
+            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
             
             if self.unimodal_loss>0:
                 # calculate unimodal loss for image modality
@@ -298,7 +313,7 @@ class LaVPR(pl.LightningModule):
     
     # This is the training step that's executed at each iteration
     def training_step(self, batch, batch_idx):
-        places, labels, texts = batch
+        places, labels, texts, flip_descs, color_change_descs = batch
         
         # Note that GSVCities yields places (each containing N images)
         # which means the dataloader will return a batch containing BS places
@@ -309,13 +324,17 @@ class LaVPR(pl.LightningModule):
         labels = labels.view(-1)
         
         flat_texts = []
+        flat_flip_descs = []
+        flat_color_change_descs = []
         for i in range(BS):
             for j in range(N):
                 flat_texts.append(texts[j][i])
+                flat_flip_descs.append(flip_descs[j][i])
+                flat_color_change_descs.append(color_change_descs[j][i])
 
         # Feed forward the batch to the model
-        descriptors, text_embeds, _, _, _, ot_loss = self(images, flat_texts) # Here we are calling the method forward that we defined above
-        loss = self.loss_function(descriptors, labels, text_embeds, ot_loss) # Call the loss_function we defined above
+        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, ot_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs) # Here we are calling the method forward that we defined above
+        loss = self.loss_function(descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, ot_loss) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
         
@@ -332,9 +351,9 @@ class LaVPR(pl.LightningModule):
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
-        places, _, texts = batch
+        places, _, texts, _, _ = batch
         # calculate descriptors
-        descriptors, text_embeds, _, _, _, _ = self(places, texts)
+        descriptors, text_embeds, _, _, _ = self(places, texts)
         #return descriptors.detach().cpu()
         descriptors = descriptors.detach().cpu()        
         text_embeds_cpu = text_embeds.detach().cpu()        

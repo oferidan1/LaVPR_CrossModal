@@ -19,7 +19,7 @@ def parse_arguments():
     # Other parameters
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
     parser.add_argument("--epochs", type=int, default='10', help="number of epochs to train")    
-    parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_descriptions.csv")    
+    parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
     parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    

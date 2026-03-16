@@ -51,7 +51,7 @@ class GSVCitiesDataset(Dataset):
         self.places_ids = pd.unique(self.dataframe.index)
         self.total_nb_images = len(self.dataframe)        
         
-        self.image_path, self.description = GSVCitiesDataset.read_csv_file(train_csv, base_path)
+        self.image_path, self.description, self.flip_desc, self.color_change_desc = GSVCitiesDataset.read_csv_file(train_csv, base_path)
         
     def __getdataframes(self):
         ''' 
@@ -107,6 +107,8 @@ class GSVCitiesDataset(Dataset):
             
         imgs = []
         descriptions = []
+        flip_descs = []
+        color_change_descs = []
         for i, row in place.iterrows():
             img_name = self.get_img_name(row)
             img_path = self.base_path + 'Images/' + \
@@ -122,17 +124,20 @@ class GSVCitiesDataset(Dataset):
             # find image_path index in self.image_path  
             description = ""      
             if img_path in self.image_path:
-                desc_index = self.image_path.index(img_path)
-                description = self.description[desc_index]                  
                 max_length = 256
-                description = description[:max_length]  # truncate to max_length chars
+                desc_index = self.image_path.index(img_path)
+                description = self.description[desc_index][:max_length]
+                flip_desc = self.flip_desc[desc_index][:max_length]
+                color_change_desc = self.color_change_desc[desc_index][:max_length]
             descriptions.append(description) 
+            flip_descs.append(flip_desc)
+            color_change_descs.append(color_change_desc)
 
         # NOTE: contrary to image classification where __getitem__ returns only one image 
         # in GSVCities, we return a place, which is a Tesor of K images (K=self.img_per_place)
         # this will return a Tensor of shape [K, channels, height, width]. This needs to be taken into account 
         # in the Dataloader (which will yield batches of shape [BS, K, channels, height, width])
-        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place), descriptions
+        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place), descriptions, flip_descs, color_change_descs
 
     def __len__(self):
         '''Denotes the total number of places (not images)'''
@@ -174,5 +179,7 @@ class GSVCitiesDataset(Dataset):
             skipinitialspace=True)
         image_path = df['image_path'].values
         description = df['description'].values    
+        flip_desc = df['flip'].values    
+        color_change_desc = df['change_color'].values    
         image_path = [posixpath.join(image_root, p) for p in image_path]
-        return image_path, description
+        return image_path, description, flip_desc, color_change_desc
