@@ -47,6 +47,7 @@ class LaVPR(pl.LightningModule):
                 lora_r=64,                
                 agg_type=0,
                 ot_loss=0.0,
+                unimodal_loss=0.0,                
                  ):
         super().__init__()       
         
@@ -84,6 +85,7 @@ class LaVPR(pl.LightningModule):
         self.is_trainable_text_encoder = is_trainable_text_encoder
         self.agg_type = agg_type        
         self.ot_loss = ot_loss
+        self.unimodal_loss = unimodal_loss        
 
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -190,7 +192,7 @@ class LaVPR(pl.LightningModule):
         ot_loss = 0.0
         w_v, w_t = None, None
         
-        if img_local is not None and text_local is not None:
+        if self.ot_loss>0 and img_local is not None and text_local is not None:
             t_mask = None
             if attention_mask is not None:
                 t_mask = attention_mask[:, 1:]
@@ -254,6 +256,15 @@ class LaVPR(pl.LightningModule):
             ref_labels = labels.clone()
             miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
             loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)              
+            
+            if self.unimodal_loss>0:
+                # calculate unimodal loss for image modality
+                miner_outputs = self.miner(descriptors, labels)     
+                img_loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs)
+                miner_outputs = self.miner(text_embeds, ref_labels)     
+                txt_loss = self.loss_fn(text_embeds, ref_labels, indices_tuple=miner_outputs)
+                loss = loss + self.unimodal_loss * img_loss + self.unimodal_loss * txt_loss
+
             loss = loss + self.ot_loss * ot_loss
 
             # calculate the % of trivial pairs/triplets

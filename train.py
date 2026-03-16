@@ -37,8 +37,9 @@ def parse_arguments():
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
-    parser.add_argument("--agg_type", type=int, default="2", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
-    parser.add_argument("--ot_loss", type=float, default="0.1", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
+    parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
+    parser.add_argument("--ot_loss", type=float, default="0", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
+    parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     
     args = parser.parse_args()
     
@@ -107,6 +108,7 @@ if __name__ == '__main__':
         lora_r=args.lora_r,        
         agg_type=args.agg_type,
         ot_loss=args.ot_loss,
+        unimodal_loss=args.unimodal_loss,
     )
         
     model = model.to('cuda')
