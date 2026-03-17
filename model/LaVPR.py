@@ -193,12 +193,16 @@ class LaVPR(pl.LightningModule):
     
     
     # the forward pass of the lightning model
-    def forward(self, img, text, flip_desc, color_change_desc):
+    def forward(self, img, text, flip_desc=None, color_change_desc=None):
         #encode image and text and get local features if the model has them (e.g. BLIP) for L-OT loss
+        text_flip_embeds = None
+        text_color_change_embeds = None
         img_embeds, img_local = self.encode_image(img)
         text_embeds, text_local, attention_mask = self.encode_text(text)
-        text_flip_embeds, _, _ = self.encode_text(flip_desc)
-        text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
+        if flip_desc is not None:
+            text_flip_embeds, _, _ = self.encode_text(flip_desc)
+        if color_change_desc is not None:
+            text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
@@ -269,8 +273,8 @@ class LaVPR(pl.LightningModule):
             #add text_flip_embeds, text_color_change_embeds, to ref_emb with positive labels (same place), and add negative labels for them (different place)
             ref_embs = torch.cat([text_embeds, text_flip_embeds, text_color_change_embeds], dim=0)
             ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
-            miner_outputs = self.miner(descriptors, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
-            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
+            miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
+            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)              
             
             if self.unimodal_loss>0:
                 # calculate unimodal loss for image modality
