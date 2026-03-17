@@ -274,7 +274,7 @@ class LaVPR(pl.LightningModule):
             ref_embs = torch.cat([text_embeds, text_flip_embeds, text_color_change_embeds], dim=0)
             ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
             miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
-            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=text_embeds, ref_labels=ref_labels)              
+            loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
             
             if self.unimodal_loss>0:
                 # calculate unimodal loss for image modality
