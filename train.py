@@ -103,6 +103,7 @@ if __name__ == '__main__':
         miner_margin=0.1,
         faiss_gpu=False,        
         cross_modal=args.cross_modal,
+        is_trainable_text_encoder=args.is_trainable_text_encoder,
         lora_all_linear=args.lora_all_linear,
         lora_target_modules=args.lora_target_modules,
         lora_r=args.lora_r,        

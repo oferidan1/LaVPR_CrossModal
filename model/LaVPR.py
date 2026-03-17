@@ -40,7 +40,7 @@ class LaVPR(pl.LightningModule):
                 model_name='Salesforce/blip-itm-base-coco',
                 embeds_dim=256,
                 is_freeze_text=True,
-                is_trainable_text_encoder=True,
+                is_trainable_text_encoder=False,
                 cross_modal=0,
                 lora_all_linear=False,
                 lora_target_modules=None,
