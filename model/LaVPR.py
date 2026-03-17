@@ -355,7 +355,7 @@ class LaVPR(pl.LightningModule):
     # For validation, we will also iterate step by step over the validation set
     # this is the way Pytorch Lghtning is made. All about modularity, folks.
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
-        places, _, texts, _, _ = batch
+        places, _, texts = batch
         # calculate descriptors
         descriptors, text_embeds, _, _, _ = self(places, texts)
         #return descriptors.detach().cpu()
