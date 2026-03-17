@@ -122,7 +122,7 @@ class GSVCitiesDataset(Dataset):
             
             # get the description for this image
             # find image_path index in self.image_path  
-            description = ""      
+            flip_desc, color_change_desc, description = "", "", ""            
             if img_path in self.image_path:
                 max_length = 256
                 desc_index = self.image_path.index(img_path)
