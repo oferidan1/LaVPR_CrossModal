@@ -48,6 +48,7 @@ class LaVPR(pl.LightningModule):
                 agg_type=0,
                 ot_loss=0.0,
                 unimodal_loss=0.0,                
+                pos_loss=0,
                  ):
         super().__init__()       
         
@@ -86,6 +87,7 @@ class LaVPR(pl.LightningModule):
         self.agg_type = agg_type        
         self.ot_loss = ot_loss
         self.unimodal_loss = unimodal_loss        
+        self.pos_loss = pos_loss
 
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -199,10 +201,11 @@ class LaVPR(pl.LightningModule):
         text_color_change_embeds = None
         img_embeds, img_local = self.encode_image(img)
         text_embeds, text_local, attention_mask = self.encode_text(text)
-        if flip_desc is not None:
-            text_flip_embeds, _, _ = self.encode_text(flip_desc)
-        if color_change_desc is not None:
-            text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
+        if self.pos_loss:
+            if flip_desc is not None:
+                text_flip_embeds, _, _ = self.encode_text(flip_desc)
+            if color_change_desc is not None:
+                text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
@@ -270,10 +273,12 @@ class LaVPR(pl.LightningModule):
         # we mine the pairs/triplets if there is an online mining strategy
         if self.miner is not None:                        
             ref_labels = labels.clone()
+            ref_embs = text_embeds
             #add text_flip_embeds, text_color_change_embeds, to ref_emb with positive labels (same place), and add negative labels for them (different place)
-            ref_embs = torch.cat([text_embeds, text_flip_embeds, text_color_change_embeds], dim=0)
-            ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
-            miner_outputs = self.miner(descriptors, labels, ref_emb=text_embeds, ref_labels=ref_labels)     
+            if self.pos_loss:
+                ref_embs = torch.cat([text_embeds, text_flip_embeds, text_color_change_embeds], dim=0)
+                ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
+            miner_outputs = self.miner(descriptors, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
             loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
             
             if self.unimodal_loss>0:
