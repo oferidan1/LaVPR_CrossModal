@@ -283,11 +283,12 @@ class LaVPR(pl.LightningModule):
             
             if self.unimodal_loss>0:
                 # calculate unimodal loss for image modality
-                miner_outputs = self.miner(descriptors, labels)     
-                img_loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs)
+                # miner_outputs = self.miner(descriptors, labels)     
+                # img_loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs)
                 miner_outputs = self.miner(text_embeds, ref_labels)     
                 txt_loss = self.loss_fn(text_embeds, ref_labels, indices_tuple=miner_outputs)
-                loss = loss + self.unimodal_loss * img_loss + self.unimodal_loss * txt_loss
+                #loss = loss + self.unimodal_loss * img_loss + self.unimodal_loss * txt_loss
+                loss = loss + self.unimodal_loss * txt_loss
 
             loss = loss + self.ot_loss * ot_loss
 
