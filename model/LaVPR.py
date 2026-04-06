@@ -49,6 +49,7 @@ class LaVPR(pl.LightningModule):
                 ot_loss=0.0,
                 unimodal_loss=0.0,                
                 pos_loss=0,
+                latent_mixup=0.0,
                  ):
         super().__init__()       
         
@@ -88,6 +89,7 @@ class LaVPR(pl.LightningModule):
         self.ot_loss = ot_loss
         self.unimodal_loss = unimodal_loss        
         self.pos_loss = pos_loss
+        self.latent_mixup = latent_mixup
 
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -280,7 +282,38 @@ class LaVPR(pl.LightningModule):
                 ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
             miner_outputs = self.miner(descriptors, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
             loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
-            
+            if self.latent_mixup>0:
+                # calculate latent mixup loss:
+                # Extract negative pairs from the miner outputs
+                a1, p, a2, n = miner_outputs
+                if len(a2) > 0:
+                    BS = descriptors.shape[0]
+                    
+                    # Vt: anchor vector (text)
+                    Vt = ref_embs[n]
+                    
+                    # Vi-: negative image vector from mining
+                    Vi_neg = descriptors[a2]
+                    
+                    # Vi+: positive image vector (labels are equal)
+                    Vi_pos = descriptors[n % BS]
+                    
+                    # Mixup ratio
+                    alpha = torch.rand(len(a2), 1, device=descriptors.device)
+                    
+                    # V' = a*Vi+ + (1-a)*Vi-
+                    # Note: We L2-normalize V_prime, otherwise Vt @ V' exactly equals score2 due to linearity of the dot product, making MSE 0.
+                    V_prime = torch.nn.functional.normalize(alpha * Vi_pos + (1 - alpha) * Vi_neg, p=2, dim=-1)
+                    
+                    # score1 = Vt@V'
+                    score1 = (Vt * V_prime).sum(dim=-1)
+                    
+                    # score2 = a*(Vt@Vi+) + (1-a)*(Vt@Vi-)
+                    score2 = alpha.squeeze(-1) * (Vt * Vi_pos).sum(dim=-1) + (1 - alpha.squeeze(-1)) * (Vt * Vi_neg).sum(dim=-1)
+                    
+                    mixup_loss = torch.nn.functional.mse_loss(score1, score2)
+                    loss = loss + self.latent_mixup * mixup_loss
+
             if self.unimodal_loss>0:
                 # calculate unimodal loss for image modality
                 # miner_outputs = self.miner(descriptors, labels)     

@@ -39,6 +39,7 @@ def parse_arguments():
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
     parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
     parser.add_argument("--ot_loss", type=float, default="0", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
+    parser.add_argument("--latent_mixup", type=float, default="1", help="multplier for latent_mixup loss, 0=no latent_mixup loss, >0 use latent_mixup loss")
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     
@@ -112,6 +113,7 @@ if __name__ == '__main__':
         ot_loss=args.ot_loss,
         unimodal_loss=args.unimodal_loss,
         pos_loss=args.pos_loss,
+        latent_mixup=args.latent_mixup,
     )
         
     model = model.to('cuda')
