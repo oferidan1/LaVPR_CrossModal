@@ -52,31 +52,14 @@ To reproduce our results, download the following datasets:
 
 Training on **GSV-Cities** for 10 epochs takes approximately **10 hours** on a single NVIDIA RTX 3090.
 
-### 1. Image-Text Fusion Model (Dynamic Weighting)
-
-```bash
-python train.py --fusion_type=dynamic_weighting \
-                --is_text_pooling=1 \
-                --vpr_dim=512 \
-                --vpr_model_name=mixvpr \
-                --text_dim=1024 \
-                --text_model_name=BAAI/bge-large-en-v1.5 \
-                --train_csv=datasets/descriptions/gsv_cities_descriptions.csv \
-                --image_root=PATH_TO_GSV_CITIES_DATASET_LOCATON \
-                --val_csv=datasets/descriptions/pitts30k_val_800_queries.csv \
-                --val_image_root=PATH_TO_PITTS30K_VAL_DATASET_LOCATON
-
 ```
 
 ### 2. Image-Text Alignment Model (Cross-Modal)
 
 ```bash
 python train.py --cross_modal=2 \
-                --fusion_type=none \
-                --vpr_model_name=Salesforce/blip-itm-base-coco \
-                --vpr_dim=256 \
-                --is_text_pooling=0 \
-                --is_image_pooling=0 \
+                --model_name=Salesforce/blip-itm-base-coco \
+                --embeds_dim=256 \
                 --image_size=384 \
                 --loss_name=MultiSimilarityLossCM \
                 --is_trainable_text_encoder=1 \
