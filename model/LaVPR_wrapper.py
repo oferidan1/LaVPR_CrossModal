@@ -102,7 +102,7 @@ class LaVPR_wrapper():
     
     def encode_text(self, texts):
         if 'blip' in self.model_name:            
-            text_inputs = self.processor(text=texts, return_tensors="pt", padding=True).input_ids.to(self.device)
+            text_inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=512).input_ids.to(self.device)
             with torch.no_grad():     
                 text_features = self.vpr_encoder.encode_text(text_inputs)[:,0]
         elif 'clip' in self.model_name or 'siglip' in self.model_name:            

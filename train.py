@@ -13,23 +13,24 @@ from model.LaVPR import LaVPR
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # Resume parameters
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)    
     parser.add_argument("--model_name", type=str, default="Salesforce/blip-itm-base-coco")        
-    # Other parameters
+    parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
+    parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
+    # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
+    # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
+    # parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
     parser.add_argument("--epochs", type=int, default='10', help="number of epochs to train")    
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
-    parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
+    parser.add_argument("--image_root", type=str, default="/home/shared/datasets/gsv_cities/", help="root directory for images")
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
-    parser.add_argument("--val_image_root", type=str, default="/mnt/d/data/pitts30k/images/val", help="root directory for images")
+    parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
-    parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")    
-    parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
-    parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
+    parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
     parser.add_argument("--is_trainable_text_encoder", type=int, default="1", help="train text encoder or not")
-    parser.add_argument("--batch_size", type=int, default="10", help="batch size for training")
+    parser.add_argument("--batch_size", type=int, default="40", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss")    
     parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
@@ -39,9 +40,10 @@ def parse_arguments():
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
     parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
     parser.add_argument("--ot_loss", type=float, default="0", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
-    parser.add_argument("--latent_mixup", type=float, default="1", help="multplier for latent_mixup loss, 0=no latent_mixup loss, >0 use latent_mixup loss")
+    parser.add_argument("--latent_mixup", type=float, default="0", help="multplier for latent_mixup loss, 0=no latent_mixup loss, >0 use latent_mixup loss")
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
-    parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
+    parser.add_argument("--pos_loss", type=int, default="1", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
+    parser.add_argument("--neg_loss", type=int, default="1", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
     
     args = parser.parse_args()
     
@@ -113,6 +115,7 @@ if __name__ == '__main__':
         ot_loss=args.ot_loss,
         unimodal_loss=args.unimodal_loss,
         pos_loss=args.pos_loss,
+        neg_loss=args.neg_loss,
         latent_mixup=args.latent_mixup,
     )
         

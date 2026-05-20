@@ -8,6 +8,9 @@ from torch.utils.data import Dataset
 import torchvision.transforms as T
 import os
 import posixpath
+import json
+import random
+import ast
 
 default_transform = T.Compose([
     T.ToTensor(),
@@ -17,6 +20,10 @@ default_transform = T.Compose([
 # NOTE: Hard coded path to dataset folder 
 BASE_PATH = '/mnt/d/data/gsv_cities/'
 TRAIN_CSV = '/mnt/d/data/gsv_cities/gsv_cities_predictions.csv'
+
+SG_JSON = 'datasets/descriptions/gsv_cities_descriptions_sg.json'
+ATTR_JSON = 'datasets/descriptions/gsv_cities_descriptions_attr_hn.json'
+
 
 # if not Path(BASE_PATH).exists():
 #     raise FileNotFoundError(
@@ -51,7 +58,19 @@ class GSVCitiesDataset(Dataset):
         self.places_ids = pd.unique(self.dataframe.index)
         self.total_nb_images = len(self.dataframe)        
         
-        self.image_path, self.description, self.flip_desc, self.color_change_desc = GSVCitiesDataset.read_csv_file(train_csv, base_path)
+        self.image_path, self.image_full_path, self.description, self.flip_desc, self.color_change_desc = GSVCitiesDataset.read_csv_file(train_csv, base_path)
+        
+        #load SG JSON
+        with open(SG_JSON, 'r') as f:
+            sg_json = json.load(f)
+            
+        # Transform the list into a fast-access scene graph dictionary
+        # This extracts 'scene_graph' directly so you don't have to type it out later
+        self.sg_json = {item["image_id"]: item["scene_graph"] for item in sg_json}
+        
+        #load ATTR JSON 
+        with open(ATTR_JSON, 'r') as f:
+            self.attr_json = json.load(f)
         
     def __getdataframes(self):
         ''' 
@@ -108,6 +127,7 @@ class GSVCitiesDataset(Dataset):
         imgs = []
         descriptions = []
         flip_descs = []
+        neg_attr_descs = []
         color_change_descs = []
         for i, row in place.iterrows():
             img_name = self.get_img_name(row)
@@ -122,22 +142,54 @@ class GSVCitiesDataset(Dataset):
             
             # get the description for this image
             # find image_path index in self.image_path  
-            flip_desc, color_change_desc, description = "", "", ""            
-            if img_path in self.image_path:
+            neg_desc, flip_desc, color_change_desc, description = "", "", "", ""
+            if img_path in self.image_full_path:
                 max_length = 256
-                desc_index = self.image_path.index(img_path)
+                desc_index = self.image_full_path.index(img_path)                
                 description = self.description[desc_index][:max_length]
                 flip_desc = self.flip_desc[desc_index][:max_length]
                 color_change_desc = self.color_change_desc[desc_index][:max_length]
+                
+                #find image_id in sg_json
+                image_id = self.image_path[desc_index]
+                sg_data = self.sg_json[image_id]                
+                if sg_data:
+                    neg_desc = description.lower()
+                    objects = sg_data.get('objects', [])
+                    for obj in objects:
+                        obj_label = str(obj.get('label', obj.get('type', obj.get('name', '')))).lower().strip()
+                        obj_attributes = obj.get('attributes', [])
+                        if isinstance(obj_attributes, dict):
+                            obj_attributes = list(obj_attributes.values())
+                        
+                        for attr in obj_attributes:          
+                            attr_val = attr.get('value', "") if isinstance(attr, dict) else attr
+                            if isinstance(attr_val, str) and attr_val.strip().startswith("[") and attr_val.strip().endswith("]"):
+                                try:
+                                    attr_val = ast.literal_eval(attr_val.strip())
+                                except (ValueError, SyntaxError):
+                                    pass
+                            if not isinstance(attr_val, list):
+                                attr_val = [attr_val]
+                            for single_attr in attr_val:
+                                attr_clean = str(single_attr).lower().strip()
+                                if obj_label in self.attr_json and attr_clean in self.attr_json[obj_label]:
+                                    neg_attr = self.attr_json[obj_label][attr_clean]
+                                    if neg_attr:
+                                        neg = random.choice(neg_attr)
+                                        neg_desc = neg_desc.replace(attr_clean, neg)
+                            #probability = random.random()
+                
             descriptions.append(description) 
             flip_descs.append(flip_desc)
             color_change_descs.append(color_change_desc)
-
-        # NOTE: contrary to image classification where __getitem__ returns only one image 
+            neg_attr_descs.append(neg_desc)
+            
+         # NOTE: contrary to image classification where __getitem__ returns only one image 
         # in GSVCities, we return a place, which is a Tesor of K images (K=self.img_per_place)
         # this will return a Tensor of shape [K, channels, height, width]. This needs to be taken into account 
         # in the Dataloader (which will yield batches of shape [BS, K, channels, height, width])
-        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place), descriptions, flip_descs, color_change_descs
+        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place), descriptions, flip_descs, color_change_descs, neg_attr_descs
 
     def __len__(self):
         '''Denotes the total number of places (not images)'''
@@ -180,6 +232,6 @@ class GSVCitiesDataset(Dataset):
         image_path = df['image_path'].values
         description = df['description'].values    
         flip_desc = df['flip'].values    
-        color_change_desc = df['change_color'].values    
-        image_path = [posixpath.join(image_root, p) for p in image_path]
-        return image_path, description, flip_desc, color_change_desc
+        color_change_desc = df['change_color'].values            
+        image_full_path = [posixpath.join(image_root, p) for p in image_path]        
+        return image_path, image_full_path, description, flip_desc, color_change_desc
