@@ -14,12 +14,15 @@ from model.LaVPR import LaVPR
 
 def parse_arguments():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)    
-    parser.add_argument("--model_name", type=str, default="Salesforce/blip-itm-base-coco")        
-    parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
-    parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
+    # parser.add_argument("--model_name", type=str, default="Salesforce/blip-itm-base-coco")        
+    # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
+    # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
+    parser.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224")            
+    parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
+    parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
     parser.add_argument("--epochs", type=int, default='10', help="number of epochs to train")    
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
@@ -33,7 +36,7 @@ def parse_arguments():
     parser.add_argument("--batch_size", type=int, default="40", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss")    
-    parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
+    parser.add_argument("--is_val", type=int, default="0", help="run validation 0=no/1=yes")
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
     #parser.add_argument("--lora_target_modules", nargs='+', default=["q_proj", "v_proj"], help="when not lora_all_linear, lora target modules")    
@@ -45,6 +48,7 @@ def parse_arguments():
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     parser.add_argument("--pos_loss", type=int, default="1", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="1", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
+    parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
     
     args = parser.parse_args()
     
@@ -91,14 +95,17 @@ if __name__ == '__main__':
         embeds_dim=args.embeds_dim,
         
         #---- Train hyperparameters
-        lr=0.05, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)
-        optimizer='sgd', # sgd, adamw
+        #lr=0.05, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)
+        #optimizer='sgd', # sgd, adamw
+        lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        
+        optimizer='adamw',
         weight_decay=0.001, # 0.001 for sgd and 0 for adam,
         momentum=0.9,
         warmpup_steps=650,
         #milestones=[2],
         milestones=[2,4,6,8],
         lr_mult=0.3,
+        epochs=args.epochs,
 
         #----- Loss functions
         # example: ContrastiveLoss, TripletMarginLoss, MultiSimilarityLoss,
@@ -149,7 +156,7 @@ if __name__ == '__main__':
         accelerator='gpu', devices=[0],
         default_root_dir=f'./LOGS/{"resnet50"}', # Tensorflow can be used to viz
 
-        num_sanity_val_steps=0, # runs a validation step before stating training
+        num_sanity_val_steps=0, # runs a =- step before stating training
         precision=16, # we use half precision to reduce  memory usage
         max_epochs=args.epochs,
         check_val_every_n_epoch=1, # run validation every epoch

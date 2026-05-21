@@ -31,6 +31,7 @@ class LaVPR(pl.LightningModule):
                 warmpup_steps=500,
                 milestones=[5, 10, 15],
                 lr_mult=0.3,
+                epochs=10,
                 
                 #----- Loss
                 loss_name='MultiSimilarityLoss', 
@@ -63,6 +64,7 @@ class LaVPR(pl.LightningModule):
         self.warmpup_steps = warmpup_steps
         self.milestones = milestones
         self.lr_mult = lr_mult
+        self.epochs = epochs
 
         self.loss_name = loss_name
         self.miner_name = miner_name
@@ -164,9 +166,13 @@ class LaVPR(pl.LightningModule):
         if 'blip' in self.model_name:
             img_local = self.text_encoder.encode_image(img)            
             img_embeds = img_local[:,0]
-        elif 'clip' in self.model_name or 'siglip' in self.model_name:
+        elif 'clip' in self.model_name:
             img_embeds = self.text_encoder.get_image_features(pixel_values=img)
             img_embeds = img_embeds.pooler_output
+        elif 'siglip' in self.model_name:
+            img_output = self.text_encoder.get_image_features(pixel_values=img)
+            img_local = self.text_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)            
+            img_embeds = img_output.pooler_output
         elif 'eva' in self.model_name:            
             img_embeds = self.text_encoder.encode_image(img)
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
@@ -184,14 +190,24 @@ class LaVPR(pl.LightningModule):
             attention_mask = text_inputs['attention_mask'].to(self.my_device)                
             text_local = self.text_encoder.encode_text(input_ids=text_tokens, attention_mask=attention_mask)    
             text_embeds= text_local[:, 0]        
-        elif 'clip' in self.model_name or 'siglip' in self.model_name:
+        elif 'clip' in self.model_name:        
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
             text_tokens = text_inputs.input_ids.to(self.my_device)
             attention_mask = None
             if 'attention_mask' in text_inputs:
                 attention_mask = text_inputs['attention_mask'].to(self.my_device)                
-            text_embeds = self.text_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
-            text_embeds = text_embeds.pooler_output            
+            text_output = self.text_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
+            text_local = self.text_encoder.text_projection(text_output.last_hidden_state)
+            text_embeds = text_output.pooler_output    
+        elif 'siglip' in self.model_name:
+            text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
+            text_tokens = text_inputs.input_ids.to(self.my_device)
+            attention_mask = None
+            if 'attention_mask' in text_inputs:
+                attention_mask = text_inputs['attention_mask'].to(self.my_device)                
+            text_output = self.text_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
+            text_local = self.text_encoder.base_model.model.text_model.head(text_output.last_hidden_state)
+            text_embeds = text_output.pooler_output                
         elif 'eva' in self.model_name:
             text_tokens = self.tokenizer(text).to(self.my_device)            
             text_embeds = self.text_encoder.encode_text(text_tokens)    
@@ -212,8 +228,8 @@ class LaVPR(pl.LightningModule):
         if self.pos_loss:
             if flip_desc is not None:
                 text_flip_embeds, _, _ = self.encode_text(flip_desc)
-            if color_change_desc is not None:
-                text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
+            # if color_change_desc is not None:
+            #     text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         if self.neg_loss:
             if neg_attr_desc is not None:
                 text_neg_attr_embeds, _, _ = self.encode_text(neg_attr_desc)
@@ -258,8 +274,43 @@ class LaVPR(pl.LightningModule):
                                         weight_decay=self.weight_decay)
         else:
             raise ValueError(f'Optimizer {self.optimizer} has not been added to "configure_optimizers()"')
-        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=self.milestones, gamma=self.lr_mult)
-        return [optimizer], [scheduler]
+        
+        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=self.milestones, gamma=self.lr_mult)        
+        
+        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     optimizer,
+        #     T_max=self.epochs,  # Total number of epochs to decay over
+        #     eta_min=1e-6        # The minimum LR floor (prevents dropping to absolute 0)
+        # )
+        
+        # # 1. Calculate steps
+        # steps_per_epoch = self.trainer.num_training_batches        
+        # # Calculate total step iterations across all epochs
+        # total_steps = self.epochs * steps_per_epoch        
+
+        # # 2. Define the Warmup Phase (from 1/10th of LR up to full LR)
+        # warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        #     optimizer, 
+        #     start_factor=0.1, 
+        #     end_factor=1.0, 
+        #     total_iters=self.warmpup_steps
+        # )
+
+        # # 3. Define the Cosine Decay Phase (runs for the remaining steps)
+        # cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     optimizer, 
+        #     T_max=(total_steps - self.warmpup_steps), 
+        #     eta_min=1e-6
+        # )
+
+        # # 4. Chain them sequentially
+        # scheduler = torch.optim.lr_scheduler.SequentialLR(
+        #     optimizer, 
+        #     schedulers=[warmup_scheduler, cosine_scheduler], 
+        #     milestones=[self.warmpup_steps]  # Switches to cosine exactly at step 650
+        # )
+
+        # return [optimizer], [scheduler]
     
     # configure the optizer step, takes into account the warmup stage
     def optimizer_step(self,  epoch, batch_idx,
