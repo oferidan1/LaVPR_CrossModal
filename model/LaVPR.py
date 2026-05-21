@@ -171,7 +171,7 @@ class LaVPR(pl.LightningModule):
             img_embeds = img_embeds.pooler_output
         elif 'siglip' in self.model_name:
             img_output = self.text_encoder.get_image_features(pixel_values=img)
-            img_local = self.text_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)            
+            img_local = self.text_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
             img_embeds = img_output.pooler_output
         elif 'eva' in self.model_name:            
             img_embeds = self.text_encoder.encode_image(img)
@@ -310,7 +310,7 @@ class LaVPR(pl.LightningModule):
         #     milestones=[self.warmpup_steps]  # Switches to cosine exactly at step 650
         # )
 
-        # return [optimizer], [scheduler]
+        return [optimizer], [scheduler]
     
     # configure the optizer step, takes into account the warmup stage
     def optimizer_step(self,  epoch, batch_idx,
