@@ -171,7 +171,8 @@ class LaVPR(pl.LightningModule):
             img_embeds = img_embeds.pooler_output
         elif 'siglip' in self.model_name:
             img_output = self.text_encoder.get_image_features(pixel_values=img)
-            img_local = self.text_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
+            #img_local = self.text_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
+            img_local = img_output.last_hidden_state            
             img_embeds = img_output.pooler_output
         elif 'eva' in self.model_name:            
             img_embeds = self.text_encoder.encode_image(img)
@@ -206,7 +207,8 @@ class LaVPR(pl.LightningModule):
             if 'attention_mask' in text_inputs:
                 attention_mask = text_inputs['attention_mask'].to(self.my_device)                
             text_output = self.text_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
-            text_local = self.text_encoder.base_model.model.text_model.head(text_output.last_hidden_state)
+            #text_local = self.text_encoder.base_model.model.text_model.head(text_output.last_hidden_state)
+            text_local = text_output.last_hidden_state
             text_embeds = text_output.pooler_output                
         elif 'eva' in self.model_name:
             text_tokens = self.tokenizer(text).to(self.my_device)            
@@ -227,32 +229,50 @@ class LaVPR(pl.LightningModule):
         text_embeds, text_local, attention_mask = self.encode_text(text)
         if self.pos_loss:
             if flip_desc is not None:
-                text_flip_embeds, _, _ = self.encode_text(flip_desc)
+                text_flip_embeds, text_flip_local, attention_mask_flip = self.encode_text(flip_desc)
             # if color_change_desc is not None:
             #     text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         if self.neg_loss:
             if neg_attr_desc is not None:
-                text_neg_attr_embeds, _, _ = self.encode_text(neg_attr_desc)
+                text_neg_attr_embeds, text_neg_local, attention_mask_neg = self.encode_text(neg_attr_desc)
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
         w_v, w_t = None, None
+        w_v_flip, w_t_flip = None, None
+        w_v_neg, w_t_neg = None, None        
         
         if self.ot_loss>0 and img_local is not None and text_local is not None:
             t_mask = None
+            t_mask_flip = None
+            t_mask_neg = None
             if attention_mask is not None:
                 t_mask = attention_mask[:, 1:]
+            if attention_mask_flip is not None:
+                t_mask_flip = attention_mask_flip[:, 1:]
+            if attention_mask_neg is not None:
+                t_mask_neg = attention_mask_neg[:, 1:]            
             
             # Calculate L-OT weights and loss
             ot_loss, w_v, w_t = self.local_ot_loss(img_local[:, 1:], text_local[:, 1:], t_mask=t_mask)
+            ot_loss_flip, w_v_flip, w_t_flip = self.local_ot_loss(img_local[:, 1:], text_flip_local[:, 1:], t_mask=t_mask_flip)
+            ot_loss_neg, w_v_neg, w_t_neg = self.local_ot_loss(img_local[:, 1:], text_neg_local[:, 1:], t_mask=t_mask_neg)
 
         if self.agg_type:
             if self.agg_type == 3:
                 img_embeds = self.img_agg(img_local, token_weights=w_v)
-                text_embeds = self.text_agg(text_local, attention_mask, token_weights=w_t)
+                text_embeds = self.text_agg(text_local, attention_mask, token_weights=w_t)               
+                if flip_desc is not None: 
+                    text_flip_embeds = self.text_agg(text_flip_local, attention_mask_flip, token_weights=w_t_flip)
+                if neg_attr_desc is not None:
+                    text_neg_attr_embeds = self.text_agg(text_neg_local, attention_mask_neg, token_weights=w_t_neg)                
             else:
                 img_embeds = self.agg(img_local, token_weights=w_v)
                 text_embeds = self.agg(text_local, attention_mask, token_weights=w_t)
+                if flip_desc is not None:
+                    text_flip_embeds = self.agg(text_flip_local, attention_mask_flip, token_weights=w_t_flip)
+                if neg_attr_desc is not None:
+                    text_neg_attr_embeds = self.agg(text_neg_local, attention_mask_neg, token_weights=w_t_neg)    
 
         return img_embeds, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss
     

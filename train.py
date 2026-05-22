@@ -48,7 +48,8 @@ def parse_arguments():
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     parser.add_argument("--pos_loss", type=int, default="1", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="1", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
-    parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
+    parser.add_argument("--lr", type=float, default="0.05", help="learning rate")
+    #parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
     
     args = parser.parse_args()
     
@@ -92,13 +93,11 @@ if __name__ == '__main__':
     model = LaVPR(
         #---- Encoder
         model_name=args.model_name.lower(),        
-        embeds_dim=args.embeds_dim,
-        
-        #---- Train hyperparameters
-        #lr=0.05, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)
-        #optimizer='sgd', # sgd, adamw
+        embeds_dim=args.embeds_dim,        
+        #---- Train hyperparameters        
         lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        
-        optimizer='adamw',
+        optimizer='sgd', # sgd, adamw
+        #optimizer='adamw',        
         weight_decay=0.001, # 0.001 for sgd and 0 for adam,
         momentum=0.9,
         warmpup_steps=650,
