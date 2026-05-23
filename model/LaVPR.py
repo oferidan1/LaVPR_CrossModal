@@ -3,6 +3,7 @@ import torch
 from torch.optim import lr_scheduler, optimizer
 import utils
 from torch import nn
+import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import AutoTokenizer, AutoModel
 import os
@@ -52,6 +53,7 @@ class LaVPR(pl.LightningModule):
                 pos_loss=0,
                 neg_loss=0,
                 latent_mixup=0.0,
+                dynamic_gamma=0,
                  ):
         super().__init__()       
         
@@ -94,7 +96,8 @@ class LaVPR(pl.LightningModule):
         self.pos_loss = pos_loss
         self.neg_loss = neg_loss
         self.latent_mixup = latent_mixup
-
+        self.dynamic_gamma = dynamic_gamma
+        
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
             self.contrastive_loss = utils.losses.contrastive_loss_cross_modal
@@ -353,7 +356,18 @@ class LaVPR(pl.LightningModule):
     def loss_function(self, descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss=0.0):
         
         # we mine the pairs/triplets if there is an online mining strategy
-        if self.miner is not None:                        
+        if self.cross_modal == 5:
+            desc_all = torch.cat([descriptors, text_embeds], dim=0)
+            labels_all = torch.cat([labels, labels], dim=0)
+            miner_outputs = self.miner(desc_all, labels_all)     
+            loss = self.loss_fn(desc_all, labels_all, indices_tuple=miner_outputs)              
+            # calculate the % of trivial pairs/triplets
+            # which do not contribute in the loss value
+            nb_samples = desc_all.shape[0]
+            nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
+            batch_acc = 1.0 - (nb_mined/nb_samples)
+            
+        elif self.miner is not None:                        
             ref_labels = labels.clone()
             ref_embs = text_embeds
             #add text_flip_embeds, text_color_change_embeds, to ref_emb with positive labels (same place), and add negative labels for them (different place)
@@ -366,6 +380,29 @@ class LaVPR(pl.LightningModule):
                 ref_embs = torch.cat([ref_embs, text_neg_attr_embeds], dim=0)
                 ref_labels = torch.cat([ref_labels, labels + 10**8], dim=0)
             miner_outputs = self.miner(descriptors, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
+            # --- NEW: Compute Batch-Adaptive Base ---
+            if self.dynamic_gamma:
+                with torch.no_grad():                    
+                    
+                    # 2. Compute the full similarity matrix between query and reference batches
+                    sim_matrix = torch.matmul(descriptors, ref_embs.T)
+                    
+                    # 3. Create a binary mask where labels match (true positive pairs)
+                    # Using unsqueeze allows broadcasting: [Batch_Q, 1] == [1, Batch_R]
+                    pos_mask = (labels.unsqueeze(1) == ref_labels.unsqueeze(0))
+                    
+                    # 4. Extract positive values and safely calculate the mean
+                    pos_similarities = sim_matrix[pos_mask]
+                    
+                    if pos_similarities.numel() > 0:
+                        mean_pos_sim = pos_similarities.mean().item()
+                        # Use the raw mean as the zero-point boundary.
+                        # Clamp it between 0.35 and 0.45 to prevent extreme drift.
+                        self.loss_fn.base = max(0.35, min(mean_pos_sim, 0.45))
+                    else:
+                        # Fallback to your stable 0.4 default if a weird batch has zero positive pairs
+                        self.loss_fn.base = 0.4            
+            
             loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
             if self.latent_mixup>0:
                 # calculate latent mixup loss:
@@ -484,7 +521,7 @@ class LaVPR(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         places, _, texts = batch
         # calculate descriptors
-        descriptors, text_embeds, _, _, _ = self(places, texts)
+        descriptors, text_embeds, _, _, _, _ = self(places, texts)
         #return descriptors.detach().cpu()
         descriptors = descriptors.detach().cpu()        
         text_embeds_cpu = text_embeds.detach().cpu()        

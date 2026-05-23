@@ -97,7 +97,7 @@ class CosineSALAD(nn.Module):
     def __init__(self, 
                  num_channels=256, 
                  num_clusters=64, 
-                 cluster_dim=128, 
+                 cluster_dim=16, 
                  token_dim=256):
         super().__init__()
         
@@ -179,7 +179,7 @@ class CosineSALAD(nn.Module):
         v_local = v_agg.flatten(1) 
         v_global = t
 
-        f_out = torch.cat([v_global, v_local], dim=-1)
+        f_out = torch.cat([v_global, v_local], dim=-1)       
         return F.normalize(f_out, p=2, dim=-1)
 
 

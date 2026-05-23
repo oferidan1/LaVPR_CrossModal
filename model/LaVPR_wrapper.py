@@ -61,7 +61,7 @@ class LaVPR_wrapper():
             
             self.encoder_dim = self.embeds_dim
             if args.agg_type:
-                self.encoder_dim = 8448           
+                self.encoder_dim = 1280 #8448           
             
             
         

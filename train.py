@@ -14,12 +14,12 @@ from model.LaVPR import LaVPR
 
 def parse_arguments():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)    
-    parser.add_argument("--model_name", type=str, default="Salesforce/blip-itm-base-coco")        
-    parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
-    parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
-    # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
-    # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
-    # parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
+    # parser.add_argument("--model_name", type=str, default="Salesforce/blip-itm-base-coco")        
+    # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
+    # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
+    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
+    parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
+    parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224")            
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
@@ -28,28 +28,30 @@ def parse_arguments():
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
     parser.add_argument("--image_root", type=str, default="/home/shared/datasets/gsv_cities/", help="root directory for images")
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
+    parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
     parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
     parser.add_argument("--is_trainable_text_encoder", type=int, default="1", help="train text encoder or not")
-    parser.add_argument("--batch_size", type=int, default="40", help="batch size for training")
+    parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
-    parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss")    
-    parser.add_argument("--is_val", type=int, default="0", help="run validation 0=no/1=yes")
+    parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss/5=concat text and image")        
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
     #parser.add_argument("--lora_target_modules", nargs='+', default=["q_proj", "v_proj"], help="when not lora_all_linear, lora target modules")    
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
-    parser.add_argument("--agg_type", type=int, default="2", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
+    parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
     parser.add_argument("--ot_loss", type=float, default="0", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
     parser.add_argument("--latent_mixup", type=float, default="0", help="multplier for latent_mixup loss, 0=no latent_mixup loss, >0 use latent_mixup loss")
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
-    parser.add_argument("--pos_loss", type=int, default="1", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
-    parser.add_argument("--neg_loss", type=int, default="1", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
-    parser.add_argument("--lr", type=float, default="0.05", help="learning rate")
+    parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
+    parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
+    parser.add_argument("--lr", type=float, default="0.05", help="learning rate")    
     #parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
+    parser.add_argument("--opt", type=str, default="sgd", help="optimizer sgd/adam/adamw")    
+    parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
     
     args = parser.parse_args()
     
@@ -96,7 +98,7 @@ if __name__ == '__main__':
         embeds_dim=args.embeds_dim,        
         #---- Train hyperparameters        
         lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        
-        optimizer='sgd', # sgd, adamw
+        optimizer=args.opt, # sgd, adamw
         #optimizer='adamw',        
         weight_decay=0.001, # 0.001 for sgd and 0 for adam,
         momentum=0.9,
@@ -124,6 +126,7 @@ if __name__ == '__main__':
         pos_loss=args.pos_loss,
         neg_loss=args.neg_loss,
         latent_mixup=args.latent_mixup,
+        dynamic_gamma=args.dynamic_gamma,
     )
         
     model = model.to('cuda')
