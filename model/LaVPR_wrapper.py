@@ -14,11 +14,13 @@ from transformers import AutoModel, AutoProcessor
 import open_clip
 
 
+
 class LaVPR_wrapper():
     def __init__(self, args):
         self.model_name = args.model_name
         self.device = args.device
         self.embeds_dim = args.embeds_dim
+        self.encoder_dim = args.embeds_dim
        
         if args.cross_modal==1:
             self.max_text_length = 77
@@ -26,17 +28,19 @@ class LaVPR_wrapper():
                 self.vpr_encoder = BlipForImageTextRetrievalWrapper.from_pretrained(self.model_name)
                 self.processor = BlipProcessor.from_pretrained(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)
-            if 'clip' in self.model_name or 'siglip' in self.model_name:
+            elif 'llm2clip' in self.model_name:
+                from llm2clip.llm2clip import load_llm2clip
+                self.vpr_encoder, self.text_encoder, self.processor = load_llm2clip()            
+            elif 'clip' in self.model_name or 'siglip' in self.model_name:
                 self.vpr_encoder = AutoModel.from_pretrained(self.model_name)
                 self.processor = AutoProcessor.from_pretrained(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)
-            if 'siglip' in self.model_name:
+            elif 'siglip' in self.model_name:
                  self.max_text_length = 64
-            if 'eva' in self.model_name.lower():
+            elif 'eva' in self.model_name.lower():
                 self.vpr_encoder, _, self.processor = open_clip.create_model_and_transforms(self.model_name, pretrained='merged2b_s8b_b131k')#'EVA02-B-16'
                 self.tokenizer = open_clip.get_tokenizer(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)                
-       
         else:            
             self.single_encoder = LaVPR(   
                 #---- Encoder
@@ -90,13 +94,16 @@ class LaVPR_wrapper():
         if 'blip' in self.model_name:
             with torch.no_grad():
                 image_features = self.vpr_encoder.encode_image(images)[:,0]
+        elif 'llm2clip' in self.model_name:
+            image_features = self.vpr_encoder.encode_image(images)        
+            image_features /= image_features.norm(dim=-1, keepdim=True)   
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
             with torch.no_grad():               
                 image_features = self.vpr_encoder.get_image_features(pixel_values=images)
         elif 'eva' in self.model_name.lower():
             with torch.no_grad():                 
                 image_features = self.vpr_encoder.encode_image(images)
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)                
         else:
             with torch.no_grad():
                 image_features = self.vpr_encoder(images)            
@@ -107,6 +114,10 @@ class LaVPR_wrapper():
             text_inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=512).input_ids.to(self.device)
             with torch.no_grad():     
                 text_features = self.vpr_encoder.encode_text(text_inputs)[:,0]
+        elif 'llm2clip' in self.model_name:            
+            text_features = self.text_encoder.encode(texts, convert_to_tensor=True).to(self.device)
+            text_features = self.vpr_encoder.encode_text(text_features)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
         elif 'clip' in self.model_name or 'siglip' in self.model_name:            
             text_inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length).input_ids.to(self.device)
             with torch.no_grad():     
@@ -121,7 +132,7 @@ class LaVPR_wrapper():
             with torch.no_grad():      
                 model_output = self.text_encoder(**text_tokens)                        
                 text_features = model_output[0][:, 0]            
-            text_features = torch.nn.functional.normalize(text_features, p=2, dim=1)   
+            text_features = torch.nn.functional.normalize(text_features, p=2, dim=1)          
         else:
             text_features = self.text_encoder.encode(texts, convert_to_tensor=True)
         return text_features
