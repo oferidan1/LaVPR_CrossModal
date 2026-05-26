@@ -13,6 +13,7 @@ from transformers import AutoModel, AutoProcessor
 import open_clip
 from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
+from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
 
 class LaVPR(pl.LightningModule):
     """This is the main model for Visual Place Recognition
@@ -81,7 +82,10 @@ class LaVPR(pl.LightningModule):
         
         self.save_hyperparameters() # write hyperparams into a file
         
-        self.loss_fn = utils.get_loss(loss_name)
+        if 'WeightedMultiSimilarityLoss' in loss_name:
+            self.loss_fn = WeightedMultiSimilarityLossCM()
+        else:
+            self.loss_fn = utils.get_loss(loss_name)
         self.local_ot_loss = LocalOTLoss()
         self.miner = utils.get_miner(miner_name, miner_margin)
         self.batch_acc = [] # we will keep track of the % of trivial pairs/triplets at the loss level 
@@ -135,7 +139,7 @@ class LaVPR(pl.LightningModule):
         
         # Define LoRA configuration
         # TaskType.FEATURE_EXTRACTION is appropriate for sentence embedding tasks            
-        if self.is_trainable_text_encoder:                
+        if self.is_trainable_text_encoder==1:                
             lora_targets = lora_target_modules
             if lora_all_linear:
                 lora_targets = "all-linear"                    
@@ -606,7 +610,7 @@ class LaVPR(pl.LightningModule):
         print('\n\n')
         
     def on_save_checkpoint(self, checkpoint):
-        if self.is_trainable_text_encoder:
+        if self.is_trainable_text_encoder==1:
             # Lightning gives you where THIS checkpoint is being written            
             ckpt_cb = next(
                 (cb for cb in self.trainer.checkpoint_callbacks 

@@ -35,7 +35,8 @@ def parse_arguments():
     parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
     parser.add_argument("--is_trainable_text_encoder", type=int, default="1", help="train text encoder or not")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
-    parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
+    #parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
+    parser.add_argument("--loss_name", type=str, default="WeightedMultiSimilarityLoss", help="name of the loss function to use")    
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss/5=concat text and image")        
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
@@ -48,10 +49,12 @@ def parse_arguments():
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
-    parser.add_argument("--lr", type=float, default="0.05", help="learning rate")    
-    #parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
-    parser.add_argument("--opt", type=str, default="sgd", help="optimizer sgd/adam/adamw")    
+    #parser.add_argument("--lr", type=float, default="0.05", help="learning rate")    
+    parser.add_argument("--lr", type=float, default="0.00002", help="learning rate")
+    parser.add_argument("--opt", type=str, default="adamw", help="optimizer sgd/adam/adamw")    
     parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
+    parser.add_argument("--resume", type=str, default=None, help="resume training from path")
+    #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
     
     args = parser.parse_args()
     
@@ -116,6 +119,7 @@ if __name__ == '__main__':
         miner_margin=0.1,
         faiss_gpu=False,        
         cross_modal=args.cross_modal,
+        is_freeze_text=args.is_freeze_text,
         is_trainable_text_encoder=args.is_trainable_text_encoder,
         lora_all_linear=args.lora_all_linear,
         lora_target_modules=args.lora_target_modules,
@@ -128,6 +132,9 @@ if __name__ == '__main__':
         latent_mixup=args.latent_mixup,
         dynamic_gamma=args.dynamic_gamma,
     )
+    
+    if args.resume is not None:
+        model = model.load_from_checkpoint(args.resume)
         
     model = model.to('cuda')
     
@@ -157,7 +164,6 @@ if __name__ == '__main__':
     trainer = pl.Trainer(
         accelerator='gpu', devices=[0],
         default_root_dir=f'./LOGS/{"resnet50"}', # Tensorflow can be used to viz
-
         num_sanity_val_steps=0, # runs a =- step before stating training
         precision=16, # we use half precision to reduce  memory usage
         max_epochs=args.epochs,
@@ -165,6 +171,8 @@ if __name__ == '__main__':
         callbacks=[checkpoint_cb],# we only run the checkpointing callback (you can add more)
         reload_dataloaders_every_n_epochs=1, # we reload the dataset to shuffle the order
         log_every_n_steps=20,
+        gradient_clip_val=1.0,  
+        gradient_clip_algorithm="norm"
         # fast_dev_run=True # uncomment or dev mode (only runs a one iteration train and validation, no checkpointing).
     )
     
