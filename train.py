@@ -56,7 +56,7 @@ def parse_arguments():
     parser.add_argument("--milestones", nargs="+", type=int, default=[5,8], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
     parser.add_argument("--resume", type=str, default=None, help="resume training from path")
-    parser.add_argument("--tokens_idf_loss", type=int, default="1", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--tokens_idf_loss", type=float, default="1", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 

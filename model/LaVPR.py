@@ -56,7 +56,7 @@ class LaVPR(pl.LightningModule):
                 neg_loss=0,
                 latent_mixup=0.0,
                 dynamic_gamma=0,
-                tokens_idf_loss=0,
+                tokens_idf_loss=0.0,
                 tokens_idf_file=None,
                  ):
         super().__init__()       
