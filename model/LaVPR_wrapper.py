@@ -64,7 +64,7 @@ class LaVPR_wrapper():
             self.single_encoder.eval()            
             
             self.encoder_dim = self.embeds_dim
-            if args.agg_type:
+            if args.agg_type>0 and args.agg_type<4:
                 self.encoder_dim = 1280 #8448           
             
             
@@ -87,7 +87,7 @@ class LaVPR_wrapper():
     
     def encode_single(self, images, texts):
         with torch.no_grad():
-            features, text_features, _ , _ , _, _  = self.single_encoder(images, texts)
+            features, text_features, _ , _ , _, _, _  = self.single_encoder(images, texts)
         return features, text_features
     
     def encode_image(self, images):

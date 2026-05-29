@@ -33,10 +33,10 @@ def parse_arguments():
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
     parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
-    parser.add_argument("--is_trainable_text_encoder", type=int, default="1", help="train text encoder or not")
+    parser.add_argument("--is_trainable_text_encoder", type=int, default="1", help="train text encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
-    #parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
-    parser.add_argument("--loss_name", type=str, default="WeightedMultiSimilarityLoss", help="name of the loss function to use")    
+    parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
+    #parser.add_argument("--loss_name", type=str, default="WeightedMultiSimilarityLoss", help="name of the loss function to use")    
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss/5=concat text and image")        
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
@@ -49,11 +49,16 @@ def parse_arguments():
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
-    #parser.add_argument("--lr", type=float, default="0.05", help="learning rate")    
-    parser.add_argument("--lr", type=float, default="0.00002", help="learning rate")
     parser.add_argument("--opt", type=str, default="adamw", help="optimizer sgd/adam/adamw")    
+    parser.add_argument("--lr", type=float, default="0.00002", help="learning rate")
+    parser.add_argument("--lr_mult", type=float, default="0.3", help="learning rate")    
+    #parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6,8], help="milestones for lr scheduler seperated by space")
+    parser.add_argument("--milestones", nargs="+", type=int, default=[5,8], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
     parser.add_argument("--resume", type=str, default=None, help="resume training from path")
+    parser.add_argument("--tokens_idf_loss", type=int, default="1", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
+    
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
     
     args = parser.parse_args()
@@ -102,13 +107,11 @@ if __name__ == '__main__':
         #---- Train hyperparameters        
         lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        
         optimizer=args.opt, # sgd, adamw
-        #optimizer='adamw',        
         weight_decay=0.001, # 0.001 for sgd and 0 for adam,
         momentum=0.9,
-        warmpup_steps=650,
-        #milestones=[2],
-        milestones=[2,4,6,8],
-        lr_mult=0.3,
+        warmpup_steps=650,        
+        milestones=args.milestones,
+        lr_mult=args.lr_mult,
         epochs=args.epochs,
 
         #----- Loss functions
@@ -131,6 +134,8 @@ if __name__ == '__main__':
         neg_loss=args.neg_loss,
         latent_mixup=args.latent_mixup,
         dynamic_gamma=args.dynamic_gamma,
+        tokens_idf_loss=args.tokens_idf_loss,
+        tokens_idf_file=args.tokens_idf_file,
     )
     
     if args.resume is not None:

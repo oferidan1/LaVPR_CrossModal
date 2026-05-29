@@ -163,9 +163,12 @@ def main(args):
             recalls_str = ", ".join([f"R@{val}: {rec:.1f}" for val, rec in zip(args.recall_values, recalls)])
             logger.info(recalls_str)
             
+            #model path is either lora_path *if not None) or model path (if not None) params
+            model_path = args.lora_path if args.lora_path is not None else args.model_path
+            
             # open eval_vpr_results.csv in append mode and write the recalls
             with open("eval_vpr_results.csv", "a") as f:
-                f.write(f"{args.model_name},{recalls_str}\n")
+                f.write(f"{model_path},{args.model_name},{recalls_str}\n")
             
     # Save visualizations of predictions
     if args.num_preds_to_save != 0:

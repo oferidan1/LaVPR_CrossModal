@@ -14,6 +14,7 @@ import open_clip
 from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
 from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
+from model.tokens_classify_loss import TokensClassificationLoss
 
 class LaVPR(pl.LightningModule):
     """This is the main model for Visual Place Recognition
@@ -55,6 +56,8 @@ class LaVPR(pl.LightningModule):
                 neg_loss=0,
                 latent_mixup=0.0,
                 dynamic_gamma=0,
+                tokens_idf_loss=0,
+                tokens_idf_file=None,
                  ):
         super().__init__()       
         
@@ -101,6 +104,11 @@ class LaVPR(pl.LightningModule):
         self.neg_loss = neg_loss
         self.latent_mixup = latent_mixup
         self.dynamic_gamma = dynamic_gamma
+        self.tokens_idf_loss = tokens_idf_loss
+        self.tokens_idf_file = tokens_idf_file
+        
+        if self.tokens_idf_loss:
+            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=49408, idf_path=self.tokens_idf_file)
         
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -114,6 +122,8 @@ class LaVPR(pl.LightningModule):
         elif agg_type == 3:
             self.text_agg = CosineSALAD(num_channels=embeds_dim)
             self.img_agg = CosineSALAD(num_channels=embeds_dim)
+        elif agg_type == 4:
+            self.agg = TextGatedAttentionPooler(hidden_dim=embeds_dim, output_dim=embeds_dim)
                 
         # init weight of linear layers but not the pretrained backbones
         self.apply(self._init_weights)
@@ -174,8 +184,9 @@ class LaVPR(pl.LightningModule):
             img_local = self.text_encoder.encode_image(img)            
             img_embeds = img_local[:,0]
         elif 'clip' in self.model_name:
-            img_embeds = self.text_encoder.get_image_features(pixel_values=img)
-            img_embeds = img_embeds.pooler_output
+            img_output = self.text_encoder.get_image_features(pixel_values=img)
+            img_local = img_output.last_hidden_state            
+            img_embeds = img_output.pooler_output
         elif 'siglip' in self.model_name:
             img_output = self.text_encoder.get_image_features(pixel_values=img)
             #img_local = self.text_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
@@ -222,7 +233,7 @@ class LaVPR(pl.LightningModule):
             text_embeds = self.text_encoder.encode_text(text_tokens)    
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)                   
         
-        return text_embeds, text_local, attention_mask
+        return text_embeds, text_local, attention_mask, text_tokens
     
     
     # the forward pass of the lightning model
@@ -233,7 +244,7 @@ class LaVPR(pl.LightningModule):
         text_neg_attr_embeds = None
         
         img_embeds, img_local = self.encode_image(img)
-        text_embeds, text_local, attention_mask = self.encode_text(text)
+        text_embeds, text_local, attention_mask, text_tokens = self.encode_text(text)
         if self.pos_loss:
             if flip_desc is not None:
                 text_flip_embeds, text_flip_local, attention_mask_flip = self.encode_text(flip_desc)
@@ -245,6 +256,7 @@ class LaVPR(pl.LightningModule):
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
+        tidf_loss = 0.0
         w_v, w_t = None, None
         w_v_flip, w_t_flip = None, None
         w_v_neg, w_t_neg = None, None        
@@ -266,22 +278,29 @@ class LaVPR(pl.LightningModule):
             ot_loss_neg, w_v_neg, w_t_neg = self.local_ot_loss(img_local[:, 1:], text_neg_local[:, 1:], t_mask=t_mask_neg)
 
         if self.agg_type:
-            if self.agg_type == 3:
+            if self.agg_type == 4: # gated attention 
+                text_embeds = self.agg(text_local, attention_mask, text_embeds)
+            elif self.agg_type == 3: # double salad
                 img_embeds = self.img_agg(img_local, token_weights=w_v)
                 text_embeds = self.text_agg(text_local, attention_mask, token_weights=w_t)               
                 if flip_desc is not None: 
                     text_flip_embeds = self.text_agg(text_flip_local, attention_mask_flip, token_weights=w_t_flip)
                 if neg_attr_desc is not None:
                     text_neg_attr_embeds = self.text_agg(text_neg_local, attention_mask_neg, token_weights=w_t_neg)                
-            else:
+            else: #salad
                 img_embeds = self.agg(img_local, token_weights=w_v)
                 text_embeds = self.agg(text_local, attention_mask, token_weights=w_t)
                 if flip_desc is not None:
                     text_flip_embeds = self.agg(text_flip_local, attention_mask_flip, token_weights=w_t_flip)
                 if neg_attr_desc is not None:
                     text_neg_attr_embeds = self.agg(text_neg_local, attention_mask_neg, token_weights=w_t_neg)    
+                    
+        if self.tokens_idf_loss:
+            img_embeds_avg = img_local[:, 1:].mean(dim=1)
+            #img_embeds_avg = img_embeds_avg / img_embeds_avg.norm(dim=-1, keepdim=True)
+            tidf_loss = self.tokens_classification_loss(vision_embeddings=img_embeds_avg, batch_text_ids=text_tokens)
 
-        return img_embeds, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss
+        return img_embeds, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss, tidf_loss
     
     
     # configure the optimizer 
@@ -357,7 +376,7 @@ class LaVPR(pl.LightningModule):
 
             
     #  The loss function call (this method will be called at each training iteration)
-    def loss_function(self, descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss=0.0):
+    def loss_function(self, descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss=0.0, tidf_loss=0.0):
         
         # we mine the pairs/triplets if there is an online mining strategy
         if self.cross_modal == 5:
@@ -374,17 +393,23 @@ class LaVPR(pl.LightningModule):
         elif self.miner is not None:                        
             ref_labels = labels.clone()
             ref_embs = text_embeds
-            #add text_flip_embeds, text_color_change_embeds, to ref_emb with positive labels (same place), and add negative labels for them (different place)
+            
+            # add positive augmentations
             if self.pos_loss:
                 # ref_embs = torch.cat([text_embeds, text_flip_embeds, text_color_change_embeds], dim=0)
                 # ref_labels = torch.cat([ref_labels, labels, labels], dim=0)
                 ref_embs = torch.cat([text_embeds, text_flip_embeds], dim=0)
                 ref_labels = torch.cat([ref_labels, labels], dim=0)                                
-            if self.neg_loss:
+            
+            # add negative augmentations
+            if self.neg_loss: 
                 ref_embs = torch.cat([ref_embs, text_neg_attr_embeds], dim=0)
                 ref_labels = torch.cat([ref_labels, labels + 10**8], dim=0)
+            
+            #mine hard negatives
             miner_outputs = self.miner(descriptors, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
-            # --- NEW: Compute Batch-Adaptive Base ---
+            
+            # Compute Batch-Adaptive Base ---
             if self.dynamic_gamma:
                 with torch.no_grad():                    
                     
@@ -406,8 +431,10 @@ class LaVPR(pl.LightningModule):
                     else:
                         # Fallback to your stable 0.4 default if a weird batch has zero positive pairs
                         self.loss_fn.base = 0.4            
-            
+            #calc loss
             loss = self.loss_fn(descriptors, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)              
+            
+            # latent mixup?
             if self.latent_mixup>0:
                 # calculate latent mixup loss:
                 # Extract negative pairs from the miner outputs
@@ -439,7 +466,7 @@ class LaVPR(pl.LightningModule):
                     
                     mixup_loss = torch.nn.functional.mse_loss(score1, score2)
                     loss = loss + self.latent_mixup * mixup_loss
-
+            #uni modal loss?
             if self.unimodal_loss>0:
                 # calculate unimodal loss for image modality
                 # miner_outputs = self.miner(descriptors, labels)     
@@ -449,7 +476,7 @@ class LaVPR(pl.LightningModule):
                 #loss = loss + self.unimodal_loss * img_loss + self.unimodal_loss * txt_loss
                 loss = loss + self.unimodal_loss * txt_loss
 
-            loss = loss + self.ot_loss * ot_loss
+            loss = loss + self.ot_loss * ot_loss + self.tokens_idf_loss * tidf_loss
 
             # calculate the % of trivial pairs/triplets
             # which do not contribute in the loss value
@@ -505,8 +532,8 @@ class LaVPR(pl.LightningModule):
         
 
         # Feed forward the batch to the model
-        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs, flat_neg_attr_descs) # Here we are calling the method forward that we defined above
-        loss = self.loss_function(descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss) # Call the loss_function we defined above
+        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs, flat_neg_attr_descs) # Here we are calling the method forward that we defined above
+        loss = self.loss_function(descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
         
@@ -525,7 +552,7 @@ class LaVPR(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         places, _, texts = batch
         # calculate descriptors
-        descriptors, text_embeds, _, _, _, _ = self(places, texts)
+        descriptors, text_embeds, _, _, _, _, _ = self(places, texts)
         #return descriptors.detach().cpu()
         descriptors = descriptors.detach().cpu()        
         text_embeds_cpu = text_embeds.detach().cpu()        
@@ -747,4 +774,133 @@ class MeanReweightingPooler(nn.Module):
         if return_scores:
             return pooled, weights  # return per-token weights
         return pooled   
+
+
+class TextGatedAttentionPooler_1(nn.Module):
+    def __init__(self, hidden_dim=768, output_dim=1024, gated_weight=0.5):
+        super().__init__()
+        self.gated_weight = gated_weight  # Controls landmark injection intensity
+        
+        # Gating network for raw token sequences
+        self.gate_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        self.feature_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
+        )
+        
+        # Projection heads to map elements to your 1024 footprint
+        self.base_projection = nn.Linear(hidden_dim, output_dim)
+        self.gated_projection = nn.Linear(hidden_dim, output_dim)
+        self.layer_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, last_hidden_states, attention_mask, original_pooler_output):
+        """
+        Args:
+            last_hidden_states: [B, Seq_Len, 768] (Raw token states)
+            attention_mask: [B, Seq_Len]
+            original_pooler_output: [B, 768] (CLIP's native EOS token output)
+        """
+        # 1. Project the foundational, pre-aligned CLIP representation
+        base_clip_emb = self.base_projection(original_pooler_output) # Preserves Obj 1
+        
+        # 2. Extract your clean landmark features via Gated Attention
+        gate_scores = torch.sigmoid(self.gate_net(last_hidden_states))
+        transformed_features = self.feature_net(last_hidden_states)
+        
+        mask_expanded = attention_mask.unsqueeze(-1)
+        gated_features = transformed_features * gate_scores * mask_expanded
+        active_gates = gate_scores * mask_expanded
+        
+        gated_context = gated_features.sum(dim=1) / (active_gates.sum(dim=1) + 1e-5)
+        transformed_gated = self.gated_projection(gated_context) # Captures Obj 2
+        
+        # 3. Residual Blending: Base Bridge + Gated Landmark Modifier
+        final_embeddings = base_clip_emb + self.gated_weight * transformed_gated
+        
+        return self.layer_norm(final_embeddings)
     
+
+class TextGatedAttentionPooler(nn.Module):
+    """
+    Hybrid Order-Aware Gated Attention Pooler for Cross-Modal VPR.
+    Combines CLIP's native global semantic anchor (CLS/EOS) with local 
+    1D-Convolutional spatial layouts to preserve left-to-right modifiers.
+    """
+    def __init__(self, hidden_dim=768, output_dim=512, kernel_size=3, gated_weight=0.4):
+        super().__init__()
+        self.gated_weight = gated_weight # Controls directional spatial injection intensity
+        
+        # 1. Global Space Alignment Branch (Objective 1)
+        self.base_projection = nn.Linear(hidden_dim, output_dim)
+        
+        # 2. Local Attribute Binding Branch (Objective 2)
+        self.local_context_net = nn.Conv1d(
+            in_channels=hidden_dim, 
+            out_channels=hidden_dim, 
+            kernel_size=kernel_size, 
+            padding=kernel_size // 2
+        )
+        
+        self.gate_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.feature_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh()
+        )
+        
+        self.gated_projection = nn.Linear(hidden_dim, output_dim)
+        
+        # Final normalization layer
+        self.layer_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, last_hidden_states, attention_mask, original_pooler_output):
+        """
+        Args:
+            last_hidden_states (Tensor): Raw token states from CLIP text tower [Batch, 77, 768]
+            attention_mask (Tensor): Binary token mask [Batch, 77]
+            original_pooler_output (Tensor): CLIP's native sentence embedding [Batch, 768]
+        """
+        # =====================================================================
+        # BRANCH A: NATIVE GLOBAL SEMANTIC ANCHOR
+        # =====================================================================
+        # Project the pre-aligned foundational CLIP representation
+        base_clip_emb = self.base_projection(original_pooler_output)
+        
+        # =====================================================================
+        # BRANCH B: ORDER-AWARE LOCAL LANDMARK EXTRACTION
+        # =====================================================================
+        mask_expanded = attention_mask.unsqueeze(-1)
+        masked_states = last_hidden_states * mask_expanded
+        
+        # Permute to [Batch, 768, 77] for Conv1D phrase grouping
+        x = masked_states.permute(0, 2, 1)
+        x_context = F.gelu(self.local_context_net(x))
+        
+        # Permute back to sequence format [Batch, 77, 768]
+        context_states = x_context.permute(0, 2, 1) * mask_expanded
+        
+        # Compute independent Sigmoid gate scores across contextualized words
+        gate_scores = torch.sigmoid(self.gate_net(context_states))
+        transformed_features = self.feature_net(context_states)
+        
+        gated_features = transformed_features * gate_scores * mask_expanded
+        active_gates = gate_scores * mask_expanded
+        
+        # Normalized Gated Pooling (Weighted Average over sequence landmarks)
+        gated_context = gated_features.sum(dim=1) / (active_gates.sum(dim=1) + 1e-5)
+        transformed_gated = self.gated_projection(gated_context)
+        
+        # =====================================================================
+        # COMBINATION: GLOBAL BASELINE + LOCAL SEQUENTIAL RESIDUAL
+        # =====================================================================
+        final_embeddings = base_clip_emb + self.gated_weight * transformed_gated
+        
+        return self.layer_norm(final_embeddings)
