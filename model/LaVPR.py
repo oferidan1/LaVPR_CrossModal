@@ -15,6 +15,8 @@ from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
 from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
 from model.tokens_classify_loss import TokensClassificationLoss
+from model.pooling_cm import TextGatedAttentionPooler, GeMPooling1D, AttentionGatedPatchPooler, SpatialLayoutPooler
+
 
 class LaVPR(pl.LightningModule):
     """This is the main model for Visual Place Recognition
@@ -58,6 +60,8 @@ class LaVPR(pl.LightningModule):
                 dynamic_gamma=0,
                 tokens_idf_loss=0.0,
                 tokens_idf_file=None,
+                idf_grad_scale=0.05,
+                idf_pooling = 'mean'
                  ):
         super().__init__()       
         
@@ -106,9 +110,11 @@ class LaVPR(pl.LightningModule):
         self.dynamic_gamma = dynamic_gamma
         self.tokens_idf_loss = tokens_idf_loss
         self.tokens_idf_file = tokens_idf_file
+        self.idf_pooling = idf_pooling
+        vocab_size = 49408
         
         if self.tokens_idf_loss:
-            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=49408, idf_path=self.tokens_idf_file)
+            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale)
         
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -124,6 +130,13 @@ class LaVPR(pl.LightningModule):
             self.img_agg = CosineSALAD(num_channels=embeds_dim)
         elif agg_type == 4:
             self.agg = TextGatedAttentionPooler(hidden_dim=embeds_dim, output_dim=embeds_dim)
+            
+        if idf_pooling == 'gem':
+            self.idf_pooling_layer = GeMPooling1D()
+        elif idf_pooling == 'attention':
+            self.idf_pooling_layer = AttentionGatedPatchPooler()
+        elif idf_pooling == 'spatial':
+            self.idf_pooling_layer = SpatialLayoutPooler()            
                 
         # init weight of linear layers but not the pretrained backbones
         self.apply(self._init_weights)
@@ -167,6 +180,9 @@ class LaVPR(pl.LightningModule):
             self.text_encoder = get_peft_model(self.text_encoder, lora_config)
         elif is_freeze_text:
             self.text_encoder.eval()        
+        
+        # self.register_buffer("cap_fq", torch.zeros(1, vocab_size, dtype=torch.float32))
+        # self.register_buffer("num_samples", torch.zeros(1, dtype=torch.float32))
 
                 
     def _init_weights(self, module):
@@ -247,12 +263,12 @@ class LaVPR(pl.LightningModule):
         text_embeds, text_local, attention_mask, text_tokens = self.encode_text(text)
         if self.pos_loss:
             if flip_desc is not None:
-                text_flip_embeds, text_flip_local, attention_mask_flip = self.encode_text(flip_desc)
+                text_flip_embeds, text_flip_local, attention_mask_flip, text_flip_tokens = self.encode_text(flip_desc)
             # if color_change_desc is not None:
             #     text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         if self.neg_loss:
             if neg_attr_desc is not None:
-                text_neg_attr_embeds, text_neg_local, attention_mask_neg = self.encode_text(neg_attr_desc)
+                text_neg_attr_embeds, text_neg_local, attention_mask_neg, text_neg_tokens = self.encode_text(neg_attr_desc)
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
@@ -296,9 +312,14 @@ class LaVPR(pl.LightningModule):
                     text_neg_attr_embeds = self.agg(text_neg_local, attention_mask_neg, token_weights=w_t_neg)    
                     
         if self.tokens_idf_loss:
-            img_embeds_avg = img_local[:, 1:].mean(dim=1)
-            #img_embeds_avg = img_embeds_avg / img_embeds_avg.norm(dim=-1, keepdim=True)
-            tidf_loss = self.tokens_classification_loss(vision_embeddings=img_embeds_avg, batch_text_ids=text_tokens)
+            if self.idf_pooling == 'mean':
+                img_embeds_pooled = img_local[:, 1:].mean(dim=1)
+            else:
+                img_embeds_pooled = self.idf_pooling_layer(img_local[:, 1:])
+            tidf_loss = self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
+            #tidf_loss = self.tokens_classification_loss(vision_embeddings=img_local[:, 0], batch_text_ids=text_tokens)
+            #tidf_loss = self.tokens_classification_loss(cap_fq=self.cap_fq,  num_samples=self.num_samples, vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
+            
 
         return img_embeds, text_embeds, text_flip_embeds, text_color_change_embeds, text_neg_attr_embeds, ot_loss, tidf_loss
     
@@ -653,254 +674,3 @@ class LaVPR(pl.LightningModule):
     
 
     
-class CLSReweightingPooler(nn.Module):
-    """
-    Combines the CLS token with attention-pooled tokens.
-    Output: a single pooled vector per sequence.
-    """
-
-    def __init__(self, hidden_size):
-        super().__init__()
-
-        # Attention for token-level importance
-        self.attention = nn.Linear(hidden_size, 1)
-        
-        self.dropout = nn.Dropout(0.1)
-
-        # Learnable mixing of CLS and attention-pooled vector
-        self.mix = nn.Linear(hidden_size * 2, hidden_size)
-
-        # Optional nonlinearity
-        self.activation = nn.Tanh()
-
-    def forward(self, hidden_states, mask=None, return_scores=False):
-        """
-        hidden_states: [B, T, H]
-        mask (optional): [B, T] (1 = keep token, 0 = ignore)
-        """
-
-        # ---- 1. CLS embedding ----
-        cls = hidden_states[:, 0]  # [B, H]
-
-        # ---- 2. Attention scores for each token ----
-        scores = self.attention(hidden_states).squeeze(-1)  # [B, T]
-        
-        # Mask out CLS token
-        scores[:, 0] = -1e4
-
-        if mask is not None:
-            scores = scores.masked_fill(~mask.bool(), -1e4)
-
-        weights = torch.softmax(scores, dim=-1)  # [B, T]
-
-        # ---- 3. Attention-based pooled vector ----
-        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)  # [B, H]
-
-        # # ---- 4. Concatenate CLS + attention-pooled ----
-        combined = torch.cat([cls, pooled], dim=-1)  # [B, 2H]        
-        combined = self.dropout(combined) 
-
-        # ---- 5. Learnable mixing ----
-        pooled = self.activation(self.mix(combined))  # [B, H]
-        
-        #pooled = cls + attn_pooled  # [B, H]
-
-        if return_scores:
-            return pooled, weights  # return per-token weights
-        return pooled   
-    
-
-def mean_pooling(token_embeddings, attention_mask):
-    # First element of model_output contains all token embeddings
-    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-    # Sum of the attention mask
-    sum_mask = torch.clamp(attention_mask.sum(1), min=1e-9).unsqueeze(1)
-    # Mean Pooling
-    return sum_embeddings / sum_mask
-    
-class MeanReweightingPooler(nn.Module):
-    """
-    Combines the Mean token with attention-pooled tokens.
-    Output: a single pooled vector per sequence.
-    """
-
-    def __init__(self, hidden_size):
-        super().__init__()
-
-        # Attention for token-level importance
-        self.attention = nn.Linear(hidden_size, 1)
-        
-        self.dropout = nn.Dropout(0.1)
-
-        # Learnable mixing of CLS and attention-pooled vector
-        self.mix = nn.Linear(hidden_size * 2, hidden_size)
-
-        # Optional nonlinearity
-        self.activation = nn.Tanh()
-
-    def forward(self, hidden_states, mask=None, return_scores=False):
-        """
-        hidden_states: [B, T, H]
-        mask (optional): [B, T] (1 = keep token, 0 = ignore)
-        """
-
-        # ---- 1. CLS embedding ----
-        cls = mean_pooling(hidden_states, mask)  # [B, H]        
-
-        # ---- 2. Attention scores for each token ----
-        scores = self.attention(hidden_states).squeeze(-1)  # [B, T]
-        
-        # Mask out CLS token
-        scores[:, 0] = -1e4
-
-        if mask is not None:
-            scores = scores.masked_fill(~mask.bool(), -1e4)
-
-        weights = torch.softmax(scores, dim=-1)  # [B, T]
-
-        # ---- 3. Attention-based pooled vector ----
-        pooled = torch.sum(hidden_states * weights.unsqueeze(-1), dim=1)  # [B, H]
-
-        # # ---- 4. Concatenate CLS + attention-pooled ----
-        combined = torch.cat([cls, pooled], dim=-1)  # [B, 2H]        
-        combined = self.dropout(combined) 
-
-        # ---- 5. Learnable mixing ----
-        pooled = self.activation(self.mix(combined))  # [B, H]
-        
-        #pooled = cls + attn_pooled  # [B, H]
-
-        if return_scores:
-            return pooled, weights  # return per-token weights
-        return pooled   
-
-
-class TextGatedAttentionPooler_1(nn.Module):
-    def __init__(self, hidden_dim=768, output_dim=1024, gated_weight=0.5):
-        super().__init__()
-        self.gated_weight = gated_weight  # Controls landmark injection intensity
-        
-        # Gating network for raw token sequences
-        self.gate_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        self.feature_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        
-        # Projection heads to map elements to your 1024 footprint
-        self.base_projection = nn.Linear(hidden_dim, output_dim)
-        self.gated_projection = nn.Linear(hidden_dim, output_dim)
-        self.layer_norm = nn.LayerNorm(output_dim)
-
-    def forward(self, last_hidden_states, attention_mask, original_pooler_output):
-        """
-        Args:
-            last_hidden_states: [B, Seq_Len, 768] (Raw token states)
-            attention_mask: [B, Seq_Len]
-            original_pooler_output: [B, 768] (CLIP's native EOS token output)
-        """
-        # 1. Project the foundational, pre-aligned CLIP representation
-        base_clip_emb = self.base_projection(original_pooler_output) # Preserves Obj 1
-        
-        # 2. Extract your clean landmark features via Gated Attention
-        gate_scores = torch.sigmoid(self.gate_net(last_hidden_states))
-        transformed_features = self.feature_net(last_hidden_states)
-        
-        mask_expanded = attention_mask.unsqueeze(-1)
-        gated_features = transformed_features * gate_scores * mask_expanded
-        active_gates = gate_scores * mask_expanded
-        
-        gated_context = gated_features.sum(dim=1) / (active_gates.sum(dim=1) + 1e-5)
-        transformed_gated = self.gated_projection(gated_context) # Captures Obj 2
-        
-        # 3. Residual Blending: Base Bridge + Gated Landmark Modifier
-        final_embeddings = base_clip_emb + self.gated_weight * transformed_gated
-        
-        return self.layer_norm(final_embeddings)
-    
-
-class TextGatedAttentionPooler(nn.Module):
-    """
-    Hybrid Order-Aware Gated Attention Pooler for Cross-Modal VPR.
-    Combines CLIP's native global semantic anchor (CLS/EOS) with local 
-    1D-Convolutional spatial layouts to preserve left-to-right modifiers.
-    """
-    def __init__(self, hidden_dim=768, output_dim=512, kernel_size=3, gated_weight=0.4):
-        super().__init__()
-        self.gated_weight = gated_weight # Controls directional spatial injection intensity
-        
-        # 1. Global Space Alignment Branch (Objective 1)
-        self.base_projection = nn.Linear(hidden_dim, output_dim)
-        
-        # 2. Local Attribute Binding Branch (Objective 2)
-        self.local_context_net = nn.Conv1d(
-            in_channels=hidden_dim, 
-            out_channels=hidden_dim, 
-            kernel_size=kernel_size, 
-            padding=kernel_size // 2
-        )
-        
-        self.gate_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
-        self.feature_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh()
-        )
-        
-        self.gated_projection = nn.Linear(hidden_dim, output_dim)
-        
-        # Final normalization layer
-        self.layer_norm = nn.LayerNorm(output_dim)
-
-    def forward(self, last_hidden_states, attention_mask, original_pooler_output):
-        """
-        Args:
-            last_hidden_states (Tensor): Raw token states from CLIP text tower [Batch, 77, 768]
-            attention_mask (Tensor): Binary token mask [Batch, 77]
-            original_pooler_output (Tensor): CLIP's native sentence embedding [Batch, 768]
-        """
-        # =====================================================================
-        # BRANCH A: NATIVE GLOBAL SEMANTIC ANCHOR
-        # =====================================================================
-        # Project the pre-aligned foundational CLIP representation
-        base_clip_emb = self.base_projection(original_pooler_output)
-        
-        # =====================================================================
-        # BRANCH B: ORDER-AWARE LOCAL LANDMARK EXTRACTION
-        # =====================================================================
-        mask_expanded = attention_mask.unsqueeze(-1)
-        masked_states = last_hidden_states * mask_expanded
-        
-        # Permute to [Batch, 768, 77] for Conv1D phrase grouping
-        x = masked_states.permute(0, 2, 1)
-        x_context = F.gelu(self.local_context_net(x))
-        
-        # Permute back to sequence format [Batch, 77, 768]
-        context_states = x_context.permute(0, 2, 1) * mask_expanded
-        
-        # Compute independent Sigmoid gate scores across contextualized words
-        gate_scores = torch.sigmoid(self.gate_net(context_states))
-        transformed_features = self.feature_net(context_states)
-        
-        gated_features = transformed_features * gate_scores * mask_expanded
-        active_gates = gate_scores * mask_expanded
-        
-        # Normalized Gated Pooling (Weighted Average over sequence landmarks)
-        gated_context = gated_features.sum(dim=1) / (active_gates.sum(dim=1) + 1e-5)
-        transformed_gated = self.gated_projection(gated_context)
-        
-        # =====================================================================
-        # COMBINATION: GLOBAL BASELINE + LOCAL SEQUENTIAL RESIDUAL
-        # =====================================================================
-        final_embeddings = base_clip_emb + self.gated_weight * transformed_gated
-        
-        return self.layer_norm(final_embeddings)

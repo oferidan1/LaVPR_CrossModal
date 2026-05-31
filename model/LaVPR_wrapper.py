@@ -100,6 +100,7 @@ class LaVPR_wrapper():
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
             with torch.no_grad():               
                 image_features = self.vpr_encoder.get_image_features(pixel_values=images)
+            image_features = image_features.pooler_output
         elif 'eva' in self.model_name.lower():
             with torch.no_grad():                 
                 image_features = self.vpr_encoder.encode_image(images)
@@ -122,6 +123,7 @@ class LaVPR_wrapper():
             text_inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length).input_ids.to(self.device)
             with torch.no_grad():     
                 text_features = self.vpr_encoder.get_text_features(input_ids=text_inputs)
+            text_features = text_features.pooler_output  
         elif 'eva' in self.model_name.lower():
             text_tokens = self.tokenizer(texts).to(self.device)
             with torch.no_grad():
