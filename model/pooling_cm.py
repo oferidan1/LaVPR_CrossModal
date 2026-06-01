@@ -307,7 +307,7 @@ class SpatialLayoutPooler(nn.Module):
     Preserves the 14x14 grid structure, projects channels down, 
     and flattens the spatial layout directly.
     """
-    def __init__(self, vision_dim=768, grid_size=14, bottleneck_dim=512):
+    def __init__(self, vision_dim=768, grid_size=14, bottleneck_dim=768):
         super().__init__()
         self.grid_size = grid_size
         
@@ -323,10 +323,10 @@ class SpatialLayoutPooler(nn.Module):
         B, N, C = x.shape # [B, 196, 768]
         
         # Reshape to 2D Image Space grid: [B, 768, 14, 14]
-        x = x.permute(0, 2, 1).view(B, C, self.grid_size, self.grid_size)
+        x = x.permute(0, 2, 1).reshape(B, C, self.grid_size, self.grid_size)
         
         x = self.channel_compress(x) # [B, 64, 14, 14]
-        x = x.view(B, -1) # Flatten spatial + channel layout: [B, 64 * 14 * 14]
+        x = x.reshape(B, -1) # Flatten spatial + channel layout: [B, 64 * 14 * 14]
         
         pooled = self.final_projection(x) # [B, bottleneck_dim] (e.g., 512 or 768)
         return pooled
