@@ -68,6 +68,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                  train_csv=None,
                  val_image_root=None,
                  val_csv=None,
+                 mapping_json_path=None,
                  ):
         super().__init__()
         self.batch_size = batch_size
@@ -87,6 +88,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
         self.train_csv = train_csv
         self.val_image_root = val_image_root
         self.val_csv = val_csv
+        self.mapping_json_path = mapping_json_path
         self.save_hyperparameters() # save hyperparameter with Pytorch Lightening
 
         self.train_transform = T.Compose([
@@ -149,7 +151,9 @@ class GSVCitiesDataModule(pl.LightningDataModule):
             random_sample_from_each_place=self.random_sample_from_each_place,
             transform=self.train_transform,
             base_path=self.train_image_root,
-            train_csv=self.train_csv)
+            train_csv=self.train_csv,
+            mapping_json_path=self.mapping_json_path,
+        )
 
     def train_dataloader(self):
         self.reload()

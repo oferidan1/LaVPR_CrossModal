@@ -57,10 +57,14 @@ def parse_arguments():
     parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
     parser.add_argument("--resume", type=str, default=None, help="resume training from path")
-    parser.add_argument("--tokens_idf_loss", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--tokens_idf_loss", type=float, default="3", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
     parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")
     parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial")
+    parser.add_argument("--vocab_path", type=str, default='datasets/gsv_cities_scene_graph_vocab_v2.json', help="path to vocab path")
+    parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v2.pt', help="path to image_idf_path")
+    parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping_path")
+    
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
     
@@ -101,6 +105,7 @@ if __name__ == '__main__':
         train_csv=args.train_csv,
         val_image_root=args.val_image_root,
         val_csv=args.val_csv,
+        mapping_json_path=args.mapping_path,
     )
 
     model = LaVPR(
@@ -141,6 +146,8 @@ if __name__ == '__main__':
         tokens_idf_file=args.tokens_idf_file,
         idf_grad_scale=args.idf_grad_scale,
         idf_pooling=args.idf_pooling,
+        vocab_path=args.vocab_path,
+        image_idf_path=args.image_idf_path,
     )
     
     if args.resume is not None:

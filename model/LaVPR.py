@@ -14,7 +14,7 @@ import open_clip
 from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
 from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
-from model.tokens_classify_loss import TokensClassificationLoss
+from model.tokens_classify_loss import TokensClassificationLoss, HierarchicalTokensLoss, VocabClassificationLoss
 from model.pooling_cm import TextGatedAttentionPooler, GeMPooling1D, AttentionGatedPatchPooler, SpatialLayoutPooler
 
 
@@ -61,7 +61,9 @@ class LaVPR(pl.LightningModule):
                 tokens_idf_loss=0.0,
                 tokens_idf_file=None,
                 idf_grad_scale=0.05,
-                idf_pooling = 'mean'
+                idf_pooling = 'mean',
+                vocab_path=None,
+                image_idf_path=None,
                  ):
         super().__init__()       
         
@@ -112,9 +114,16 @@ class LaVPR(pl.LightningModule):
         self.tokens_idf_file = tokens_idf_file
         self.idf_pooling = idf_pooling
         vocab_size = 49408
+        self.vocab_path = vocab_path
+        self.image_idf_path = image_idf_path
         
-        if self.tokens_idf_loss:
+        if self.tokens_idf_loss==1:
             self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale)
+        elif self.tokens_idf_loss==2:
+            self.tokens_classification_loss = HierarchicalTokensLoss()
+        elif self.tokens_idf_loss==3:
+            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale)
+            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=768, vocab_path=vocab_path, image_idf_path=image_idf_path)
         
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -253,7 +262,7 @@ class LaVPR(pl.LightningModule):
     
     
     # the forward pass of the lightning model
-    def forward(self, img, text, flip_desc=None, color_change_desc=None, neg_attr_desc=None):
+    def forward(self, img, text, flip_desc=None, color_change_desc=None, neg_attr_desc=None, concept_ids=None):
         #encode image and text and get local features if the model has them (e.g. BLIP) for L-OT loss
         text_flip_embeds = None
         text_color_change_embeds = None
@@ -315,8 +324,11 @@ class LaVPR(pl.LightningModule):
             if self.idf_pooling == 'mean':
                 img_embeds_pooled = img_local[:, 1:].mean(dim=1)
             else:
-                img_embeds_pooled = self.idf_pooling_layer(img_local[:, 1:])
+                img_embeds_pooled = self.idf_pooling_layer(img_local[:, 1:])            
             tidf_loss = self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
+            if self.tokens_idf_loss==3 and concept_ids is not None:
+                vocab_idf_loss = self.vocab_classification_loss(vision_embeddings=img_embeds_pooled, batch_concept_ids=concept_ids)
+                tidf_loss = tidf_loss + vocab_idf_loss
             #tidf_loss = self.tokens_classification_loss(vision_embeddings=img_local[:, 0], batch_text_ids=text_tokens)
             #tidf_loss = self.tokens_classification_loss(cap_fq=self.cap_fq,  num_samples=self.num_samples, vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
             
@@ -530,7 +542,7 @@ class LaVPR(pl.LightningModule):
     
     # This is the training step that's executed at each iteration
     def training_step(self, batch, batch_idx):
-        places, labels, texts, flip_descs, color_change_descs, neg_attr_descs = batch
+        places, labels, texts, flip_descs, color_change_descs, neg_attr_descs, concepts_ids = batch
         
         # Note that GSVCities yields places (each containing N images)
         # which means the dataloader will return a batch containing BS places
@@ -539,6 +551,7 @@ class LaVPR(pl.LightningModule):
         # reshape places and labels
         images = places.view(BS*N, ch, h, w)
         labels = labels.view(-1)
+        concepts_ids = concepts_ids.view(BS*N, -1)
         
         flat_texts = []
         flat_flip_descs = []
@@ -549,11 +562,10 @@ class LaVPR(pl.LightningModule):
                 flat_texts.append(texts[j][i])
                 flat_flip_descs.append(flip_descs[j][i])
                 flat_color_change_descs.append(color_change_descs[j][i])
-                flat_neg_attr_descs.append(neg_attr_descs[j][i])
-        
+                #flat_neg_attr_descs.append(neg_attr_descs[j][i])        
 
         # Feed forward the batch to the model
-        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs, flat_neg_attr_descs) # Here we are calling the method forward that we defined above
+        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs, flat_neg_attr_descs, concepts_ids) 
         loss = self.loss_function(descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
