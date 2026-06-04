@@ -62,8 +62,10 @@ class LaVPR(pl.LightningModule):
                 tokens_idf_file=None,
                 idf_grad_scale=0.05,
                 idf_pooling = 'mean',
+                vocab_idf_loss=0.0,                
                 vocab_path=None,
                 image_idf_path=None,
+                vocab_grad_scale=0.05,
                  ):
         super().__init__()       
         
@@ -116,14 +118,16 @@ class LaVPR(pl.LightningModule):
         vocab_size = 49408
         self.vocab_path = vocab_path
         self.image_idf_path = image_idf_path
+        self.vocab_idf_loss = vocab_idf_loss
+        self.vocab_grad_scale = vocab_grad_scale
         
         if self.tokens_idf_loss==1:
             self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale)
         elif self.tokens_idf_loss==2:
             self.tokens_classification_loss = HierarchicalTokensLoss()
-        elif self.tokens_idf_loss==3:
+        elif self.vocab_idf_loss:
             self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale)
-            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=768, vocab_path=vocab_path, image_idf_path=image_idf_path)
+            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=768, vocab_path=vocab_path, image_idf_path=image_idf_path, grad_scale=vocab_grad_scale)
         
         if cross_modal == 4: # contrastive loss for cross modal retrieval
             self.contrastive_logit_scale = nn.Parameter(0.07*torch.ones([])) 
@@ -325,10 +329,10 @@ class LaVPR(pl.LightningModule):
                 img_embeds_pooled = img_local[:, 1:].mean(dim=1)
             else:
                 img_embeds_pooled = self.idf_pooling_layer(img_local[:, 1:])            
-            tidf_loss = self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
-            if self.tokens_idf_loss==3 and concept_ids is not None:
+            tidf_loss = self.vocab_idf_loss * self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
+            if self.vocab_idf_loss and concept_ids is not None:
                 vocab_idf_loss = self.vocab_classification_loss(vision_embeddings=img_embeds_pooled, batch_concept_ids=concept_ids)
-                tidf_loss = tidf_loss + vocab_idf_loss
+                tidf_loss = tidf_loss + self.vocab_idf_loss * vocab_idf_loss
             #tidf_loss = self.tokens_classification_loss(vision_embeddings=img_local[:, 0], batch_text_ids=text_tokens)
             #tidf_loss = self.tokens_classification_loss(cap_fq=self.cap_fq,  num_samples=self.num_samples, vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
             
@@ -509,7 +513,7 @@ class LaVPR(pl.LightningModule):
                 #loss = loss + self.unimodal_loss * img_loss + self.unimodal_loss * txt_loss
                 loss = loss + self.unimodal_loss * txt_loss
 
-            loss = loss + self.ot_loss * ot_loss + self.tokens_idf_loss * tidf_loss
+            loss = loss + self.ot_loss * ot_loss + tidf_loss
 
             # calculate the % of trivial pairs/triplets
             # which do not contribute in the loss value

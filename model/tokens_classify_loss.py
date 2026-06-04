@@ -306,7 +306,7 @@ import torch.nn.functional as F
 
 class VocabClassificationLoss(nn.Module):
     def __init__(self, vision_dim, vocab_path="scene_graph_vocab.json", 
-                 image_idf_path="gsv_cities_image_idf.pt", target_initial_loss=4.0):
+                 image_idf_path="gsv_cities_image_idf.pt", target_initial_loss=4.0, grad_scale=0.05):
         super().__init__()
         
         # Load static global token Inverse Document Frequency trajectories
@@ -320,7 +320,8 @@ class VocabClassificationLoss(nn.Module):
         # Balancing scale tracking constants
         initial_mean_loss = -torch.log(torch.tensor(0.5))
         self.loss_scale = target_initial_loss / initial_mean_loss
-        self.loss_scale = 0.1
+        self.loss_scale = 1
+        self.grad_scale = grad_scale 
 
     def forward(self, vision_embeddings, batch_concept_ids):
         """
@@ -330,9 +331,12 @@ class VocabClassificationLoss(nn.Module):
         """
         if batch_concept_ids is None:
             return torch.tensor(0.0, device=vision_embeddings.device, requires_grad=True)
+        
+        scaled_vision_features = GradientScaleFunction.apply(vision_embeddings, self.grad_scale)
+        logits = self.classification_head(scaled_vision_features)
             
-        batch_size = vision_embeddings.size(0)
-        device = vision_embeddings.device
+        batch_size = logits.size(0)
+        device = logits.device
         
         # --- 1. FULLY VECTORIZED TERM FREQUENCY (TF) CALCULATION ---
         # Initialize flat allocation allocation tensor maps
@@ -362,13 +366,11 @@ class VocabClassificationLoss(nn.Module):
         # CRITICAL REPAIR: Normalize by the max value per row instead of the sum.
         # This keeps prominent landmark class targets pinned at 1.0 so BCE functions normally.
         row_max = weighted_targets.max(dim=1, keepdim=True)[0]
-        target_distribution = weighted_targets / (row_max + 1e-8)
-        
-        predicted_logits = self.classification_head(vision_embeddings)
+        target_distribution = weighted_targets / (row_max + 1e-8)        
         
         # --- 3. MULTI-LABEL BINARY CROSS-ENTROPY EVALUATION ---
         classification_loss = F.binary_cross_entropy_with_logits(
-            predicted_logits, 
+            logits, 
             target_distribution, 
             reduction="mean"
         )
