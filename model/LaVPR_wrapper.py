@@ -30,7 +30,7 @@ class LaVPR_wrapper():
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)
             elif 'llm2clip' in self.model_name:
                 from llm2clip.llm2clip import load_llm2clip
-                self.vpr_encoder, self.text_encoder, self.processor = load_llm2clip()            
+                self.vpr_encoder, self.vlm_encoder, self.processor = load_llm2clip()            
             elif 'clip' in self.model_name or 'siglip' in self.model_name:
                 self.vpr_encoder = AutoModel.from_pretrained(self.model_name)
                 self.processor = AutoProcessor.from_pretrained(self.model_name)
@@ -55,7 +55,7 @@ class LaVPR_wrapper():
 
             if args.lora_path is not None:
                 print("loading lora from:", args.lora_path)
-                self.single_encoder.text_encoder = peft.PeftModel.from_pretrained(self.single_encoder.text_encoder, args.lora_path, is_trainable=False)            
+                self.single_encoder.vlm_encoder = peft.PeftModel.from_pretrained(self.single_encoder.vlm_encoder, args.lora_path, is_trainable=False)            
             else:            
                 model_state_dict = torch.load(args.model_path)['state_dict']
                 self.single_encoder.load_state_dict(model_state_dict, strict=False)
@@ -117,7 +117,7 @@ class LaVPR_wrapper():
             with torch.no_grad():     
                 text_features = self.vpr_encoder.encode_text(text_inputs)[:,0]
         elif 'llm2clip' in self.model_name:            
-            text_features = self.text_encoder.encode(texts, convert_to_tensor=True).to(self.device)
+            text_features = self.vlm_encoder.encode(texts, convert_to_tensor=True).to(self.device)
             #text_features = self.vpr_encoder.encode_text(text_features)
             text_features = self.vpr_encoder.get_text_features(text_features.to(self.vpr_encoder.dtype)).float()
             text_features /= text_features.norm(dim=-1, keepdim=True)
@@ -134,11 +134,11 @@ class LaVPR_wrapper():
         elif 'bge' in self.text_model_name:                    
             text_tokens = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
             with torch.no_grad():      
-                model_output = self.text_encoder(**text_tokens)                        
+                model_output = self.vlm_encoder(**text_tokens)                        
                 text_features = model_output[0][:, 0]            
             text_features = torch.nn.functional.normalize(text_features, p=2, dim=1)          
         else:
-            text_features = self.text_encoder.encode(texts, convert_to_tensor=True)
+            text_features = self.vlm_encoder.encode(texts, convert_to_tensor=True)
         return text_features
 
 

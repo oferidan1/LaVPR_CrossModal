@@ -30,17 +30,17 @@ def encode_batch(model, args, images, texts, indices, all_descriptors, vision_de
 
     if args.cross_modal==1:
         image_features = model.encode_text(texts)
-        image_features = image_features.cpu().numpy()
+        image_features = image_features.cpu().float().numpy()
         vision_descriptors[indices.numpy(), :] = image_features     
         text_features = model.encode_image(images.to(args.device))
-        text_features = text_features.cpu().numpy()
+        text_features = text_features.cpu().float().numpy()
         text_descriptors[indices.numpy(), :] = text_features                
     else:
         # single vector of both image and text
         descriptors, text_features = model.encode_single(images.to(args.device), texts)
-        descriptors = descriptors.cpu().numpy()                
+        descriptors = descriptors.cpu().float().numpy()
         vision_descriptors[indices.numpy(), :] = descriptors
-        text_features = text_features.cpu().numpy()
+        text_features = text_features.cpu().float().numpy()
         text_descriptors[indices.numpy(), :] = text_features
         
             

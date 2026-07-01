@@ -17,10 +17,13 @@ def parse_arguments():
     # parser.add_argument("--model_name", type=str, default="Salesforce/blip-itm-base-coco")        
     # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
-    #parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
+    # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
     parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
     parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
+    #parser.add_argument("--model_name", type=str, default="llm2clip/LLM2CLIP-Openai-B-16")
+    # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
+    # parser.add_argument("--embeds_dim", type=int, default=1280, help="dimension of the embeddings")
     # parser.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224")            
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
@@ -34,7 +37,7 @@ def parse_arguments():
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--is_freeze_text", type=int, default="0", help="freeze text encoder or not")
     parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
-    parser.add_argument("--is_trainable_text_encoder", type=int, default="2", help="train text encoder or not. 1=lora, 2=full train")
+    parser.add_argument("--train_vlm", type=int, default="1", help="train text encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     #parser.add_argument("--loss_name", type=str, default="WeightedMultiSimilarityLoss", help="name of the loss function to use")    
@@ -57,15 +60,16 @@ def parse_arguments():
     parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
     parser.add_argument("--resume", type=str, default=None, help="resume training from path")
-    parser.add_argument("--tokens_idf_loss", type=float, default="1", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--tokens_idf_loss", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
     parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")
     parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial")
-    parser.add_argument("--vocab_idf_loss", type=float, default="1", help="multplier for vocab idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--vocab_idf_loss", type=float, default="0", help="multplier for vocab idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--vocab_grad_scale", type=float, default="0.05", help="idf grad scale")
     parser.add_argument("--vocab_path", type=str, default='datasets/gsv_cities_scene_graph_vocab_v2.json', help="path to vocab path")
     parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v2.pt', help="path to image_idf_path")
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping_path")
+    parser.add_argument("--cls_adapter", type=int, default="0", help="classification adapter in loss , use or not")
     
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
@@ -107,7 +111,7 @@ if __name__ == '__main__':
         train_csv=args.train_csv,
         val_image_root=args.val_image_root,
         val_csv=args.val_csv,
-        mapping_json_path=args.mapping_path,
+        mapping_json_path=args.mapping_path,        
     )
 
     model = LaVPR(
@@ -133,7 +137,7 @@ if __name__ == '__main__':
         faiss_gpu=False,        
         cross_modal=args.cross_modal,
         is_freeze_text=args.is_freeze_text,
-        is_trainable_text_encoder=args.is_trainable_text_encoder,
+        train_vlm=args.train_vlm,
         lora_all_linear=args.lora_all_linear,
         lora_target_modules=args.lora_target_modules,
         lora_r=args.lora_r,        
@@ -150,6 +154,9 @@ if __name__ == '__main__':
         idf_pooling=args.idf_pooling,
         vocab_path=args.vocab_path,
         image_idf_path=args.image_idf_path,
+        vocab_grad_scale=args.vocab_grad_scale,
+        vocab_idf_loss=args.vocab_idf_loss,
+        cls_adapter=args.cls_adapter,
     )
     
     if args.resume is not None:

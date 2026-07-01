@@ -145,3 +145,4 @@ This repository builds upon several excellent open-source projects:
 ---
 
 
+LLM2CLIP:  transformers==4.44.2
