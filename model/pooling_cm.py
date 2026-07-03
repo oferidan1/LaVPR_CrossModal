@@ -330,3 +330,169 @@ class SpatialLayoutPooler(nn.Module):
         
         pooled = self.final_projection(x) # [B, bottleneck_dim] (e.g., 512 or 768)
         return pooled
+    
+
+
+class MultiLayerAttentionTextPooler(nn.Module):
+    def __init__(
+        self,
+        text_dim=512,
+        joint_dim=512,
+        target_layers=(9, 10, 11, 12),
+        num_heads=8,
+        init_eot_bias=2.0,  # sigmoid(2)=0.88 => mostly EOT at start
+    ):
+        super().__init__()
+
+        self.target_layers = target_layers
+        num_layers = len(target_layers)
+
+        #
+        # Multi-layer fusion
+        #
+        self.layer_fusion = nn.Sequential(
+            nn.Linear(text_dim * num_layers, text_dim),
+            nn.GELU(),
+        )
+
+        #
+        # Learnable query
+        #
+        self.pool_query = nn.Parameter(
+            torch.randn(1, 1, joint_dim) * 0.02
+        )
+
+        #
+        # QKV projections
+        #
+        self.k_proj = nn.Linear(text_dim, joint_dim)
+        self.v_proj = nn.Linear(text_dim, joint_dim)
+
+        #
+        # MHA Pooling
+        #
+        self.mha_pool = nn.MultiheadAttention(
+            embed_dim=joint_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+
+        #
+        # Residual normalization
+        #
+        self.norm = nn.LayerNorm(joint_dim)
+
+        #
+        # EOT vs Attention gate
+        #
+        self.alpha = nn.Parameter(
+            torch.tensor(init_eot_bias)
+        )
+
+        #
+        # Final projection
+        #
+        self.output_proj = nn.Sequential(
+            nn.Linear(joint_dim, joint_dim),
+            nn.LayerNorm(joint_dim),
+        )
+
+    def forward(self, text_all_layers, text_embeds, attention_mask, native_text_projection=None):
+        B = attention_mask.size(0)
+
+        # ==========================================================
+        # 1. FIX: EXTRACT TRUE NATIVE CLIP EOT VECTOR
+        # ==========================================================
+        # In CLIP, the true global feature is at the EOT index of the LAST layer (12)
+        
+        eot_idx = (attention_mask.long().sum(dim=1) - 1)
+
+        # ==========================================================
+        # 2. HIERARCHICAL ATTENTION POOLING (MHA)
+        # ==========================================================
+        extracted_states = [text_all_layers[l] for l in self.target_layers]
+        hierarchical_features = torch.cat(extracted_states, dim=-1)
+        fused_text_tokens = self.layer_fusion(hierarchical_features) # [B, T, D]
+
+        q = self.pool_query.expand(B, -1, -1) # [B, 1, D]
+        k = self.k_proj(fused_text_tokens)
+        v = self.v_proj(fused_text_tokens)
+
+        key_padding_mask = (attention_mask == 0)
+        pooled_features, _ = self.mha_pool(
+            query=q, key=k, value=v, 
+            key_padding_mask=key_padding_mask, 
+            need_weights=False
+        )
+        pooled_features = pooled_features.squeeze(1)
+        pooled_features = self.norm(pooled_features + q.squeeze(1))
+
+        # ==========================================================
+        # 3. FUSION GATE (True Global vs Learned Attention Local)
+        # ==========================================================
+        gate = torch.sigmoid(self.alpha)
+
+        # Mix the TRUE pre-aligned global token with your custom attention pooler
+        output = (
+            gate * text_embeds 
+            + (1.0 - gate) * self.output_proj(pooled_features)
+        )
+
+        # Normalization for Cosine Loss matching
+        return F.normalize(output, p=2, dim=-1)
+    
+class ResidualTextPooler(nn.Module):
+    def __init__(self, text_dim=512, joint_dim=512, target_layers=(9, 10, 11)):
+        super().__init__()
+        self.target_layers = target_layers
+        num_layers = len(target_layers)
+        
+        # Fuse intermediate layers only (excluding the final layer to prevent duplication)
+        self.layer_fusion = nn.Sequential(
+            nn.Linear(text_dim * num_layers, text_dim),
+            nn.GELU()
+        )
+        
+        # Custom attention pooling head
+        self.pool_query = nn.Parameter(torch.randn(1, 1, joint_dim) * 0.01)
+        self.k_proj = nn.Linear(text_dim, joint_dim)
+        self.v_proj = nn.Linear(text_dim, joint_dim)
+        
+        self.mha_pool = nn.MultiheadAttention(embed_dim=joint_dim, num_heads=8, batch_first=True)
+        self.norm = nn.LayerNorm(joint_dim)
+        
+        # Scale block to shrink initialization impact close to zero
+        self.adapter_scale = nn.Parameter(torch.tensor(0.001)) 
+        self.output_proj = nn.Linear(joint_dim, joint_dim)
+
+    def forward(self, text_all_layers, text_embeds, attention_mask):
+        """
+        Args:
+            text_all_layers: text_output.hidden_states
+            attention_mask: padding mask tensor
+            native_clip_output: The exact pre-trained text embedding from your working script
+        """
+        B = attention_mask.size(0)
+        
+        # 1. Gather intermediate layers cleanly
+        extracted_states = [text_all_layers[l] for l in self.target_layers]
+        hierarchical_features = torch.cat(extracted_states, dim=-1)
+        fused_text_tokens = self.layer_fusion(hierarchical_features)
+        
+        # 2. Run your Multi-Head Attention pooling routine
+        q = self.pool_query.expand(B, -1, -1)
+        k = self.k_proj(fused_text_tokens)
+        v = self.v_proj(fused_text_tokens)
+        
+        pooled_features, _ = self.mha_pool(
+            query=q, key=k, value=v, 
+            key_padding_mask=(attention_mask == 0)
+        )
+        pooled_features = self.norm(pooled_features.squeeze(1) + q.squeeze(1))
+        delta_text_features = self.output_proj(pooled_features)
+        
+        # 3. Apply the Residual Connection
+        # This guarantees your model starts with your working baseline accuracy at step 0
+        final_output = text_embeds + (self.adapter_scale * delta_text_features)
+        
+        return F.normalize(final_output, p=2, dim=-1)

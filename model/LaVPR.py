@@ -15,7 +15,7 @@ from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
 from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
 from model.tokens_classify_loss import TokensClassificationLoss, HierarchicalTokensLoss, VocabClassificationLoss
-from model.pooling_cm import TextGatedAttentionPooler, GeMPooling1D, AttentionGatedPatchPooler, SpatialLayoutPooler
+from model.pooling_cm import TextGatedAttentionPooler, GeMPooling1D, AttentionGatedPatchPooler, SpatialLayoutPooler, MultiLayerAttentionTextPooler, ResidualTextPooler
 
 
 class LaVPR(pl.LightningModule):
@@ -67,6 +67,7 @@ class LaVPR(pl.LightningModule):
                 image_idf_path=None,
                 vocab_grad_scale=0.05,
                 cls_adapter=0,
+                cmpl=0,
                  ):
         super().__init__()       
         
@@ -124,6 +125,7 @@ class LaVPR(pl.LightningModule):
         self.vocab_idf_loss = vocab_idf_loss
         self.vocab_grad_scale = vocab_grad_scale
         self.cls_adapter = cls_adapter
+        self.cmpl = cmpl
         
         if self.tokens_idf_loss==1:
             self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, cls_adapter=cls_adapter)
@@ -147,13 +149,42 @@ class LaVPR(pl.LightningModule):
             self.img_agg = CosineSALAD(num_channels=embeds_dim)
         elif agg_type == 4:
             self.agg = TextGatedAttentionPooler(hidden_dim=embeds_dim, output_dim=embeds_dim)
+        elif agg_type == 5:
+            self.agg = MultiLayerAttentionTextPooler(text_dim=embeds_dim, joint_dim=embeds_dim)
+        elif agg_type == 6:
+            self.agg = ResidualTextPooler(text_dim=embeds_dim, joint_dim=embeds_dim)
             
         if idf_pooling == 'gem':
             self.idf_pooling_layer = GeMPooling1D()
         elif idf_pooling == 'attention':
             self.idf_pooling_layer = AttentionGatedPatchPooler()
         elif idf_pooling == 'spatial':
-            self.idf_pooling_layer = SpatialLayoutPooler()            
+            self.idf_pooling_layer = SpatialLayoutPooler()      
+            
+        if cmpl:
+             # Target intermediate layers P = {p3, p6, p9, p12}
+            self.target_layers = [3, 6, 9, 12]
+            cmpl_dim = 768
+            
+            # Modules per target intermediate layer
+            self.sfm_modules = nn.ModuleDict({
+                f"layer_{str(l)}": SaliencyFilteringModule(cmpl_dim) for l in self.target_layers
+            })
+
+            # 1. Visual Extractors: map 768 -> 512
+            self.visual_E_f_modules = nn.ModuleDict({
+                f"layer_{str(l)}": FineGrainedExtractor(query_dim=embeds_dim, kv_dim=768, num_queries=16) 
+                for l in self.target_layers
+            })
+
+            # 2. Textual Extractors: map 512 -> 512
+            self.text_E_f_modules = nn.ModuleDict({
+                f"layer_{str(l)}": FineGrainedExtractor(query_dim=embeds_dim, kv_dim=512, num_queries=16) 
+                for l in self.target_layers
+            })
+            
+            self.sdm_loss = SDMLoss()
+            self.local_sdm_loss = LocalSDMLoss(temperature=0.02)
                 
         # init weight of linear layers but not the pretrained backbones
         self.apply(self._init_weights)
@@ -183,10 +214,16 @@ class LaVPR(pl.LightningModule):
         
         # Define LoRA configuration
         # TaskType.FEATURE_EXTRACTION is appropriate for sentence embedding tasks            
-        if self.train_vlm==1:                
+        if self.train_vlm==1:                            
             lora_targets = lora_target_modules
             if lora_all_linear:
-                lora_targets = "all-linear"                    
+                lora_targets = "all-linear"  
+                
+            # # Programmatically build the exact string matches for your 12 ViT layers
+            # lora_targets = []
+            # for i in range(12):  # Assuming standard 12-layer ViT baseline
+            #     lora_targets.append(f"vision_model.encoder.layers.{i}.self_attn.q_proj")
+            #     lora_targets.append(f"vision_model.encoder.layers.{i}.self_attn.v_proj")                  
             
             lora_config = LoraConfig(
                 r=lora_r,
@@ -252,6 +289,7 @@ class LaVPR(pl.LightningModule):
         text_embeds = None
         attention_mask = None
         text_local = None
+        text_all_layers = None
 
         if 'blip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=512)
@@ -269,9 +307,10 @@ class LaVPR(pl.LightningModule):
             attention_mask = None
             if 'attention_mask' in text_inputs:
                 attention_mask = text_inputs['attention_mask'].to(self.my_device)                
-            text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
+            text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)
             text_local = self.vlm_encoder.text_projection(text_output.last_hidden_state)
             text_embeds = text_output.pooler_output    
+            text_all_layers = text_output.hidden_states
         elif 'siglip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
             text_tokens = text_inputs.input_ids.to(self.my_device)
@@ -287,26 +326,26 @@ class LaVPR(pl.LightningModule):
             text_embeds = self.vlm_encoder.encode_text(text_tokens)    
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)        
         
-        return text_embeds, text_local, attention_mask, text_tokens
+        return text_embeds, text_local, attention_mask, text_tokens, text_all_layers
     
     
     # the forward pass of the lightning model
-    def forward(self, img, text, flip_desc=None, color_change_desc=None, neg_attr_desc=None, concept_ids=None):
+    def forward(self, img, text, flip_desc=None, color_change_desc=None, neg_attr_desc=None, concept_ids=None, labels=None):
         #encode image and text and get local features if the model has them (e.g. BLIP) for L-OT loss
         text_flip_embeds = None
         text_color_change_embeds = None
         text_neg_attr_embeds = None
         
         img_embeds, img_local, img_all_layers = self.encode_image(img)
-        text_embeds, text_local, attention_mask, text_tokens = self.encode_text(text)
+        text_embeds, text_local, attention_mask, text_tokens, text_all_layers = self.encode_text(text)
         if self.pos_loss:
             if flip_desc is not None:
-                text_flip_embeds, text_flip_local, attention_mask_flip, text_flip_tokens = self.encode_text(flip_desc)
+                text_flip_embeds, text_flip_local, attention_mask_flip, text_flip_tokens, text_flip_all_layers = self.encode_text(flip_desc)
             # if color_change_desc is not None:
             #     text_color_change_embeds, _, _ = self.encode_text(color_change_desc)
         if self.neg_loss:
             if neg_attr_desc is not None:
-                text_neg_attr_embeds, text_neg_local, attention_mask_neg, text_neg_tokens = self.encode_text(neg_attr_desc)
+                text_neg_attr_embeds, text_neg_local, attention_mask_neg, text_neg_tokens, text_neg_all_layers = self.encode_text(neg_attr_desc)
         
         # Compute L-OT weights and loss if both modalities are present (Training)
         ot_loss = 0.0
@@ -314,6 +353,67 @@ class LaVPR(pl.LightningModule):
         w_v, w_t = None, None
         w_v_flip, w_t_flip = None, None
         w_v_neg, w_t_neg = None, None        
+        
+        if self.cmpl:
+            local_features_v = {}
+            local_features_t = {}
+            
+            # --- 1. Hierarchical Feature Extraction & Progressive Alignment ---
+            for layer in self.target_layers:
+                layer_key = f"layer_{layer}"
+                
+                # --- Modality A: Visual ---
+                v_layer_out = img_all_layers[layer]
+                v_cls = v_layer_out[:, 0:1, :]    # Extract [CLS]
+                v_patches = v_layer_out[:, 1:, :] # Extract raw patch tokens
+                
+                # Filter background visual noise via SFM
+                v_filtered_patches = self.sfm_modules[layer_key](v_patches)
+                
+                # Recombine CLS + Saliency tokens
+                v_combined = torch.cat([v_cls, v_filtered_patches], dim=1)
+                
+                # Anchor representation distillation via E_f
+                # F_v^(l) shape: (B, num_queries, embed_dim)
+                F_v_l = self.visual_E_f_modules[layer_key](v_combined)
+                local_features_v[layer] = F_v_l
+                
+                # --- Modality B: Textual ---
+                t_layer_out = text_all_layers[layer] # (B, num_tokens, embed_dim)
+                
+                # Direct anchor representation distillation via E_f 
+                # F_t^(l) shape: (B, num_queries, embed_dim)
+                F_t_l = self.text_E_f_modules[layer_key](t_layer_out)
+                local_features_t[layer] = F_t_l
+
+            # --- 2. Extracting Global vs Local representations ---
+            
+            # For Local Loss (L_ls): Uses the fine-grained query representations directly
+            # For Global Loss (L_gs): Generated by pooling the final aligned layer (p12) outputs
+            final_layer = self.target_layers[-1]
+            
+            # Aggregate the query tokens via mean pooling to form a singular global representation vector
+            global_v_raw = local_features_v[final_layer].mean(dim=1) # (B, embed_dim)
+            global_t_raw = local_features_t[final_layer].mean(dim=1) # (B, embed_dim)
+            
+            # Hyper-sphere L2 normalization mapping
+            img_embeds = F.normalize(global_v_raw, p=2, dim=-1)
+            text_embeds = F.normalize(global_t_raw, p=2, dim=-1)
+            
+            total_local_sdm_loss = 0.0
+
+            for layer in self.target_layers:
+                # Extract specific layer tensor pairs
+                F_v_layer = local_features_v[layer]
+                F_t_layer = local_features_t[layer]
+                
+                # Compute layer-specific Local SDM loss
+                L_ls_layer = self.local_sdm_loss(F_v_layer, F_t_layer, labels=labels)
+    
+                # Aggregate across hierarchical depths
+                total_local_sdm_loss += L_ls_layer
+            
+            tidf_loss = total_local_sdm_loss
         
         if self.ot_loss>0 and img_local is not None and text_local is not None:
             t_mask = None
@@ -331,16 +431,18 @@ class LaVPR(pl.LightningModule):
             ot_loss_flip, w_v_flip, w_t_flip = self.local_ot_loss(img_local[:, 1:], text_flip_local[:, 1:], t_mask=t_mask_flip)
             ot_loss_neg, w_v_neg, w_t_neg = self.local_ot_loss(img_local[:, 1:], text_neg_local[:, 1:], t_mask=t_mask_neg)
 
-        if self.agg_type:
-            if self.agg_type == 4: # gated attention 
-                text_embeds = self.agg(text_local, attention_mask, text_embeds)
-            elif self.agg_type == 3: # double salad
+        if self.agg_type:            
+            if self.agg_type == 3: # double salad
                 img_embeds = self.img_agg(img_local, token_weights=w_v)
                 text_embeds = self.text_agg(text_local, attention_mask, token_weights=w_t)               
                 if flip_desc is not None: 
                     text_flip_embeds = self.text_agg(text_flip_local, attention_mask_flip, token_weights=w_t_flip)
                 if neg_attr_desc is not None:
                     text_neg_attr_embeds = self.text_agg(text_neg_local, attention_mask_neg, token_weights=w_t_neg)                
+            if self.agg_type == 4: # gated attention 
+                text_embeds = self.agg(text_local, attention_mask, text_embeds)
+            elif self.agg_type == 5 or self.agg_type == 6: #text pooling
+                text_embeds = self.agg(text_all_layers, text_embeds, attention_mask)
             else: #salad
                 img_embeds = self.agg(img_local, token_weights=w_v)
                 text_embeds = self.agg(text_local, attention_mask, token_weights=w_t)
@@ -440,7 +542,10 @@ class LaVPR(pl.LightningModule):
         # max_grad_norm = 5.0                
         # clip_grad_norm_(self.parameters(), max_norm=max_grad_norm)
 
-        optimizer.step(closure=optimizer_closure)
+        #optimizer.step(closure=optimizer_closure)
+          
+        # CORRECT (Safe for both single GPU and Multi-GPU DDP):
+        self.trainer.strategy.optimizer_step(optimizer, optimizer_idx, optimizer_closure)
 
             
     #  The loss function call (this method will be called at each training iteration)
@@ -545,6 +650,11 @@ class LaVPR(pl.LightningModule):
                 loss = loss + self.unimodal_loss * txt_loss
 
             loss = loss + self.ot_loss * ot_loss + tidf_loss
+            
+            if self.cmpl:
+                sdm_loss = self.sdm_loss(descriptors, ref_embs)
+                loss = loss + sdm_loss
+            
 
             # calculate the % of trivial pairs/triplets
             # which do not contribute in the loss value
@@ -603,7 +713,7 @@ class LaVPR(pl.LightningModule):
                 #flat_neg_attr_descs.append(neg_attr_descs[j][i])        
 
         # Feed forward the batch to the model
-        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs, flat_neg_attr_descs, concepts_ids) 
+        descriptors, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss = self(images, flat_texts, flat_flip_descs, flat_color_change_descs, flat_neg_attr_descs, concepts_ids, labels) 
         loss = self.loss_function(descriptors, labels, text_embeds, text_flip_embeds, text_color_change_embeds, neg_attr_embeds, ot_loss, tidf_loss) # Call the loss_function we defined above
         
         self.log('loss', loss.item(), logger=True)
@@ -723,4 +833,193 @@ class LaVPR(pl.LightningModule):
             print("Saved PEFT adapter to:", ckpt_dir)
     
 
+    
+class SaliencyFilteringModule(nn.Module):
+    """
+    SFM: Uses attention weights to dynamically select discriminative,
+    geographically stable visual patches and filters out transient noise.
+    """
+    def __init__(self, embed_dim=768, selection_ratio=0.7):
+        super().__init__()
+        self.selection_ratio = selection_ratio
+        # Small network or linear layer to compute saliency/attention scores
+        self.score_predictor = nn.Linear(embed_dim, 1)
+
+    def forward(self, patch_tokens):
+        # patch_tokens shape: (B, num_patches, embed_dim)
+        B, N, C = patch_tokens.shape
+        num_to_select = int(N * self.selection_ratio)
+        
+        # Predict importance scores for each token
+        scores = self.score_predictor(patch_tokens).squeeze(-1) # (B, num_patches)
+        
+        # Select top-k highest scoring patch tokens per batch instance
+        _, topk_indices = torch.topk(scores, k=num_to_select, dim=-1)
+        
+        # Gather selected tokens
+        # Expand indices across the channel dimension
+        gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, C)
+        filtered_patches = torch.gather(patch_tokens, dim=1, index=gather_indices)
+        
+        return filtered_patches # (B, num_to_select, embed_dim)
+
+
+class FineGrainedExtractor(nn.Module):
+    def __init__(self, query_dim=512, kv_dim=768, num_queries=16):
+        """
+        Args:
+            query_dim: The unified space dimension (e.g., 512)
+            kv_dim: The incoming raw feature dimension from the backbone 
+                    (768 for ViT, 512 for Text)
+        """
+        super().__init__()
+        # Queries live in the unified projection space
+        self.queries = nn.Parameter(torch.randn(num_queries, query_dim))
+        
+        # Self-attention handles only queries (query_dim -> query_dim)
+        self.query_self_attn = nn.MultiheadAttention(query_dim, num_heads=8, batch_first=True)
+        self.ln1 = nn.LayerNorm(query_dim)
+        
+        # Cross-attention handles mixed dimensions!
+        # embed_dim = Query output dimension
+        # kdim/vdim = Incoming input sequence dimension from backbone
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=query_dim, 
+            num_heads=8, 
+            kdim=kv_dim, 
+            vdim=kv_dim, 
+            batch_first=True
+        )
+        self.ln2 = nn.LayerNorm(query_dim)
+        
+    def forward(self, x):
+        B = x.size(0)
+        q = self.queries.unsqueeze(0).expand(B, -1, -1) # (B, num_queries, query_dim)
+        
+        # 1. Query Self-Attention (Stays in query_dim space)
+        q_attn, _ = self.query_self_attn(q, q, q)
+        q = self.ln1(q + q_attn)
+        
+        # 2. Cross-Attention over token sequences
+        # q: (B, num_queries, query_dim)
+        # x: (B, seq_len, kv_dim) -> Can be 768 or 512!
+        distilled_features, _ = self.cross_attn(q, x, x)
+        
+        # Output is automatically projected back into query_dim space
+        f_distilled = self.ln2(q + distilled_features)
+        
+        return f_distilled # Shape: (B, num_queries, query_dim)
+    
+
+class SDMLoss(nn.Module):
+    """
+    Similarity Distribution Matching (SDM) Loss.
+    Computes the bidirectional KL-divergence between the predicted cross-modal
+    similarity distributions and ground-truth distributions within a mini-batch.
+    """
+    def __init__(self, temperature=0.02):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, visual_embeds, text_embeds, labels=None):
+        """
+        Args:
+            visual_embeds (torch.Tensor): Global visual embeddings, shape (B, D).
+            text_embeds (torch.Tensor): Global text embeddings, shape (B, D).
+            labels (torch.Tensor, optional): True label identities, shape (B,).
+                                            If None, assumes a diagonal matrix (perfect pairing).
+        Returns:
+            torch.Tensor: Scalar loss value.
+        """
+        # 1. Compute the raw cosine similarity matrix
+        # (Assumes visual_embeds and text_embeds are already L2-normalized)
+        sim_matrix = torch.matmul(visual_embeds, text_embeds.t())  # Shape: (B, B)
+
+        # 2. Compute predicted distributions (Softmax over rows and columns)
+        p_v2t = F.softmax(sim_matrix / self.temperature, dim=-1)   # Visual to Text
+        p_t2v = F.softmax(sim_matrix.t() / self.temperature, dim=-1) # Text to Visual
+
+        # 3. Construct Ground-Truth Distribution (q)
+        if labels is None:
+            # Standard setup: Item i in visual matches item i in text
+            q_target = torch.eye(visual_embeds.size(0), device=visual_embeds.device)
+        else:
+            # Handles duplicate locations / multiple positives in the same batch
+            labels = labels.view(-1, 1)
+            q_target = torch.eq(labels, labels.t()).float()
+            
+        # Normalize ground-truth rows so each row sums up to 1 (valid probability distribution)
+        q_v2t = q_target / q_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        q_t2v = q_target.t() / q_target.t().sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # 4. Compute Bidirectional KL-Divergence Loss
+        # Avoid log(0) errors by using a small epsilon clamp
+        loss_v2t = F.kl_div(p_v2t.log().clamp(min=-100), q_v2t, reduction='batchmean')
+        loss_t2v = F.kl_div(p_t2v.log().clamp(min=-100), q_t2v, reduction='batchmean')
+
+        # Total global loss is the average of both directions
+        return (loss_v2t + loss_t2v) / 2.0
+    
+class LocalSDMLoss(nn.Module):
+    """
+    Local Similarity Distribution Matching (Local SDM) Loss for hierarchical layers.
+    Computes bidirectional KL-divergence over token-sequence matrices by taking
+    the mean similarity across local query tokens as defined in the paper.
+    """
+    def __init__(self, temperature=0.02):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, F_v_layer, F_t_layer, labels=None):
+        """
+        Args:
+            F_v_layer (torch.Tensor): Visual query features for a layer, shape (B, num_queries, D).
+            F_t_layer (torch.Tensor): Textual query features for a layer, shape (B, num_queries, D).
+            labels (torch.Tensor, optional): Identity labels for checking matches inside a batch.
+        """
+        B, num_queries, D = F_v_layer.shape
+
+        # 1. Ensure vectors are L2-normalized across the feature dimension (D)
+        F_v_norm = F.normalize(F_v_layer, p=2, dim=-1)  # (B, num_queries, D)
+        F_t_norm = F.normalize(F_t_layer, p=2, dim=-1)  # (B, num_queries, D)
+
+        # 2. Compute token-to-token similarity matrix between ALL batch pairs
+        # Reshape to combine batch and query dimensions for efficient matrix multiplication
+        # F_v_flat: (B * num_queries, D)
+        F_v_flat = F_v_norm.view(-1, D)
+        # F_t_flat: (B * num_queries, D)
+        F_t_flat = F_t_norm.view(-1, D)
+        
+        # Total token similarity matrix shape: (B * num_queries, B * num_queries)
+        token_sim_matrix = torch.matmul(F_v_flat, F_t_flat.t())
+        
+        # Reshape back to separate individual batch element comparisons
+        # Shape: (B, num_queries, B, num_queries)
+        batch_sim_tensor = token_sim_matrix.view(B, num_queries, B, num_queries)
+        
+        # 3. Compute the mean similarity across all local query tokens for each pair (Eq. Page 6)
+        # Permute to (B, B, num_queries, num_queries) so we can average out the token dimensions
+        batch_sim_tensor = batch_sim_tensor.permute(0, 2, 1, 3)
+        # Average over both the visual and textual local query token axes
+        sim_matrix = batch_sim_tensor.mean(dim=[-2, -1])  # Shape: (B, B)
+
+        # 4. Convert mean token similarities to predicted probability distributions
+        p_v2t = F.softmax(sim_matrix / self.temperature, dim=-1)   # Visual to Text
+        p_t2v = F.softmax(sim_matrix.t() / self.temperature, dim=-1) # Text to Visual
+
+        # 5. Define or construct target distributions (q)
+        if labels is None:
+            q_target = torch.eye(B, device=F_v_layer.device)
+        else:
+            labels = labels.view(-1, 1)
+            q_target = torch.eq(labels, labels.t()).float()
+
+        q_v2t = q_target / q_target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        q_t2v = q_target.t() / q_target.t().sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # 6. Compute Bidirectional KL-Divergence Loss for this layer
+        loss_v2t = F.kl_div(p_v2t.log().clamp(min=-100), q_v2t, reduction='batchmean')
+        loss_t2v = F.kl_div(p_t2v.log().clamp(min=-100), q_t2v, reduction='batchmean')
+
+        return (loss_v2t + loss_t2v) / 2.0
     

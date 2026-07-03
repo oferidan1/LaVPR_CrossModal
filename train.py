@@ -18,12 +18,12 @@ def parse_arguments():
     # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
-    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
-    parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
-    parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
-    #parser.add_argument("--model_name", type=str, default="llm2clip/LLM2CLIP-Openai-B-16")
+    # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
-    # parser.add_argument("--embeds_dim", type=int, default=1280, help="dimension of the embeddings")
+    # parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
+    parser.add_argument("--model_name", type=str, default="llm2clip/LLM2CLIP-Openai-B-16")
+    parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
+    parser.add_argument("--embeds_dim", type=int, default=1280, help="dimension of the embeddings")
     # parser.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224")            
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
@@ -35,16 +35,17 @@ def parse_arguments():
     parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
-    parser.add_argument("--is_freeze_text", type=int, default="0", help="freeze text encoder or not")
+    parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
     parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
-    parser.add_argument("--train_vlm", type=int, default="1", help="train text encoder or not. 1=lora, 2=full train")
+    parser.add_argument("--train_vlm", type=int, default="0", help="train vlm encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     #parser.add_argument("--loss_name", type=str, default="WeightedMultiSimilarityLoss", help="name of the loss function to use")    
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model/3=with projections/4=contrastive loss/5=concat text and image")        
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
-    parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
-    #parser.add_argument("--lora_target_modules", nargs='+', default=["q_proj", "v_proj"], help="when not lora_all_linear, lora target modules")    
+    #parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
+    parser.add_argument("--lora_target_modules", nargs='+', default=["q_proj", "v_proj"], help="when not lora_all_linear, lora target modules")    
+    #parser.add_argument("--lora_target_modules", nargs='+', default=["vision_model.encoder.layers.*.self_attn.q_proj", "vision_model.encoder.layers.*.self_attn.v_proj"], help="when not lora_all_linear, lora target modules")        
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
     parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
@@ -70,6 +71,7 @@ def parse_arguments():
     parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v2.pt', help="path to image_idf_path")
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping_path")
     parser.add_argument("--cls_adapter", type=int, default="0", help="classification adapter in loss , use or not")
+    parser.add_argument("--cmpl", type=int, default="0", help="cmpl use or not")
     
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
@@ -157,6 +159,7 @@ if __name__ == '__main__':
         vocab_grad_scale=args.vocab_grad_scale,
         vocab_idf_loss=args.vocab_idf_loss,
         cls_adapter=args.cls_adapter,
+        cmpl=args.cmpl,
     )
     
     if args.resume is not None:
@@ -191,14 +194,15 @@ if __name__ == '__main__':
         accelerator='gpu', devices=[0],
         default_root_dir=f'./LOGS/{"resnet50"}', # Tensorflow can be used to viz
         num_sanity_val_steps=0, # runs a =- step before stating training
-        precision=16, # we use half precision to reduce  memory usage
+        #precision=16, # we use half precision to reduce  memory usage
         max_epochs=args.epochs,
         check_val_every_n_epoch=1, # run validation every epoch
         callbacks=[checkpoint_cb],# we only run the checkpointing callback (you can add more)
         reload_dataloaders_every_n_epochs=1, # we reload the dataset to shuffle the order
         log_every_n_steps=20,
         gradient_clip_val=1.0,  
-        gradient_clip_algorithm="norm"
+        gradient_clip_algorithm="norm",
+        precision="bf16"
         # fast_dev_run=True # uncomment or dev mode (only runs a one iteration train and validation, no checkpointing).
     )
     

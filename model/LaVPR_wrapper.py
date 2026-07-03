@@ -45,7 +45,7 @@ class LaVPR_wrapper():
             self.single_encoder = LaVPR(   
                 #---- Encoder
                 model_name=args.model_name.lower(),
-                is_trainable_text_encoder=args.is_trainable_text_encoder,
+                train_vlm=args.train_vlm,
                 embeds_dim=args.embeds_dim,           
                 lora_all_linear=args.lora_all_linear,
                 lora_target_modules=args.lora_target_modules,
