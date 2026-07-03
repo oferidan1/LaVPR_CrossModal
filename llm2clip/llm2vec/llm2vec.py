@@ -456,8 +456,8 @@ class LLM2Vec(nn.Module):
         )
         features = batch_to_device(features, device)
 
-        with torch.no_grad():
-            embeddings = self.forward(features)
+        #with torch.no_grad():
+        embeddings = self.forward(features)
         return embeddings
 
     def _text_length(self, text: Union[List[int], List[List[int]]]):
