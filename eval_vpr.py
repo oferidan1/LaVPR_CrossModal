@@ -28,7 +28,7 @@ def encode_batch(model, args, images, texts, indices, all_descriptors, vision_de
     if args.bfloat16:
         images = images.bfloat16()
 
-    if args.cross_modal==1:
+    if args.cross_modal<=1:
         image_features = model.encode_text(texts)
         image_features = image_features.cpu().float().numpy()
         vision_descriptors[indices.numpy(), :] = image_features     
@@ -197,22 +197,25 @@ def main(args):
             encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors)
         
 
-    max_results_reranking = test_ds.num_database    
-        
-    vision_database_descriptors = vision_descriptors[: test_ds.num_database]    
-    text_queries_descriptors = text_descriptors[test_ds.num_database :]
+    if args.cross_modal:        
+        database_descriptors = vision_descriptors[: test_ds.num_database]    
+        queries_descriptors = text_descriptors[test_ds.num_database :]
+    else:
+        database_descriptors = text_descriptors[: test_ds.num_database]    
+        queries_descriptors = text_descriptors[test_ds.num_database :]        
     
     # 1. Initial Quick Retrieval via Global Vectors
     scores, predictions = get_queries_predictions(
-        model.encoder_dim, vision_database_descriptors, all_descriptors, text_queries_descriptors, max_results
+        model.encoder_dim, database_descriptors, all_descriptors, queries_descriptors, max_results
     )       
     
     # 2. Apply Fine-Grained Cross-Attention Reranking
     # Set how many top candidates you want to rerank (e.g., top 25 or top 50)
-    max_rerank_k = min(25, max_results) 
-    predictions = rerank_predictions(
-        model, test_ds, queries_dataloader, predictions, max_rerank_k=max_rerank_k, device=args.device
-    )
+    if args.reranker:
+        max_rerank_k = min(25, max_results) 
+        predictions = rerank_predictions(
+            model, test_ds, queries_dataloader, predictions, max_rerank_k=max_rerank_k, device=args.device
+        )
 
     # 3. Calculate metrics using the updated reranked predictions
     if is_msls_challenge:
@@ -233,7 +236,7 @@ def main(args):
             
             model_path = args.lora_path if args.lora_path is not None else args.model_path
             with open("eval_vpr_results.csv", "a") as f:
-                f.write(f"{model_path},{args.model_name},Reranked_{max_rerank_k}: {recalls_str}\n")
+                f.write(f"{model_path},{args.model_name},{recalls_str}\n")
             
     if args.num_preds_to_save != 0:
         logger.info("Saving final predictions")

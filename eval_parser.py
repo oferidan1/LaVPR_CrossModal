@@ -93,6 +93,7 @@ def parse_arguments():
     parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
     parser.add_argument("--embeds_dim", type=int, default="256", help="embeds dimension")    
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model")        
+    parser.add_argument("--reranker", type=int, default="0", help="reranker")        
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
 
 

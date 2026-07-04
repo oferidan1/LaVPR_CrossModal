@@ -22,7 +22,7 @@ class LaVPR_wrapper():
         self.embeds_dim = args.embeds_dim
         self.encoder_dim = args.embeds_dim
        
-        if args.cross_modal==1:
+        if args.cross_modal<=1:
             self.max_text_length = 77
             if 'blip' in self.model_name:
                 self.vpr_encoder = BlipForImageTextRetrievalWrapper.from_pretrained(self.model_name)
