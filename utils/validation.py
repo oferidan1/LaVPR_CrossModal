@@ -48,96 +48,98 @@ def get_validation_recalls(r_list, q_list, k_values, gt, print_results=True, fai
         return d
 
 
-def get_validation_recalls_dynamic_fusion(r_list, q_list, r_text_list, q_text_list, w_r, w_q, k_values, gt, print_results=True, faiss_gpu=False, dataset_name='dataset without name ?'):
-        
-        embed_size = r_list.shape[1]
-        embed_text_size = r_text_list.shape[1]
-        if faiss_gpu:
-            res = faiss.StandardGpuResources()
-            flat_config = faiss.GpuIndexFlatConfig()
-            flat_config.useFloat16 = True
-            flat_config.device = 0
-            faiss_index_i = faiss.GpuIndexFlatIP(res, embed_size, flat_config)
-        # build index
-        else:
-            faiss_index_i = faiss.IndexFlatIP(embed_size)
-            faiss_index_t = faiss.IndexFlatIP(embed_text_size)
-        
-        # add references
-        r_list = r_list.to(torch.float32)
-        q_list = q_list.to(torch.float32)
-        r_text_list = r_text_list.to(torch.float32)
-        q_text_list = q_text_list.to(torch.float32)
-
-        faiss_index_i.add(r_list)
-        faiss_index_t.add(r_text_list)
-
-        # search for queries in the index
-        max_k = min(10000, len(r_list))
-        scores, predictions = faiss_index_i.search(q_list, max_k)
-        scores_t, predictions_t = faiss_index_t.search(q_text_list, max_k)
-        
-        #loop over indexes and and re-rank predictions according to dynamic weights where index_i == index_t
-        rerank_predictions(scores, predictions, scores_t, predictions_t, w_r, w_q, max_results=max(k_values))
-
-        # start calculating recall_at_k
-        correct_at_k = np.zeros(len(k_values))
-        for q_idx, pred in enumerate(predictions):
-            for i, n in enumerate(k_values):
-                # if in top N then also in top NN, where NN > N
-                if np.any(np.isin(pred[:n], gt[q_idx])):
-                    correct_at_k[i:] += 1
-                    break
-        
-        correct_at_k = correct_at_k / len(predictions)
-        d = {k:v for (k,v) in zip(k_values, correct_at_k)}
-
-        if print_results:
-            print() # print a new line
-            table = PrettyTable()
-            table.field_names = ['K']+[str(k) for k in k_values]
-            table.add_row(['Recall@K']+ [f'{100*v:.2f}' for v in correct_at_k])
-            print(table.get_string(title=f"Performances on {dataset_name}"))
-        
-        return d
-
-@staticmethod
-def rerank_predictions(vision_scores, vision_predictions, text_scores, text_predictions, w_r, w_q, max_results):
-    # sum scores according the where vision and text predictions are the same
-    combined_scores = []
-    combined_predictions = []
-    if len(w_r.shape) > 1:
-        print("mean w_alpha vision:", w_r[:,0].mean(), w_r[:,0].std())
+def get_validation_recalls_rerank(
+    r_list, 
+    q_list, 
+    k_values, 
+    gt, 
+    print_results=True, 
+    faiss_gpu=False, 
+    dataset_name='dataset without name ?',
+    # --- Reranking additions ---
+    rerank_model=None,          # Your LaVPR_reranker or CrossAttnClassifier model
+    r_local_list=None,          # Gathered database img_local tensors [Num_Db, Li, D]
+    q_local_list=None,          # Gathered query text_local tensors [Num_Q, Lt, D]
+    max_rerank_k=25             # How many top FAISS candidates to rerank
+):
+    embed_size = r_list.shape[1]
+    if faiss_gpu:
+        res = faiss.StandardGpuResources()
+        flat_config = faiss.GpuIndexFlatConfig()
+        flat_config.useFloat16 = True
+        flat_config.device = 0
+        faiss_index = faiss.GpuIndexFlatL2(res, embed_size, flat_config)
     else:
-        print("mean w_alpha vision:", w_r.mean(), w_r.std())
-        w_r = np.repeat(w_r, text_predictions.shape[0], axis=0)
-        w_r = np.stack([w_r, 1-w_r], axis=1)     
-        w_q = np.repeat(w_q, text_predictions.shape[0], axis=0)
-        w_q = np.stack([w_q, 1-w_q], axis=1)     
-    query_index = 0
-    for v_scores, v_preds, t_scores, t_preds in zip(vision_scores, vision_predictions, text_scores, text_predictions):
-        score_dict = {}
-        w_query_v = w_q[query_index][0]
-        for score, pred in zip(v_scores, v_preds):
-            if pred not in score_dict:
-                score_dict[pred] = 0
-            #score_dict[pred] += w_alpha[pred][0] * score 
-            score_dict[pred] += (w_r[pred][0]+w_query_v)/2 * score 
-        w_query_t = w_q[query_index][1]
-        for score, pred in zip(t_scores, t_preds):
-            if pred not in score_dict:
-                score_dict[pred] = 0
-            #score_dict[pred] += w_r[pred][1] * score 
-            score_dict[pred] += (w_r[pred][1]+w_query_t)/2 * score 
-        # sort by score
-        sorted_items = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)
-        preds_sorted = [item[0] for item in sorted_items][:max_results]
-        scores_sorted = [item[1] for item in sorted_items][:max_results]
-        combined_predictions.append(preds_sorted)
-        combined_scores.append(scores_sorted)
-        query_index += 1
-        
-    combined_predictions = np.array(combined_predictions)
-    combined_scores = np.array(combined_scores)
-    return combined_scores, combined_predictions
+        faiss_index = faiss.IndexFlatL2(embed_size)
+    
+    r_list = r_list.to(torch.float32).cpu().numpy()
+    q_list = q_list.to(torch.float32).cpu().numpy()
 
+    faiss_index.add(r_list)
+
+    # Search for queries using a safe cap (at least max(k_values) or max_rerank_k)
+    search_k = max(max(k_values), max_rerank_k)
+    _, predictions = faiss_index.search(q_list, search_k)
+    
+    # -------------------------------------------------------------------------
+    # --- Fine-Grained Cross-Attention Reranking Stage ---
+    # -------------------------------------------------------------------------
+    if rerank_model is not None and r_local_list is not None and q_local_list is not None:
+        print(f"\n--> Reranking top-{max_rerank_k} validation candidates using Cross-Attention...")
+        
+        # Pull internal neural classifier if it's wrapped inside PyTorch Lightning
+        classifier = rerank_model.cross_attn_classifier if hasattr(rerank_model, 'cross_attn_classifier') else rerank_model
+        device = next(classifier.parameters()).device
+        # Determine the model's expected dtype (e.g., bfloat16 or float32)
+        model_dtype = next(classifier.parameters()).dtype
+        classifier.eval()
+        
+        reranked_predictions = predictions.copy()
+        num_queries = len(predictions)
+        
+        with torch.no_grad():
+            for q_idx in range(num_queries):
+                # 1. Get the local token window for this query [1, Lt, D]
+                # Cast to the model's expected dtype to prevent mismatch
+                q_text_local = q_local_list[q_idx].unsqueeze(0).to(device=device, dtype=model_dtype) 
+                
+                # 2. Extract indices of top global candidates to rerank
+                candidate_db_indices = predictions[q_idx, :max_rerank_k]
+                
+                # 3. Gather and cast local patch maps for these candidates [K, Li, D]
+                cand_img_locals = torch.stack([r_local_list[db_idx] for db_idx in candidate_db_indices]).to(device=device, dtype=model_dtype)
+                
+                # 4. Match dimensions for cross-attention broadcast
+                Lt, D_dim = q_text_local.shape[1], q_text_local.shape[2]
+                q_text_local_expanded = q_text_local.expand(len(candidate_db_indices), Lt, D_dim)
+                
+                # 5. Compute fine-grained scores [K]
+                scores = classifier(cand_img_locals, q_text_local_expanded).cpu().numpy()
+                
+                # 6. Sort candidate index subset descending by attention score
+                reranked_order = np.argsort(-scores)
+                reranked_predictions[q_idx, :max_rerank_k] = candidate_db_indices[reranked_order]
+        
+        # Replace predictions with our refined reranked array for metrics extraction
+        predictions = reranked_predictions
+    # -------------------------------------------------------------------------
+
+    # start calculating recall_at_k
+    correct_at_k = np.zeros(len(k_values))
+    for q_idx, pred in enumerate(predictions):
+        for i, n in enumerate(k_values):
+            if np.any(np.isin(pred[:n], gt[q_idx])):
+                correct_at_k[i:] += 1
+                break
+    
+    correct_at_k = correct_at_k / len(predictions)
+    d = {k: v for (k, v) in zip(k_values, correct_at_k)}
+
+    if print_results:
+        table = PrettyTable()
+        table.field_names = ['K'] + [str(k) for k in k_values]
+        table.add_row(['Recall@K'] + [f'{100*v:.2f}' for v in correct_at_k])
+        title_suffix = f" (Reranked @{max_rerank_k})" if rerank_model is not None else ""
+        print(table.get_string(title=f"Performances on {dataset_name}{title_suffix}"))
+    
+    return d

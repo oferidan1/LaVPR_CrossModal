@@ -58,6 +58,67 @@ def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors, 
     scores, predictions = faiss_index.search(queries_descriptors, max_results)
     return scores, predictions
 
+# ... (Keep your existing imports at the top)
+
+def rerank_predictions(model, test_ds, queries_dataloader, predictions, max_rerank_k=25, device="cuda"):
+    """
+    Reranks the top-k predictions using the Cross-Attention Classifier.
+    """
+    logger.info(f"Reranking top-{max_rerank_k} candidates using Cross-Attention...")
+    
+    # Access the underlying Lightning module if wrapped, or use directly
+    rerank_model = model.model if hasattr(model, 'model') else model
+    rerank_model.to(device)
+    rerank_model.eval()
+
+    # We need the database dataset to pull image data for candidate predictions
+    # Assuming test_ds allows access by index or we can rebuild a loader
+    reranked_predictions = predictions.copy()
+
+    # Step 1: Pre-extract or dynamically fetch local features
+    # To keep memory footprint low and handle variable sizes, we loop through queries
+    with torch.no_grad():
+        for q_idx in tqdm(range(test_ds.num_queries), desc="Reranking queries"):
+            # Get the query text sequence tokens/local features
+            # test_ds stores queries after database items
+            actual_q_ds_idx = test_ds.num_database + q_idx
+            _, _, q_text = test_ds[actual_q_ds_idx]
+            
+            # Encode query text to get token-level sequences
+            _, text_local, _, _, _ = rerank_model.encode_text([q_text]) # shape: [1, Lt, D]
+            
+            # Get top-k candidate indices from global retrieval
+            candidate_db_indices = predictions[q_idx, :max_rerank_k]
+            
+            # Gather and encode candidate images
+            cand_images = []
+            for db_idx in candidate_db_indices:
+                img, _, _ = test_ds[db_idx]
+                cand_images.append(img)
+            
+            # Stack images into a batch [max_rerank_k, C, H, W]
+            cand_images = torch.stack(cand_images).to(device)
+            if next(rerank_model.parameters()).dtype == torch.bfloat16:
+                cand_images = cand_images.bfloat16()
+                
+            _, img_local, _ = rerank_model.encode_image(cand_images) # shape: [K, Li, D]
+            
+            # Expand text tokens to match the number of candidate images
+            Lt, D_dim = text_local.shape[1], text_local.shape[2]
+            text_local_expanded = text_local.expand(len(candidate_db_indices), Lt, D_dim) # shape: [K, Lt, D]
+            
+            # Compute cross-attention scores [K]
+            scores = rerank_model.cross_attn_classifier(img_local, text_local_expanded)
+            scores = scores.cpu().numpy()
+            
+            # Sort candidate indices based on the new fine-grained cross-attention scores
+            reranked_order = np.argsort(-scores) # Sort descending
+            
+            # Update the top-k spots in your predictions matrix
+            reranked_predictions[q_idx, :max_rerank_k] = candidate_db_indices[reranked_order]
+
+    return reranked_predictions
+
 
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -138,17 +199,25 @@ def main(args):
 
     max_results_reranking = test_ds.num_database    
         
-    if args.cross_modal:
-        vision_database_descriptors = vision_descriptors[: test_ds.num_database]    
-        text_queries_descriptors = text_descriptors[test_ds.num_database :]
-        scores, predictions = get_queries_predictions(model.encoder_dim, vision_database_descriptors, all_descriptors, text_queries_descriptors, max_results)
-        
-        
+    vision_database_descriptors = vision_descriptors[: test_ds.num_database]    
+    text_queries_descriptors = text_descriptors[test_ds.num_database :]
+    
+    # 1. Initial Quick Retrieval via Global Vectors
+    scores, predictions = get_queries_predictions(
+        model.encoder_dim, vision_database_descriptors, all_descriptors, text_queries_descriptors, max_results
+    )       
+    
+    # 2. Apply Fine-Grained Cross-Attention Reranking
+    # Set how many top candidates you want to rerank (e.g., top 25 or top 50)
+    max_rerank_k = min(25, max_results) 
+    predictions = rerank_predictions(
+        model, test_ds, queries_dataloader, predictions, max_rerank_k=max_rerank_k, device=args.device
+    )
+
+    # 3. Calculate metrics using the updated reranked predictions
     if is_msls_challenge:
-        # save predictions to msls_challenge format
         test_ds.save_predictions(predictions, log_dir / "msls_challenge_predictions.txt", k=25)
     else:
-        # For each query, check if the predictions are correct
         if args.use_labels:
             positives_per_query = test_ds.get_positives()
             recalls = np.zeros(len(args.recall_values))
@@ -158,27 +227,26 @@ def main(args):
                         recalls[i:] += 1
                         break
 
-            # Divide by num_queries and multiply by 100, so the recalls are in percentages
             recalls = recalls / test_ds.num_queries * 100
             recalls_str = ", ".join([f"R@{val}: {rec:.1f}" for val, rec in zip(args.recall_values, recalls)])
-            logger.info(recalls_str)
+            logger.info(f"Reranked Metrics -> {recalls_str}")
             
-            #model path is either lora_path *if not None) or model path (if not None) params
             model_path = args.lora_path if args.lora_path is not None else args.model_path
-            
-            # open eval_vpr_results.csv in append mode and write the recalls
             with open("eval_vpr_results.csv", "a") as f:
-                f.write(f"{model_path},{args.model_name},{recalls_str}\n")
+                f.write(f"{model_path},{args.model_name},Reranked_{max_rerank_k}: {recalls_str}\n")
             
-    # Save visualizations of predictions
     if args.num_preds_to_save != 0:
         logger.info("Saving final predictions")
-        # For each query save num_preds_to_save predictions
         visualizations.save_preds(
             predictions[:, : args.num_preds_to_save], test_ds, log_dir, args.save_only_wrong_preds, args.use_labels, test_ds.images_paths_csv, texts=test_ds.descriptions
         )
 
+        
+    
 
 if __name__ == "__main__":
     args = eval_parser.parse_arguments()
+    # Ensure args.device is set (fallback to cuda if missing)
+    if not hasattr(args, 'device'):
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
     main(args)
