@@ -53,51 +53,28 @@ def contrastive_loss_cross_modal(image_features, text_features, temp):
     #loss = loss_t
     
     return loss
-
-class MultiSimilarityLossForPairwiseScores(nn.Module):
-    def __init__(self, alpha=2.0, beta=50.0, lambda_val=0.5):
+    
+    
+class MultiPositiveInfoNCELoss(nn.Module):
+    def __init__(self, temperature=0.07):
         super().__init__()
-        self.alpha = alpha     # Gradient scale for weak positives
-        self.beta = beta       # Gradient scale for hard negatives (focuses heavily on tough VPR failures)
-        self.lambda_val = lambda_val
+        self.temperature = temperature
 
     def forward(self, score_matrix, labels):
-        """
-        score_matrix: [B, B] tensor containing the raw scalar matching logits from your MLP.
-                      score_matrix[i, j] = Score(Text_i, Image_j)
-        labels:       [B] tensor containing structural location class tags (e.g., [0,0,0,0, 1,1,1,1, ...])
-        """
-        batch_size = score_matrix.size(0)
-        loss = 0.0
-        
-        # 1. Generate the absolute alignment mask grid [B, B]
-        # entry [i, j] is True if index i and index j belong to the same physical place
-        adjacency_matrix = (labels.unsqueeze(0) == labels.unsqueeze(1))
-        
-        # Disregard the diagonal identity (self-matching elements) from pair optimization
-        identity_mask = torch.eye(batch_size, dtype=torch.bool, device=score_matrix.device)
-        
-        # Isolate true companion positives and explicit out-of-class negatives
-        pos_mask = adjacency_matrix & ~identity_mask
-        neg_mask = ~adjacency_matrix
 
-        # 2. Compute soft-mining exponential margins across rows
-        for i in range(batch_size):
-            row_scores = score_matrix[i]
-            
-            # Extract the 3 structural positive matching scores and all out-of-class negative blocks
-            pos_scores = row_scores[pos_mask[i]]
-            neg_scores = row_scores[neg_mask[i]]
-            
-            # Guard rail for edge configurations
-            if len(pos_scores) == 0 or len(neg_scores) == 0:
-                continue
-            
-            # Natural soft mining via Multi-Similarity log-exponential pooling:
-            # Positives close to 0 receive high gradients; high negative scores explode exponentially
-            pos_term = (1.0 / self.alpha) * torch.log(1.0 + torch.sum(torch.exp(-self.alpha * (pos_scores - self.lambda_val))))
-            neg_term = (1.0 / self.beta) * torch.log(1.0 + torch.sum(torch.exp(self.beta * (neg_scores - self.lambda_val))))
-            
-            loss += pos_term + neg_term
-            
-        return loss / batch_size
+        labels = labels.view(-1)
+
+        pos_mask = labels[:, None] == labels[None, :]
+        pos_mask.fill_diagonal_(False)
+
+        logits = score_matrix / self.temperature
+
+        log_probs = F.log_softmax(logits, dim=1)
+
+        loss = -(log_probs * pos_mask.float()).sum(1)
+
+        denom = pos_mask.sum(1).clamp(min=1)
+
+        loss = loss / denom
+
+        return loss.mean()

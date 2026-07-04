@@ -82,6 +82,7 @@ def parse_arguments():
             
 if __name__ == '__main__':    
     pl.utilities.seed.seed_everything(seed=190223, workers=True)
+    torch.set_float32_matmul_precision("high")
     
     args = parse_arguments()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu

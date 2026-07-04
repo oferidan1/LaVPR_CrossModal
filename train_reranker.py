@@ -27,7 +27,7 @@ def parse_arguments():
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
-    parser.add_argument("--epochs", type=int, default='20', help="number of epochs to train")    
+    parser.add_argument("--epochs", type=int, default='8', help="number of epochs to train")    
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
     parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
@@ -43,12 +43,12 @@ def parse_arguments():
     parser.add_argument("--opt", type=str, default="adamw", help="optimizer sgd/adam/adamw")    
     parser.add_argument("--lr", type=float, default="0.00002", help="learning rate")
     parser.add_argument("--lr_mult", type=float, default="0.5", help="learning rate")    
-    #parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6,8], help="milestones for lr scheduler seperated by space")
-    parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
-    parser.add_argument("--resume", type=str, default=None, help="resume training from path")    
-    
+    parser.add_argument("--milestones", nargs="+", type=int, default=[4,6], help="milestones for lr scheduler seperated by space")
+    #parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
+    #parser.add_argument("--resume", type=str, default=None, help="resume training from path")        
+    parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch(18)_R1[0.5938]_R5[0.8275].ckpt') 
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping from image id to vocab indices")
-    #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
+    
     
     args = parser.parse_args()
     
@@ -111,7 +111,15 @@ if __name__ == '__main__':
     )
     
     if args.resume is not None:
-        model = model.load_from_checkpoint(args.resume)
+        #model = model.load_from_checkpoint(args.resume)
+        model_state_dict = torch.load(args.resume)['state_dict']
+        renamed_state_dict = {}
+        for old_key, value in model_state_dict.items():
+            if 'text_encoder' not in old_key:
+                continue
+            new_key = old_key.replace('text_encoder', 'vlm_encoder')
+            renamed_state_dict[new_key] = value
+        model.load_state_dict(renamed_state_dict, strict=False)
         
     model = model.to('cuda')
     
@@ -139,7 +147,7 @@ if __name__ == '__main__':
     #------------------
     # we instanciate a trainer
     trainer = pl.Trainer(
-        accelerator='gpu', devices=[0],
+        accelerator='gpu', devices=1,
         default_root_dir=f'./LOGS/{"resnet50"}', # Tensorflow can be used to viz
         num_sanity_val_steps=0, # runs a =- step before stating training
         #precision=16, # we use half precision to reduce  memory usage
@@ -153,7 +161,9 @@ if __name__ == '__main__':
     )
     
     # # Manually call validation
-    #trainer.validate(model=model, datamodule=datamodule)
+    #trainer.validate(model=model, datamodule=datamodule)    
+    
+    print("Trainer device:", trainer.strategy.root_device)
 
     # we call the trainer, we give it the model and the datamodule
     trainer.fit(model=model, datamodule=datamodule)

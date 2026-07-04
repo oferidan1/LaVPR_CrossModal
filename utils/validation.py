@@ -26,8 +26,6 @@ def get_validation_recalls(r_list, q_list, k_values, gt, print_results=True, fai
         # search for queries in the index
         _, predictions = faiss_index.search(q_list, max(k_values))
         
-        
-        
         # start calculating recall_at_k
         correct_at_k = np.zeros(len(k_values))
         for q_idx, pred in enumerate(predictions):
