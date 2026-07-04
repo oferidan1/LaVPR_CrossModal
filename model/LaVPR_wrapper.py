@@ -58,7 +58,11 @@ class LaVPR_wrapper():
                 self.single_encoder.vlm_encoder = peft.PeftModel.from_pretrained(self.single_encoder.vlm_encoder, args.lora_path, is_trainable=False)            
             else:            
                 model_state_dict = torch.load(args.model_path)['state_dict']
-                self.single_encoder.load_state_dict(model_state_dict, strict=False)
+                renamed_state_dict = {}
+                for old_key, value in model_state_dict.items():
+                    new_key = old_key.replace('text_encoder', 'vlm_encoder')
+                    renamed_state_dict[new_key] = value
+                self.single_encoder.load_state_dict(renamed_state_dict, strict=False)
             
             self.single_encoder = self.single_encoder.to(args.device)
             self.single_encoder.eval()            

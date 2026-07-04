@@ -270,10 +270,23 @@ class LaVPR(pl.LightningModule):
             img_all_layers = img_output.hidden_states
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
         elif 'clip' in self.model_name:                        
-            img_output = self.vlm_encoder.get_image_features(pixel_values=img, output_hidden_states=True)            
-            img_local = img_output.last_hidden_state            
-            img_embeds = img_output.pooler_output
-            img_all_layers = img_output.hidden_states
+            # img_output = self.vlm_encoder.get_image_features(pixel_values=img, output_hidden_states=True)            
+            # img_local = img_output.last_hidden_state            
+            # img_embeds = img_output.pooler_output
+            # img_all_layers = img_output.hidden_states
+            
+            vision_outputs = self.vlm_encoder.vision_model(
+                pixel_values=img, 
+                output_hidden_states=True
+            )
+            img_local = vision_outputs.last_hidden_state            
+            img_all_layers = vision_outputs.hidden_states
+            pooled_output = vision_outputs.pooler_output
+            if hasattr(self.vlm_encoder, 'visual_projection'):
+                img_embeds = self.vlm_encoder.visual_projection(pooled_output)
+            else:
+                img_embeds = pooled_output            
+            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)
         elif 'siglip' in self.model_name:
             img_output = self.vlm_encoder.get_image_features(pixel_values=img)
             #img_local = self.vlm_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
@@ -307,10 +320,24 @@ class LaVPR(pl.LightningModule):
             attention_mask = None
             if 'attention_mask' in text_inputs:
                 attention_mask = text_inputs['attention_mask'].to(self.my_device)                
-            text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)
-            text_local = self.vlm_encoder.text_projection(text_output.last_hidden_state)
-            text_embeds = text_output.pooler_output    
-            text_all_layers = text_output.hidden_states
+            # text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)
+            # text_local = self.vlm_encoder.text_projection(text_output.last_hidden_state)
+            # text_embeds = text_output.pooler_output    
+            # text_all_layers = text_output.hidden_states
+    
+            text_outputs = self.vlm_encoder.text_model(
+                input_ids=text_tokens,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )                        
+            text_local = text_outputs.last_hidden_state  # Shape: [B, seq_len, hidden_dim]
+            text_all_layers = text_outputs.hidden_states # Tuple of all intermediate layer states                        
+            pooled_text = text_outputs.pooler_output     # Shape: [B, hidden_dim]                        
+            if hasattr(self.vlm_encoder, 'text_projection'):
+                text_embeds = self.vlm_encoder.text_projection(pooled_text)
+            else:
+                text_embeds = pooled_text                            
+            text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
         elif 'siglip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
             text_tokens = text_inputs.input_ids.to(self.my_device)
