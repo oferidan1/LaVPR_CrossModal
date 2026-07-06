@@ -29,11 +29,13 @@ def parse_arguments():
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
     parser.add_argument("--epochs", type=int, default='8', help="number of epochs to train")    
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
-    parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
+    #parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
+    parser.add_argument("--image_root", type=str, default="/home/shared/datasets/gsv_cities/", help="root directory for images")
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
     parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
-    parser.add_argument("--val_image_root", type=str, default="/mnt/d/data/pitts30k/images/val", help="root directory for images")
+    #parser.add_argument("--val_image_root", type=str, default="/mnt/d/data/pitts30k/images/val", help="root directory for images")
+    parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--freeze_vlm", type=int, default="1", help="freeze the Vision-Language Model (VLM) backbone")
     parser.add_argument("--train_vlm", type=int, default="0", help="train vlm encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
@@ -41,12 +43,12 @@ def parse_arguments():
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
     parser.add_argument("--opt", type=str, default="adamw", help="optimizer sgd/adam/adamw")    
-    parser.add_argument("--lr", type=float, default="0.00002", help="learning rate")
+    parser.add_argument("--lr", type=float, default="0.0001", help="learning rate")
     parser.add_argument("--lr_mult", type=float, default="0.5", help="learning rate")    
-    parser.add_argument("--milestones", nargs="+", type=int, default=[4,6], help="milestones for lr scheduler seperated by space")
+    parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6], help="milestones for lr scheduler seperated by space")
     #parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
     #parser.add_argument("--resume", type=str, default=None, help="resume training from path")        
-    parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch(18)_R1[0.5938]_R5[0.8275].ckpt') 
+    parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch_18.ckpt') 
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping from image id to vocab indices")
     
     
@@ -148,7 +150,7 @@ if __name__ == '__main__':
     # we instanciate a trainer
     trainer = pl.Trainer(
         accelerator='gpu', devices=1,
-        default_root_dir=f'./LOGS/{"resnet50"}', # Tensorflow can be used to viz
+        default_root_dir=f'./LOGS/{"reranker"}', # Tensorflow can be used to viz
         num_sanity_val_steps=0, # runs a =- step before stating training
         #precision=16, # we use half precision to reduce  memory usage
         max_epochs=args.epochs,

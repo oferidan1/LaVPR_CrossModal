@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 import peft
 from model.LaVPR import LaVPR
+from model.LaVPR_reranker import LaVPR_reranker
 from transformers import AutoTokenizer, AutoModel
 from model.blip_model import BlipForImageTextRetrievalWrapper
 from transformers import BlipProcessor, BlipModel
@@ -21,6 +22,7 @@ class LaVPR_wrapper():
         self.device = args.device
         self.embeds_dim = args.embeds_dim
         self.encoder_dim = args.embeds_dim
+        self.reranker = args.reranker
        
         if args.cross_modal<=1:
             self.max_text_length = 77
@@ -41,17 +43,25 @@ class LaVPR_wrapper():
                 self.vpr_encoder, _, self.processor = open_clip.create_model_and_transforms(self.model_name, pretrained='merged2b_s8b_b131k')#'EVA02-B-16'
                 self.tokenizer = open_clip.get_tokenizer(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)                
-        else:            
-            self.single_encoder = LaVPR(   
-                #---- Encoder
-                model_name=args.model_name.lower(),
-                train_vlm=args.train_vlm,
-                embeds_dim=args.embeds_dim,           
-                lora_all_linear=args.lora_all_linear,
-                lora_target_modules=args.lora_target_modules,
-                lora_r=args.lora_r,                  
-                agg_type=args.agg_type,            
-            )
+        else:          
+            if args.reranker:
+                self.single_encoder = LaVPR_reranker(   
+                    #---- Encoder
+                    model_name=args.model_name.lower(),
+                    train_vlm=args.train_vlm,
+                    embeds_dim=args.embeds_dim,                                           
+                )
+            else:  
+                self.single_encoder = LaVPR(   
+                    #---- Encoder
+                    model_name=args.model_name.lower(),
+                    train_vlm=args.train_vlm,
+                    embeds_dim=args.embeds_dim,           
+                    lora_all_linear=args.lora_all_linear,
+                    lora_target_modules=args.lora_target_modules,
+                    lora_r=args.lora_r,                  
+                    agg_type=args.agg_type,            
+                )
 
             if args.lora_path is not None:
                 print("loading lora from:", args.lora_path)
@@ -90,9 +100,13 @@ class LaVPR_wrapper():
         return image_features, text_features
     
     def encode_single(self, images, texts):
+        img_local, text_local = None, None
         with torch.no_grad():
-            features, text_features, _ , _ , _, _, _  = self.single_encoder(images, texts)
-        return features, text_features
+            if self.reranker:
+                score_matrix, features, text_features, img_local, text_local= self.single_encoder(images, texts, return_embeddings=True)
+            else:
+                features, text_features, _ , _ , _, _, _  = self.single_encoder(images, texts)
+        return features, text_features, img_local, text_local
     
     def encode_image(self, images):
         if 'blip' in self.model_name:

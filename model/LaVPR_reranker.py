@@ -64,8 +64,9 @@ class CrossAttnClassifier(nn.Module):
         
     def forward(self, img, text, labels=None, return_embeddings=False):
         fused, _ = self.cross_attn(text, img, img)
-        cls_token = fused[:, 0]
-        scores = self.score_head(cls_token).squeeze(-1)
+        #pooled = fused[:, 0]
+        pooled = fused[:, 0] + fused.mean(dim=1)
+        scores = self.score_head(pooled).squeeze(-1)
         
         if return_embeddings:
             return scores, img, text

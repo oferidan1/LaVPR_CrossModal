@@ -24,24 +24,26 @@ def normlize_features(x):
     return x / np.linalg.norm(x, axis=1, keepdims=True)    
 
 
-def encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors):
+def encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors, img_local_descs, text_local_descs):
     if args.bfloat16:
         images = images.bfloat16()
 
     if args.cross_modal<=1:
         image_features = model.encode_text(texts)
-        image_features = image_features.cpu().float().numpy()
-        vision_descriptors[indices.numpy(), :] = image_features     
+        vision_descriptors[indices.numpy(), :] = image_features.cpu().float().numpy()
         text_features = model.encode_image(images.to(args.device))
-        text_features = text_features.cpu().float().numpy()
-        text_descriptors[indices.numpy(), :] = text_features                
-    else:
+        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
+    elif args.reranker:
         # single vector of both image and text
-        descriptors, text_features = model.encode_single(images.to(args.device), texts)
-        descriptors = descriptors.cpu().float().numpy()
-        vision_descriptors[indices.numpy(), :] = descriptors
-        text_features = text_features.cpu().float().numpy()
-        text_descriptors[indices.numpy(), :] = text_features
+        descriptors, text_features, img_local, text_local = model.encode_single(images.to(args.device), texts)
+        vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
+        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
+        img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
+        text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()
+    else:
+        descriptors, text_features, _, _ = model.encode_single(images.to(args.device), texts)
+        vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
+        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()        
         
             
 def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors, queries_descriptors, max_results):
@@ -60,55 +62,46 @@ def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors, 
 
 # ... (Keep your existing imports at the top)
 
-def rerank_predictions(model, test_ds, queries_dataloader, predictions, max_rerank_k=25, device="cuda"):
+def rerank_predictions(model, test_ds, predictions, img_local_descs, text_local_desc, max_rerank_k=25, device="cuda"):
     """
     Reranks the top-k predictions using the Cross-Attention Classifier.
     """
     logger.info(f"Reranking top-{max_rerank_k} candidates using Cross-Attention...")
-    
+
     # Access the underlying Lightning module if wrapped, or use directly
-    rerank_model = model.model if hasattr(model, 'model') else model
+    rerank_model = model.single_encoder
     rerank_model.to(device)
     rerank_model.eval()
 
-    # We need the database dataset to pull image data for candidate predictions
-    # Assuming test_ds allows access by index or we can rebuild a loader
     reranked_predictions = predictions.copy()
 
-    # Step 1: Pre-extract or dynamically fetch local features
-    # To keep memory footprint low and handle variable sizes, we loop through queries
+    # Convert pre-computed numpy arrays to tensors on the correct device
+    img_local_descs_tensor = torch.from_numpy(img_local_descs).to(device)
+    text_local_desc_tensor = torch.from_numpy(text_local_desc).to(device)
+
     with torch.no_grad():
         for q_idx in tqdm(range(test_ds.num_queries), desc="Reranking queries"):
-            # Get the query text sequence tokens/local features
-            # test_ds stores queries after database items
+            # Get the pre-computed local features for the current query
             actual_q_ds_idx = test_ds.num_database + q_idx
-            _, _, q_text = test_ds[actual_q_ds_idx]
-            
-            # Encode query text to get token-level sequences
-            _, text_local, _, _, _ = rerank_model.encode_text([q_text]) # shape: [1, Lt, D]
-            
+            query_text_local = text_local_desc_tensor[actual_q_ds_idx].unsqueeze(0)  # [1, Lt, D]
+
             # Get top-k candidate indices from global retrieval
             candidate_db_indices = predictions[q_idx, :max_rerank_k]
-            
-            # Gather and encode candidate images
-            cand_images = []
-            for db_idx in candidate_db_indices:
-                img, _, _ = test_ds[db_idx]
-                cand_images.append(img)
-            
-            # Stack images into a batch [max_rerank_k, C, H, W]
-            cand_images = torch.stack(cand_images).to(device)
-            if next(rerank_model.parameters()).dtype == torch.bfloat16:
-                cand_images = cand_images.bfloat16()
-                
-            _, img_local, _ = rerank_model.encode_image(cand_images) # shape: [K, Li, D]
-            
+
+            # Gather pre-computed local features for the candidate database images
+            candidate_img_local = img_local_descs_tensor[candidate_db_indices]  # [K, Li, D]
+
             # Expand text tokens to match the number of candidate images
-            Lt, D_dim = text_local.shape[1], text_local.shape[2]
-            text_local_expanded = text_local.expand(len(candidate_db_indices), Lt, D_dim) # shape: [K, Lt, D]
-            
+            Lt, D_dim = query_text_local.shape[1], query_text_local.shape[2]
+            text_local_expanded = query_text_local.expand(len(candidate_db_indices), Lt, D_dim)  # shape: [K, Lt, D]
+
             # Compute cross-attention scores [K]
-            scores = rerank_model.cross_attn_classifier(img_local, text_local_expanded)
+            # Ensure dtypes match if using bfloat16
+            if next(rerank_model.parameters()).dtype == torch.bfloat16:
+                candidate_img_local = candidate_img_local.bfloat16()
+                text_local_expanded = text_local_expanded.bfloat16()
+
+            scores = rerank_model.cross_attn_classifier(candidate_img_local, text_local_expanded)
             scores = scores.cpu().numpy()
             
             # Sort candidate indices based on the new fine-grained cross-attention scores
@@ -151,6 +144,13 @@ def main(args):
     logger.info(f"VLM encoder dim: {model.encoder_dim}")
 
     is_msls_challenge = False
+    # Determine local feature dimensions
+    # For ViT-B/16 with 224x224 images, num_patches = (224/16)^2 = 196. With CLS token, it's 197.
+    # For text, it's the max token length, e.g., 77 for CLIP.
+    # These are hardcoded for now but could be made dynamic.
+    num_img_tokens = 197  # (14*14) + 1 for ViT-B/16
+    num_text_tokens = 77 # Max length for CLIP
+
     if 'msls_challenge' in args.image_root:        
         test_ds = MSLSTest(dataset_root=args.database_folder, image_root=args.image_root, csv_path=args.queries_csv, mean_std=dataset_mean_std, image_size=args.image_size)
         is_msls_challenge = True
@@ -183,9 +183,11 @@ def main(args):
         vision_descriptors = np.empty((len(test_ds), model.encoder_dim), dtype="float32")
         text_descriptors = np.empty((len(test_ds), model.encoder_dim), dtype="float32")            
         all_descriptors = np.empty((len(test_ds), model.encoder_dim), dtype="float32")
+        img_local_descs = np.empty((len(test_ds), num_img_tokens, model.encoder_dim), dtype="float32")
+        text_local_desc = np.empty((len(test_ds), num_text_tokens, model.encoder_dim), dtype="float32")
             
         for images, indices, texts in tqdm(database_dataloader):
-            encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors)
+            encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors, img_local_descs, text_local_desc)
 
         query_index = test_ds.num_database
         logger.debug("Extracting queries descriptors for evaluation/testing using batch size 1")
@@ -194,7 +196,7 @@ def main(args):
         )
         queries_dataloader = DataLoader(dataset=queries_subset_ds, num_workers=args.num_workers, batch_size=args.batch_size)#1)
         for images, indices, texts in tqdm(queries_dataloader):
-            encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors)
+            encode_batch(model, args, images, texts, indices, all_descriptors, vision_descriptors, text_descriptors, img_local_descs, text_local_desc)
         
 
     if args.cross_modal:        
@@ -214,7 +216,7 @@ def main(args):
     if args.reranker:
         max_rerank_k = min(25, max_results) 
         predictions = rerank_predictions(
-            model, test_ds, queries_dataloader, predictions, max_rerank_k=max_rerank_k, device=args.device
+            model, test_ds, predictions, img_local_descs, text_local_desc, max_rerank_k=max_rerank_k, device=args.device
         )
 
     # 3. Calculate metrics using the updated reranked predictions
