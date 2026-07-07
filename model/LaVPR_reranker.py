@@ -59,7 +59,8 @@ class CrossAttnClassifier(nn.Module):
             nn.Linear(embeds_dim, 512),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(512, 1)
+            nn.Linear(512, 1),
+            nn.Tanh()  # <-- Keeps scores between [-1, 1]. Works great with lambda_val=0.5
         )
         
     def forward(self, img, text, labels=None, return_embeddings=False):
@@ -245,31 +246,31 @@ class LaVPR_reranker(pl.LightningModule):
             
             return score_matrix
 
-        # --- Training phase logic: Target Hard Negatives Only ---
+       # --- Training phase logic: Target Hard Negatives Only ---
         with torch.no_grad():
             # Cheap global cosine pre-score grid mapping to find hard negatives natively
             global_sim = torch.matmul(text_embeds, img_embeds.T)
             
+            # Match elements sharing the exact same place label
             same_class_mask = (labels.unsqueeze(0) == labels.unsqueeze(1))
-            identity_mask = torch.eye(B, dtype=torch.bool, device=self.device)
             
-            pos_mask = same_class_mask & ~identity_mask
+            # FIX: Keep the identity! All 4 images of the place are valid positives.
+            pos_mask = same_class_mask 
             neg_mask = ~same_class_mask
 
         paired_text = []
         paired_img = []
         
-        # Pull layout dimensions
-        # Each query will see all its companion variants (N-1 positives) + M hard out-of-class negatives
-        num_pos = pos_mask[0].sum().item()
+        # Pull layout dimensions dynamic parameters safely
+        num_pos = pos_mask[0].sum().item() # This will now correctly equal 4
         num_neg = min(self.num_mined_negatives, neg_mask[0].sum().item())
         total_eval_elements = num_pos + num_neg
 
         for i in range(B):
             anchor_text = text_local[i:i+1] # [1, Lt, D]
             
-            # Fetch true positives for query i
-            pos_imgs = img_local[pos_mask[i]] # [num_pos, Li, D]
+            # Fetch all 4 true positives for place query i (including its own pair)
+            pos_imgs = img_local[pos_mask[i]] # [4, Li, D]
             
             # Fetch the toughest batch negatives based on global CLIP cosine alignment
             row_neg_scores = global_sim[i].clone()
@@ -282,13 +283,13 @@ class LaVPR_reranker(pl.LightningModule):
             paired_img.append(torch.cat([pos_imgs, neg_imgs], dim=0))
 
         # Flatten into targeted evaluation inputs
-        flat_text_pairs = torch.cat(paired_text, dim=0) # [B * (num_pos + num_neg), Lt, D]
-        flat_img_pairs = torch.cat(paired_img, dim=0)   # [B * (num_pos + num_neg), Li, D]
+        flat_text_pairs = torch.cat(paired_text, dim=0) 
+        flat_img_pairs = torch.cat(paired_img, dim=0)   
 
         # Compute heavy cross-attention only on these targeted pairs
-        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs) # [B * (num_pos + num_neg), 1]
+        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs) 
         
-        # Reshape into a tight rectangular matrix [B, num_pos + num_neg]
+        # Reshape into a tight rectangular matrix [B, 4 + num_neg]
         score_matrix = flat_scores.view(B, total_eval_elements)
         
         return score_matrix, num_pos, img_embeds, text_embeds, img_local, text_local

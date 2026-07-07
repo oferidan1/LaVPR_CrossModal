@@ -234,7 +234,7 @@ def main(args):
 
             recalls = recalls / test_ds.num_queries * 100
             recalls_str = ", ".join([f"R@{val}: {rec:.1f}" for val, rec in zip(args.recall_values, recalls)])
-            logger.info(f"Reranked Metrics -> {recalls_str}")
+            logger.info(f"{recalls_str}")
             
             model_path = args.lora_path if args.lora_path is not None else args.model_path
             with open("eval_vpr_results.csv", "a") as f:
