@@ -95,6 +95,10 @@ def get_validation_recalls_rerank(
         classifier.eval()
         
         reranked_predictions = predictions.copy()
+
+        # Convert global descriptors to tensors for indexing
+        r_list_tensor = torch.from_numpy(r_list).to(device=device, dtype=model_dtype)
+        q_list_tensor = torch.from_numpy(q_list).to(device=device, dtype=model_dtype)
         num_queries = len(predictions)
         
         with torch.no_grad():
@@ -102,19 +106,27 @@ def get_validation_recalls_rerank(
                 # 1. Get the local token window for this query [1, Lt, D]
                 # Cast to the model's expected dtype to prevent mismatch
                 q_text_local = q_local_list[q_idx].unsqueeze(0).to(device=device, dtype=model_dtype) 
+                q_text_global = q_list_tensor[q_idx].unsqueeze(0) # [1, D]
                 
                 # 2. Extract indices of top global candidates to rerank
                 candidate_db_indices = predictions[q_idx, :max_rerank_k]
                 
                 # 3. Gather and cast local patch maps for these candidates [K, Li, D]
                 cand_img_locals = torch.stack([r_local_list[db_idx] for db_idx in candidate_db_indices]).to(device=device, dtype=model_dtype)
+                cand_img_globals = r_list_tensor[candidate_db_indices] # [K, D]
                 
                 # 4. Match dimensions for cross-attention broadcast
                 Lt, D_dim = q_text_local.shape[1], q_text_local.shape[2]
                 q_text_local_expanded = q_text_local.expand(len(candidate_db_indices), Lt, D_dim)
+                q_text_global_expanded = q_text_global.expand(len(candidate_db_indices), -1) # [K, D]
                 
                 # 5. Compute fine-grained scores [K]
-                scores = classifier(cand_img_locals, q_text_local_expanded).cpu().numpy()
+                scores = classifier(
+                    cand_img_locals, 
+                    q_text_local_expanded, 
+                    cand_img_globals, 
+                    q_text_global_expanded
+                ).cpu().numpy()
                 
                 # 6. Sort candidate index subset descending by attention score
                 reranked_order = np.argsort(-scores)

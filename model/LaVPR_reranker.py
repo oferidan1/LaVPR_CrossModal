@@ -43,35 +43,81 @@ class LabelAwareMinedMSLoss(nn.Module):
             loss += pos_term + neg_term
             
         return loss / B
+    
+    
+class ListwiseRankMarginLoss(nn.Module):
+    """
+    Replaces MS Loss for rectangular score matrices [B, num_pos + num_neg].
+    Optimizes relative ranking margins instead of absolute scores.
+    """
+    def __init__(self, margin=0.1):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, score_matrix, num_pos):
+        """
+        score_matrix: [B, num_pos + num_neg] containing your blended model scores.
+        num_pos: (int) The number of true positive slots grouped at the front (e.g., 4).
+        """
+        # 1. Slice and isolate your positive and negative scores per row
+        # pos_scores shape: [B, num_pos, 1]
+        pos_scores = score_matrix[:, :num_pos].unsqueeze(2) 
+        
+        # neg_scores shape: [B, 1, num_neg]
+        neg_scores = score_matrix[:, num_pos:].unsqueeze(1) 
+        
+        # 2. Compute pairwise distance comparisons between every positive and negative
+        # Broadbasts to shape: [B, num_pos, num_neg]
+        ranking_violations = self.margin - (pos_scores - neg_scores)
+        
+        # 3. Apply a ReLU constraint (hinge loss) to isolate entries violating the margin
+        loss = torch.clamp(ranking_violations, min=0.0).mean()
+        
+        return loss
 
 
 class CrossAttnClassifier(nn.Module):
     def __init__(self, embeds_dim, num_heads=8):
         super().__init__()
+        self.img_proj = nn.Linear(embeds_dim, embeds_dim)
+        self.text_proj = nn.Linear(embeds_dim, embeds_dim)
+        
+        self.ln_text = nn.LayerNorm(embeds_dim)
+        self.ln_img = nn.LayerNorm(embeds_dim)
+        self.ln_post = nn.LayerNorm(embeds_dim)
         
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embeds_dim,
-            num_heads=num_heads,
-            batch_first=True
+            embed_dim=embeds_dim, num_heads=num_heads, batch_first=True
         )
-                
+        
         self.score_head = nn.Sequential(
-            nn.Linear(embeds_dim, 512),
+            nn.Linear(embeds_dim, 256),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 1),
-            nn.Tanh()  # <-- Keeps scores between [-1, 1]. Works great with lambda_val=0.5
+            nn.Dropout(0.3),
+            nn.Linear(256, 1)
         )
         
-    def forward(self, img, text, labels=None, return_embeddings=False):
-        fused, _ = self.cross_attn(text, img, img)
-        #pooled = fused[:, 0]
-        pooled = fused[:, 0] + fused.mean(dim=1)
-        scores = self.score_head(pooled).squeeze(-1)
+        # Make the scale learnable so you don't guess 0.1 manually
+        self.local_scale = nn.Parameter(torch.tensor([0.1]))
         
-        if return_embeddings:
-            return scores, img, text
-        return scores
+    def forward(self, img_local, text_local, img_global=None, text_global=None):
+        # 1. Local Cross Attention
+        t_features = self.ln_text(self.text_proj(text_local))
+        i_features = self.ln_img(self.img_proj(img_local))
+        
+        fused, _ = self.cross_attn(t_features, i_features, i_features)
+        attn_logits = self.ln_post(fused + t_features)
+        
+        # Max pool across the token sequence
+        pooled = torch.max(attn_logits, dim=1)[0] 
+        local_score = self.score_head(pooled).squeeze(-1)
+        
+        # 2. Combined Score Blend
+        if img_global is not None and text_global is not None:            
+            global_sim = F.cosine_similarity(text_global, img_global, dim=-1)                
+            return global_sim + self.local_scale * local_score
+            
+        return local_score
 
         
 
@@ -109,7 +155,8 @@ class LaVPR_reranker(pl.LightningModule):
         self.num_mined_negatives = num_mined_negatives
         
         # Swapped to customized Multi-Similarity Loss for fixed-structure inputs
-        self.loss_fn = LabelAwareMinedMSLoss(alpha=2.0, beta=50.0, lambda_val=0.5)
+        #self.loss_fn = LabelAwareMinedMSLoss(alpha=2.0, beta=50.0, lambda_val=0.5)
+        self.loss_fn = ListwiseRankMarginLoss(margin=0.2)
         
         self.save_hyperparameters()
         self.batch_acc = [] 
@@ -236,9 +283,12 @@ class LaVPR_reranker(pl.LightningModule):
         # Validation phase logic: Fall back to full matching grid matrix
         if labels is None or not self.training:
             text_pairs = text_local[:, None].expand(B, B, Lt, D).reshape(B * B, Lt, D)
-            img_pairs = img_local[None].expand(B, B, Li, D).reshape(B * B, Li, D)
+            img_pairs = img_local[None].expand(B, B, Li, D).reshape(B * B, Li, D)            
+            text_global_pairs = text_embeds[:, None].expand(B, B, D).reshape(B*B, D)
+            img_global_pairs = img_embeds[None].expand(B, B, D).reshape(B*B, D)
             
-            scores = self.cross_attn_classifier(img_pairs, text_pairs)            
+            scores = self.cross_attn_classifier(img_pairs, text_pairs, img_global_pairs, text_global_pairs)
+
             score_matrix = scores.view(B, B)
             
             if return_embeddings:
@@ -261,6 +311,9 @@ class LaVPR_reranker(pl.LightningModule):
         paired_text = []
         paired_img = []
         
+        paired_text_global = []
+        paired_img_global = []
+        
         # Pull layout dimensions dynamic parameters safely
         num_pos = pos_mask[0].sum().item() # This will now correctly equal 4
         num_neg = min(self.num_mined_negatives, neg_mask[0].sum().item())
@@ -268,31 +321,39 @@ class LaVPR_reranker(pl.LightningModule):
 
         for i in range(B):
             anchor_text = text_local[i:i+1] # [1, Lt, D]
+            anchor_text_global = text_embeds[i:i+1] # [1, D]
             
             # Fetch all 4 true positives for place query i (including its own pair)
             pos_imgs = img_local[pos_mask[i]] # [4, Li, D]
+            pos_imgs_global = img_embeds[pos_mask[i]] # [4, D]
             
             # Fetch the toughest batch negatives based on global CLIP cosine alignment
             row_neg_scores = global_sim[i].clone()
             row_neg_scores[~neg_mask[i]] = -1e9
             _, hard_neg_indices = torch.topk(row_neg_scores, k=num_neg)
             neg_imgs = img_local[hard_neg_indices] # [num_neg, Li, D]
+            neg_imgs_global = img_embeds[hard_neg_indices] # [num_neg, D]
             
             # Pack and expand
             paired_text.append(anchor_text.expand(total_eval_elements, -1, -1))
             paired_img.append(torch.cat([pos_imgs, neg_imgs], dim=0))
+            
+            paired_text_global.append(anchor_text_global.expand(total_eval_elements, -1))
+            paired_img_global.append(torch.cat([pos_imgs_global, neg_imgs_global], dim=0))
 
         # Flatten into targeted evaluation inputs
         flat_text_pairs = torch.cat(paired_text, dim=0) 
         flat_img_pairs = torch.cat(paired_img, dim=0)   
+        flat_text_global = torch.cat(paired_text_global, dim=0)
+        flat_img_global = torch.cat(paired_img_global, dim=0)
 
         # Compute heavy cross-attention only on these targeted pairs
-        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs) 
+        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs, flat_img_global, flat_text_global) 
         
         # Reshape into a tight rectangular matrix [B, 4 + num_neg]
         score_matrix = flat_scores.view(B, total_eval_elements)
         
-        return score_matrix, num_pos, img_embeds, text_embeds, img_local, text_local
+        return score_matrix, num_pos
     
 
     def loss_function(self, score_matrix, num_pos):        
@@ -321,7 +382,7 @@ class LaVPR_reranker(pl.LightningModule):
                 flat_texts.append(texts[j][i])
 
         # Feed forward the batch to the optimized model
-        scores, num_pos, _, _, _, _,= self(images, flat_texts, labels=labels) 
+        scores, num_pos = self(images, flat_texts, labels=labels) 
         loss = self.loss_function(scores, num_pos)
         
         self.log('loss', loss.item(), logger=True)        

@@ -62,52 +62,58 @@ def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors, 
 
 # ... (Keep your existing imports at the top)
 
-def rerank_predictions(model, test_ds, predictions, img_local_descs, text_local_desc, max_rerank_k=25, device="cuda"):
-    """
-    Reranks the top-k predictions using the Cross-Attention Classifier.
-    """
+def rerank_predictions(model, test_ds, predictions, vision_descriptors, text_descriptors, img_local_descs, text_local_desc, max_rerank_k=25, device="cuda"):
     logger.info(f"Reranking top-{max_rerank_k} candidates using Cross-Attention...")
 
-    # Access the underlying Lightning module if wrapped, or use directly
     rerank_model = model.single_encoder
     rerank_model.to(device)
     rerank_model.eval()
 
     reranked_predictions = predictions.copy()
 
-    # Convert pre-computed numpy arrays to tensors on the correct device
     img_local_descs_tensor = torch.from_numpy(img_local_descs).to(device)
     text_local_desc_tensor = torch.from_numpy(text_local_desc).to(device)
+    vision_descriptors_tensor = torch.from_numpy(vision_descriptors).to(device)
+    text_descriptors_tensor = torch.from_numpy(text_descriptors).to(device)
 
     with torch.no_grad():
         for q_idx in tqdm(range(test_ds.num_queries), desc="Reranking queries"):
-            # Get the pre-computed local features for the current query
             actual_q_ds_idx = test_ds.num_database + q_idx
-            query_text_local = text_local_desc_tensor[actual_q_ds_idx].unsqueeze(0)  # [1, Lt, D]
+            
+            # Extract raw query sequence
+            query_text_global = text_descriptors_tensor[actual_q_ds_idx].unsqueeze(0) # [1, D]
+            raw_text_local = text_local_desc_tensor[actual_q_ds_idx] # [Lt, D]
+            
+            # --- FIX: Dynamically identify and remove padding tokens ---
+            # Find tokens that are NOT completely zero vectors
+            non_zero_mask = raw_text_local.any(dim=-1) 
+            true_len = non_zero_mask.sum().item()
+            
+            # If the entire row is somehow zero fallback to 1 token, otherwise slice down to true length
+            true_len = max(1, true_len)
+            query_text_local = raw_text_local[:true_len].unsqueeze(0)  # [1, True_Lt, D]
+            # -----------------------------------------------------------
 
-            # Get top-k candidate indices from global retrieval
             candidate_db_indices = predictions[q_idx, :max_rerank_k]
-
-            # Gather pre-computed local features for the candidate database images
             candidate_img_local = img_local_descs_tensor[candidate_db_indices]  # [K, Li, D]
+            candidate_img_global = vision_descriptors_tensor[candidate_db_indices] # [K, D]
 
-            # Expand text tokens to match the number of candidate images
-            Lt, D_dim = query_text_local.shape[1], query_text_local.shape[2]
-            text_local_expanded = query_text_local.expand(len(candidate_db_indices), Lt, D_dim)  # shape: [K, Lt, D]
+            # Expand the trimmed text tokens perfectly
+            True_Lt, D_dim = query_text_local.shape[1], query_text_local.shape[2]
+            text_local_expanded = query_text_local.expand(len(candidate_db_indices), True_Lt, D_dim)
+            text_global_expanded = query_text_global.expand(len(candidate_db_indices), -1)
 
-            # Compute cross-attention scores [K]
-            # Ensure dtypes match if using bfloat16
             if next(rerank_model.parameters()).dtype == torch.bfloat16:
                 candidate_img_local = candidate_img_local.bfloat16()
                 text_local_expanded = text_local_expanded.bfloat16()
+                candidate_img_global = candidate_img_global.bfloat16()
+                text_global_expanded = text_global_expanded.bfloat16()
 
-            scores = rerank_model.cross_attn_classifier(candidate_img_local, text_local_expanded)
+            # Now cross-attention only sees real semantic tokens
+            scores = rerank_model.cross_attn_classifier(candidate_img_local, text_local_expanded, candidate_img_global, text_global_expanded)
             scores = scores.cpu().numpy()
             
-            # Sort candidate indices based on the new fine-grained cross-attention scores
-            reranked_order = np.argsort(-scores) # Sort descending
-            
-            # Update the top-k spots in your predictions matrix
+            reranked_order = np.argsort(-scores)
             reranked_predictions[q_idx, :max_rerank_k] = candidate_db_indices[reranked_order]
 
     return reranked_predictions
@@ -216,7 +222,7 @@ def main(args):
     if args.reranker:
         max_rerank_k = min(25, max_results) 
         predictions = rerank_predictions(
-            model, test_ds, predictions, img_local_descs, text_local_desc, max_rerank_k=max_rerank_k, device=args.device
+            model, test_ds, predictions, vision_descriptors, text_descriptors, img_local_descs, text_local_desc, max_rerank_k=max_rerank_k, device=args.device
         )
 
     # 3. Calculate metrics using the updated reranked predictions

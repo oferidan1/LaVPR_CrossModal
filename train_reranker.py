@@ -43,9 +43,10 @@ def parse_arguments():
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
     parser.add_argument("--opt", type=str, default="adamw", help="optimizer sgd/adam/adamw")    
-    parser.add_argument("--lr", type=float, default="0.0001", help="learning rate")
+    parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
     parser.add_argument("--lr_mult", type=float, default="0.5", help="learning rate")    
-    parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6], help="milestones for lr scheduler seperated by space")
+    parser.add_argument("--milestones", nargs="+", type=int, default=[5,7], help="milestones for lr scheduler seperated by space")
+    parser.add_argument("--mined_negatives", type=int, default=16, help="num of mined negatives")    
     #parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
     #parser.add_argument("--resume", type=str, default=None, help="resume training from path")        
     parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch_18.ckpt') 
@@ -109,7 +110,8 @@ if __name__ == '__main__':
         freeze_vlm=args.freeze_vlm,
         train_vlm=args.train_vlm,        
         pos_loss=args.pos_loss,
-        neg_loss=args.neg_loss,        
+        neg_loss=args.neg_loss,      
+        num_mined_negatives=args.mined_negatives,      
     )
     
     if args.resume is not None:
@@ -130,15 +132,16 @@ if __name__ == '__main__':
         # we save the best 3 models accoring to Recall@1 on pittsburg val
         checkpoint_cb = ModelCheckpoint(
             monitor='pitts30k_val/R1',
-            filename=f'{"resnet50"}' +
+            filename=f'{"reranker"}' +
             '_epoch({epoch:02d})_step({step:04d})_R1[{pitts30k_val/R1:.4f}]_R5[{pitts30k_val/R5:.4f}]',
             auto_insert_metric_name=False,
             save_weights_only=True,
             save_top_k=3,
-            mode='max',)
+            mode='max',
+            save_last=True)
     else:
         checkpoint_cb = ModelCheckpoint(        
-            filename=f'{"resnet50"}' +
+            filename=f'{"reranker"}' +
             '_epoch({epoch:02d})_step({step:04d})',
             auto_insert_metric_name=False,
             save_weights_only=True,
