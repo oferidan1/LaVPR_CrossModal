@@ -118,8 +118,12 @@ class LaVPR_wrapper():
             image_features /= image_features.norm(dim=-1, keepdim=True)   
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
             with torch.no_grad():               
-                image_features = self.vpr_encoder.get_image_features(pixel_values=images)
-            image_features = image_features.pooler_output
+                #image_features = self.vpr_encoder.get_image_features(pixel_values=images)
+                vision_outputs = self.vpr_encoder.vision_model(pixel_values=images, output_hidden_states=True)
+                pooled_output = vision_outputs.pooler_output
+                image_features = self.vpr_encoder.visual_projection(pooled_output)
+            image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+            #image_features = image_features.pooler_output
         elif 'eva' in self.model_name.lower():
             with torch.no_grad():                 
                 image_features = self.vpr_encoder.encode_image(images)
@@ -140,10 +144,17 @@ class LaVPR_wrapper():
             text_features = self.vpr_encoder.get_text_features(text_features.to(self.vpr_encoder.dtype)).float()
             text_features /= text_features.norm(dim=-1, keepdim=True)
         elif 'clip' in self.model_name or 'siglip' in self.model_name:            
-            text_inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length).input_ids.to(self.device)
+            text_inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
+            text_tokens = text_inputs.input_ids.to(self.device)
+            attention_mask = None
+            if 'attention_mask' in text_inputs:
+                attention_mask = text_inputs['attention_mask'].to(self.device)                
             with torch.no_grad():     
-                text_features = self.vpr_encoder.get_text_features(input_ids=text_inputs)
+                text_features = self.vpr_encoder.text_model(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)                   
+                #text_features = self.vpr_encoder.get_text_features(input_ids=text_tokens)
             text_features = text_features.pooler_output  
+            text_features = self.vpr_encoder.text_projection(text_features)
+            text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         elif 'eva' in self.model_name.lower():
             text_tokens = self.tokenizer(texts).to(self.device)
             with torch.no_grad():

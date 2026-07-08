@@ -206,7 +206,10 @@ def main(args):
         
 
     if args.cross_modal:        
-        database_descriptors = vision_descriptors[: test_ds.num_database]    
+        if args.text_only:
+            database_descriptors = text_descriptors[: test_ds.num_database]    
+        else:
+            database_descriptors = vision_descriptors[: test_ds.num_database]    
         queries_descriptors = text_descriptors[test_ds.num_database :]
     else:
         database_descriptors = text_descriptors[: test_ds.num_database]    
