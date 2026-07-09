@@ -223,7 +223,7 @@ def main(args):
     # 2. Apply Fine-Grained Cross-Attention Reranking
     # Set how many top candidates you want to rerank (e.g., top 25 or top 50)
     if args.reranker:
-        max_rerank_k = min(25, max_results) 
+        max_rerank_k = max(args.max_rerank, max_results) 
         predictions = rerank_predictions(
             model, test_ds, predictions, vision_descriptors, text_descriptors, img_local_descs, text_local_desc, max_rerank_k=max_rerank_k, device=args.device
         )

@@ -85,7 +85,7 @@ def parse_arguments():
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--lora_path", type=str, default=None)        
     parser.add_argument("--is_normalize", type=int, default="0", help="is normalize features")    
-    parser.add_argument("--max_rerank", type=int, default="25", help="max results for reranking")        
+    parser.add_argument("--max_rerank", type=int, default="20", help="max results for reranking")        
     parser.add_argument("--train_vlm", type=int, default="0", help="train text encoder or not")
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
