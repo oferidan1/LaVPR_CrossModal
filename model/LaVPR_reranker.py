@@ -2,77 +2,38 @@ import pytorch_lightning as pl
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.optim import lr_scheduler, optimizer
+from torch.optim import lr_scheduler
 import os
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import AutoTokenizer, AutoModel, BlipProcessor, BlipModel, AutoProcessor
 import open_clip
 import utils
+import numpy as np
 
 
-class LabelAwareMinedMSLoss(nn.Module):
-    """
-    Computes Multi-Similarity loss directly on a pre-structured 
-    rectangular score matrix containing: [True Positives ..., Hard Mined Negatives ...]
-    """
-    def __init__(self, alpha=2.0, beta=50.0, lambda_val=0.5):
-        super().__init__()
-        self.alpha = alpha
-        self.beta = beta
-        self.lambda_val = lambda_val
-
-    def forward(self, score_matrix, num_pos):
-        """
-        score_matrix: [B, num_pos + num_neg] containing raw cross-attention outputs.
-        num_pos: The number of true companion positive targets per row (N - 1)
-        """
-        B = score_matrix.size(0)
-        loss = 0.0
-        
-        for i in range(B):
-            row = score_matrix[i]
-            pos_scores = row[:num_pos]
-            neg_scores = row[num_pos:]
-            
-            if len(pos_scores) == 0 or len(neg_scores) == 0:
-                continue
-                
-            pos_term = (1.0 / self.alpha) * torch.log(1.0 + torch.sum(torch.exp(-self.alpha * (pos_scores - self.lambda_val))))
-            neg_term = (1.0 / self.beta) * torch.log(1.0 + torch.sum(torch.exp(self.beta * (neg_scores - self.lambda_val))))
-            
-            loss += pos_term + neg_term
-            
-        return loss / B
-    
-    
 class ListwiseRankMarginLoss(nn.Module):
     """
     Replaces MS Loss for rectangular score matrices [B, num_pos + num_neg].
     Optimizes relative ranking margins instead of absolute scores.
     """
-    def __init__(self, margin=0.1):
+    def __init__(self, margin=0.3):
         super().__init__()
         self.margin = margin
 
     def forward(self, score_matrix, num_pos):
         """
         score_matrix: [B, num_pos + num_neg] containing your blended model scores.
-        num_pos: (int) The number of true positive slots grouped at the front (e.g., 4).
+        num_pos: (int) The number of true positive slots grouped at the front.
         """
         # 1. Slice and isolate your positive and negative scores per row
-        # pos_scores shape: [B, num_pos, 1]
-        pos_scores = score_matrix[:, :num_pos].unsqueeze(2) 
-        
-        # neg_scores shape: [B, 1, num_neg]
-        neg_scores = score_matrix[:, num_pos:].unsqueeze(1) 
+        pos_scores = score_matrix[:, :num_pos].unsqueeze(2)  # [B, num_pos, 1]
+        neg_scores = score_matrix[:, num_pos:].unsqueeze(1)  # [B, 1, num_neg]
         
         # 2. Compute pairwise distance comparisons between every positive and negative
-        # Broadbasts to shape: [B, num_pos, num_neg]
         ranking_violations = self.margin - (pos_scores - neg_scores)
         
         # 3. Apply a ReLU constraint (hinge loss) to isolate entries violating the margin
         loss = torch.clamp(ranking_violations, min=0.0).mean()
-        
         return loss
 
 
@@ -97,7 +58,7 @@ class CrossAttnClassifier(nn.Module):
             nn.Linear(256, 1)
         )
         
-        # Make the scale learnable so you don't guess 0.1 manually
+        # Learnable scaling factor to automatically balance cross-attention with baseline scores
         self.local_scale = nn.Parameter(torch.tensor([0.1]))
         
     def forward(self, img_local, text_local, img_global=None, text_global=None):
@@ -119,17 +80,16 @@ class CrossAttnClassifier(nn.Module):
             
         return local_score
 
-        
 
 class LaVPR_reranker(pl.LightningModule):
     def __init__(self,   
-                 lr=0.03, 
-                 optimizer='sgd',
-                 weight_decay=1e-3,
+                 lr=0.0001, 
+                 optimizer='adamw',
+                 weight_decay=1e-2,
                  momentum=0.9,
                  warmpup_steps=500,
-                 milestones=[5, 10, 15],
-                 lr_mult=0.3,
+                 milestones=[4, 6],
+                 lr_mult=0.5,
                  epochs=10,
                  faiss_gpu=False,
                  model_name='Salesforce/blip-itm-base-coco',
@@ -138,7 +98,8 @@ class LaVPR_reranker(pl.LightningModule):
                  train_vlm=False,
                  pos_loss=0,
                  neg_loss=0,
-                 num_mined_negatives=8 # <-- Dynamic budget control parameter
+                 num_mined_negatives=8,
+                 max_img_tokens=197,
                  ):
         super().__init__()       
         
@@ -154,8 +115,6 @@ class LaVPR_reranker(pl.LightningModule):
         self.faiss_gpu = faiss_gpu
         self.num_mined_negatives = num_mined_negatives
         
-        # Swapped to customized Multi-Similarity Loss for fixed-structure inputs
-        #self.loss_fn = LabelAwareMinedMSLoss(alpha=2.0, beta=50.0, lambda_val=0.5)
         self.loss_fn = ListwiseRankMarginLoss(margin=0.3)
         
         self.save_hyperparameters()
@@ -188,7 +147,15 @@ class LaVPR_reranker(pl.LightningModule):
         if freeze_vlm:
             for param in self.vlm_encoder.parameters():
                 param.requires_grad = False                               
-            self.vlm_encoder.eval()                
+            self.vlm_encoder.eval()
+
+        # --- Global Hard Negative Memory Bank Registration ---
+        # Queue capacity set to 4140 elements (Safe multiple for batch size 180)
+        self.queue_size = 4140 
+        self.register_buffer("image_global_queue", torch.zeros(self.queue_size, embeds_dim))
+        self.register_buffer("image_local_queue", torch.zeros(self.queue_size, max_img_tokens, embeds_dim))
+        self.register_buffer("label_queue", torch.ones(self.queue_size, dtype=torch.long) * -1)
+        self.queue_ptr = 0
                 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -196,6 +163,26 @@ class LaVPR_reranker(pl.LightningModule):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)        
                 
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, img_embeds, img_local, labels):
+        batch_size = img_embeds.shape[0]
+        
+        # Safety fallback slice if end of data produces smaller leftover batches
+        if self.queue_ptr + batch_size > self.queue_size:
+            batch_size = self.queue_size - self.queue_ptr
+            
+        if batch_size <= 0:
+            self.queue_ptr = 0
+            batch_size = img_embeds.shape[0]
+
+        # Overwrite current target indices block
+        self.image_global_queue[self.queue_ptr:self.queue_ptr + batch_size] = img_embeds[:batch_size]
+        self.image_local_queue[self.queue_ptr:self.queue_ptr + batch_size] = img_local[:batch_size]
+        self.label_queue[self.queue_ptr:self.queue_ptr + batch_size] = labels[:batch_size]
+        
+        # Advance rolling pointer tracking
+        self.queue_ptr = (self.queue_ptr + batch_size) % self.queue_size
+
     def encode_image(self, img):
         img_embeds = None
         img_local = None
@@ -270,61 +257,77 @@ class LaVPR_reranker(pl.LightningModule):
         return text_embeds, text_local, attention_mask, text_tokens, text_all_layers
 
     def forward(self, img, text, labels=None, return_embeddings=False):
-        """
-        Modified forward with Cross-Attention Hard Negative Mining for training
-        and full-matrix extraction for validation evaluation.
-        """
         img_embeds, img_local, img_all_layers = self.encode_image(img)
         text_embeds, text_local, attention_mask, text_tokens, text_all_layers = self.encode_text(text)      
                 
         B, Lt, D = text_local.shape
         Li = img_local.shape[1]
 
-        # Validation phase logic: Fall back to full matching grid matrix
+        # --- Validation Phase Logic (Safely Chunked to Prevent OOM) ---
         if labels is None or not self.training:
             text_pairs = text_local[:, None].expand(B, B, Lt, D).reshape(B * B, Lt, D)
             img_pairs = img_local[None].expand(B, B, Li, D).reshape(B * B, Li, D)            
             text_global_pairs = text_embeds[:, None].expand(B, B, D).reshape(B * B, D)
             img_global_pairs = img_embeds[None].expand(B, B, D).reshape(B * B, D)
             
-            scores = self.cross_attn_classifier(img_pairs, text_pairs, img_global_pairs, text_global_pairs)
+            chunk_size = 2048
+            total_pairs = text_pairs.size(0)
+            all_flat_scores = []
+            
+            for chunk_start in range(0, total_pairs, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_pairs)
+                chunk_scores = self.cross_attn_classifier(
+                    img_pairs[chunk_start:chunk_end],
+                    text_pairs[chunk_start:chunk_end],
+                    img_global_pairs[chunk_start:chunk_end],
+                    text_global_pairs[chunk_start:chunk_end]
+                )
+                all_flat_scores.append(chunk_scores)
+            
+            scores = torch.cat(all_flat_scores, dim=0)
             score_matrix = scores.view(B, B)
             
             if return_embeddings:
                 return score_matrix, img_embeds, text_embeds, img_local, text_local
-            
             return score_matrix
 
-        # --- Training phase logic: True Local Hard Negative Mining ---
+        # --- Training Phase Logic: Global Queue-Based Hard Mining ---
         with torch.no_grad():
-            # 1. Base global cosine mapping used ONLY for the initial candidate pool
-            global_sim = torch.matmul(text_embeds, img_embeds.T)
+            # Check if history bank queue is warm
+            queue_is_ready = (self.label_queue[0] != -1)
             
-            same_class_mask = (labels.unsqueeze(0) == labels.unsqueeze(1))
-            pos_mask = same_class_mask 
+            # Use active queue for negative candidates if ready, otherwise fallback to standard batch
+            active_image_global = self.image_global_queue if queue_is_ready else img_embeds
+            active_image_local = self.image_local_queue if queue_is_ready else img_local
+            active_labels = self.label_queue if queue_is_ready else labels
+            
+            # Compute global cosine similarities against the entire memory pool
+            global_sim = torch.matmul(text_embeds, active_image_global.T)
+            
+            same_class_mask = (labels.unsqueeze(1) == active_labels.unsqueeze(0))
             neg_mask = ~same_class_mask
-
-            num_pos = pos_mask[0].sum().item() 
-            num_neg = min(self.num_mined_negatives, neg_mask[0].sum().item())
             
-            # Increase the pool to 48 to find tougher options in a batch of 180
-            mining_pool_size = min(48, neg_mask[0].sum().item()) 
-
+            # Positives are gathered locally from the batch
+            local_same_class_mask = (labels.unsqueeze(0) == labels.unsqueeze(1))
+            pos_mask = local_same_class_mask
+            
+            num_pos = pos_mask[0].sum().item()
+            num_neg = self.num_mined_negatives
+            
+            # Screen the top 64 hardest global candidates using the cross-attention layers
+            mining_pool_size = min(64, active_image_global.shape[0])
             final_hard_neg_indices = []
-
-            # 2. Force mining based PURELY on the local cross-attention head
+            
             for i in range(B):
                 row_neg_scores = global_sim[i].clone()
                 row_neg_scores[~neg_mask[i]] = -1e9
                 
-                # Pull candidates from global similarity
-                _, candidate_neg_indices = torch.topk(row_neg_scores, k=mining_pool_size)
+                _, candidate_pool_indices = torch.topk(row_neg_scores, k=mining_pool_size)
                 
-                cand_img_local = img_local[candidate_neg_indices]      
-                anchor_text_local = text_local[i:i+1].expand(mining_pool_size, -1, -1)   
+                cand_img_local = active_image_local[candidate_pool_indices]
+                anchor_text_local = text_local[i:i+1].expand(mining_pool_size, -1, -1)
                 
-                # CRITICAL: Call only the cross-attention score, bypassing global_sim
-                # This stops the model from using global vector shortcuts during mining
+                # Screen using token layers without global shortcuts
                 t_features = self.cross_attn_classifier.ln_text(self.cross_attn_classifier.text_proj(anchor_text_local))
                 i_features = self.cross_attn_classifier.ln_img(self.cross_attn_classifier.img_proj(cand_img_local))
                 
@@ -332,59 +335,47 @@ class LaVPR_reranker(pl.LightningModule):
                 attn_logits = self.cross_attn_classifier.ln_post(fused + t_features)
                 pooled = torch.max(attn_logits, dim=1)[0]
                 
-                # Raw local classifier logit
                 local_screening_scores = self.cross_attn_classifier.score_head(pooled).squeeze(-1)
                 
-                # Select the negatives that get the highest attention scores
                 _, top_hard_meta_indices = torch.topk(local_screening_scores, k=num_neg)
-                actual_hard_indices = candidate_neg_indices[top_hard_meta_indices]
-                
+                actual_hard_indices = candidate_pool_indices[top_hard_meta_indices]
                 final_hard_neg_indices.append(actual_hard_indices)
 
-        # --- 3. Construct Final Batches (With Gradients On) ---
-        paired_text = []
-        paired_img = []
-        paired_text_global = []
-        paired_img_global = []
-        
+        # Build final batches for the backward pass
+        paired_text, paired_img, paired_text_global, paired_img_global = [], [], [], []
         total_eval_elements = num_pos + num_neg
 
         for i in range(B):
             anchor_text = text_local[i:i+1]
             anchor_text_global = text_embeds[i:i+1]
             
-            # Positives
             pos_imgs = img_local[pos_mask[i]]
             pos_imgs_global = img_embeds[pos_mask[i]]
             
-            # Hard cross-attention negatives chosen from our screening loop
-            neg_imgs = img_local[final_hard_neg_indices[i]]
-            neg_imgs_global = img_embeds[final_hard_neg_indices[i]]
+            neg_imgs = active_image_local[final_hard_neg_indices[i]]
+            neg_imgs_global = active_image_global[final_hard_neg_indices[i]]
             
-            # Construct rows
             paired_text.append(anchor_text.expand(total_eval_elements, -1, -1))
             paired_img.append(torch.cat([pos_imgs, neg_imgs], dim=0))
-            
             paired_text_global.append(anchor_text_global.expand(total_eval_elements, -1))
             paired_img_global.append(torch.cat([pos_imgs_global, neg_imgs_global], dim=0))
 
-        # Flatten inputs for the backward pass
-        flat_text_pairs = torch.cat(paired_text, dim=0) 
-        flat_img_pairs = torch.cat(paired_img, dim=0)   
+        flat_text_pairs = torch.cat(paired_text, dim=0)
+        flat_img_pairs = torch.cat(paired_img, dim=0)
         flat_text_global = torch.cat(paired_text_global, dim=0)
         flat_img_global = torch.cat(paired_img_global, dim=0)
 
-        # Compute heavy cross-attention only on these verified hard pairs
-        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs, flat_img_global, flat_text_global) 
-        
-        # Reshape into tight rectangular matrix [B, num_pos + num_neg]
+        # Run cross-attention forward pass with gradients tracked
+        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs, flat_img_global, flat_text_global)
         score_matrix = flat_scores.view(B, total_eval_elements)
+        
+        # Push the current batch into the rolling memory bank
+        self._dequeue_and_enqueue(img_embeds, img_local, labels)
         
         if return_embeddings:
             return score_matrix, num_pos, img_embeds, text_embeds, img_local, text_local
-            
         return score_matrix, num_pos
-    
+        
 
     def loss_function(self, score_matrix, num_pos):        
         loss = self.loss_fn(score_matrix, num_pos)
