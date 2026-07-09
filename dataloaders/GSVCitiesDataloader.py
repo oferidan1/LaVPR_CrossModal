@@ -53,6 +53,7 @@ TRAIN_CITIES = [
 class GSVCitiesDataModule(pl.LightningDataModule):
     def __init__(self,
                  batch_size=32,
+                 val_batch_size=32,
                  img_per_place=4,
                  min_img_per_place=4,
                  shuffle_all=False,
@@ -72,6 +73,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
                  ):
         super().__init__()
         self.batch_size = batch_size
+        self.val_batch_size = val_batch_size
         self.img_per_place = img_per_place
         self.min_img_per_place = min_img_per_place
         self.shuffle_all = shuffle_all
@@ -112,7 +114,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
             'shuffle': self.shuffle_all}
 
         self.valid_loader_config = {
-            'batch_size': self.batch_size,
+            'batch_size': self.val_batch_size,
             'num_workers': self.num_workers//2,
             'drop_last': False,
             'pin_memory': True,

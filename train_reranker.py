@@ -39,6 +39,7 @@ def parse_arguments():
     parser.add_argument("--freeze_vlm", type=int, default="1", help="freeze the Vision-Language Model (VLM) backbone")
     parser.add_argument("--train_vlm", type=int, default="0", help="train vlm encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
+    parser.add_argument("--val_batch_size", type=int, default="100", help="batch size for training")
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")    
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
@@ -76,6 +77,7 @@ if __name__ == '__main__':
         
     datamodule = GSVCitiesDataModule(
         batch_size=args.batch_size,
+        val_batch_size=args.val_batch_size,
         img_per_place=args.img_per_place,
         min_img_per_place=args.img_per_place,
         shuffle_all=False, # shuffle all images or keep shuffling in-city only
