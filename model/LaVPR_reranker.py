@@ -61,7 +61,7 @@ class CrossAttnClassifier(nn.Module):
         # Learnable scaling factor to automatically balance cross-attention with baseline scores
         self.local_scale = nn.Parameter(torch.tensor([0.1]))
         
-    def forward(self, img_local, text_local, img_global=None, text_global=None):
+    def forward(self, img_local, text_local, img_global=None, text_global=None, force_local=False):
         # 1. Local Cross Attention
         t_features = self.ln_text(self.text_proj(text_local))
         i_features = self.ln_img(self.img_proj(img_local))
@@ -73,8 +73,8 @@ class CrossAttnClassifier(nn.Module):
         pooled = torch.max(attn_logits, dim=1)[0] 
         local_score = self.score_head(pooled).squeeze(-1)
         
-        # 2. Combined Score Blend
-        if img_global is not None and text_global is not None:            
+        # 2. Combined Score Blend (Skipped during training)
+        if img_global is not None and text_global is not None and not force_local:            
             global_sim = F.cosine_similarity(text_global, img_global, dim=-1)                
             return global_sim + self.local_scale * local_score
             
@@ -364,9 +364,17 @@ class LaVPR_reranker(pl.LightningModule):
         flat_img_pairs = torch.cat(paired_img, dim=0)
         flat_text_global = torch.cat(paired_text_global, dim=0)
         flat_img_global = torch.cat(paired_img_global, dim=0)
+        
+        is_phase_1 = (self.current_epoch < 4)
+        force_local_flag = True if (self.training and is_phase_1) else False
 
-        # Run cross-attention forward pass with gradients tracked
-        flat_scores = self.cross_attn_classifier(flat_img_pairs, flat_text_pairs, flat_img_global, flat_text_global)
+        # Compute heavy cross-attention ONLY on local tokens during training
+        flat_scores = self.cross_attn_classifier(
+            flat_img_pairs, flat_text_pairs, flat_img_global, flat_text_global, 
+            force_local=force_local_flag # <-- FORCE THE CROSS-ATTN TO DO THE WORK
+        ) 
+        
+        # Reshape into tight rectangular matrix [B, num_pos + num_neg]
         score_matrix = flat_scores.view(B, total_eval_elements)
         
         # Push the current batch into the rolling memory bank

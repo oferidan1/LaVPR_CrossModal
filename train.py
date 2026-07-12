@@ -18,12 +18,12 @@ def parse_arguments():
     # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
-    # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
-    # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
-    # parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
-    parser.add_argument("--model_name", type=str, default="llm2clip/LLM2CLIP-Openai-B-16")
+    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
     parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
-    parser.add_argument("--embeds_dim", type=int, default=1280, help="dimension of the embeddings")
+    parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
+    # parser.add_argument("--model_name", type=str, default="llm2clip/LLM2CLIP-Openai-B-16")
+    # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
+    # parser.add_argument("--embeds_dim", type=int, default=1280, help="dimension of the embeddings")
     # parser.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224")            
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
@@ -36,7 +36,6 @@ def parse_arguments():
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
-    parser.add_argument("--is_freeze_vpr", type=int, default="1", help="freeze vpr encoder or not")        
     parser.add_argument("--train_vlm", type=int, default="0", help="train vlm encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
@@ -67,9 +66,9 @@ def parse_arguments():
     parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial")
     parser.add_argument("--vocab_idf_loss", type=float, default="0", help="multplier for vocab idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--vocab_grad_scale", type=float, default="0.05", help="idf grad scale")
-    parser.add_argument("--vocab_path", type=str, default='datasets/gsv_cities_scene_graph_vocab_v2.json', help="path to vocab path")
-    parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v2.pt', help="path to image_idf_path")
-    parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping_path")
+    parser.add_argument("--vocab_path", type=str, default='datasets/gsv_cities_scene_graph_vocab_v3.json', help="path to vocab path")
+    parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v3.pt', help="path to image_idf_path")
+    parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v3.json', help="path to mapping_path")
     parser.add_argument("--cls_adapter", type=int, default="0", help="classification adapter in loss , use or not")
     parser.add_argument("--cmpl", type=int, default="0", help="cmpl use or not")
     
@@ -178,7 +177,8 @@ if __name__ == '__main__':
             auto_insert_metric_name=False,
             save_weights_only=True,
             save_top_k=3,
-            mode='max',)
+            mode='max',
+            save_last=True)
     else:
         checkpoint_cb = ModelCheckpoint(        
             filename=f'{"resnet50"}' +
