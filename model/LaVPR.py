@@ -205,7 +205,7 @@ class LaVPR(pl.LightningModule):
             self.processor = AutoProcessor.from_pretrained(model_name)
         elif 'eva' in model_name:
             self.vlm_encoder, _, self.processor = open_clip.create_model_and_transforms(model_name.upper(), pretrained='merged2b_s8b_b131k')#'EVA02-B-16'
-            self.tokenizer = open_clip.get_tokenizer(model_name)                        
+            self.tokenizer = open_clip.get_tokenizer(model_name)                  
                         
         if is_freeze_text:
             # Freeze text encoder parameters
@@ -293,8 +293,24 @@ class LaVPR(pl.LightningModule):
             img_local = img_output.last_hidden_state            
             img_embeds = img_output.pooler_output
         elif 'eva' in self.model_name:            
-            img_embeds = self.vlm_encoder.encode_image(img)
+            # img_embeds, img_local = self.vlm_encoder.encode_image(img)
+            # img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)                        
+            img_local = self.vlm_encoder.visual.trunk.forward_features(img)
+            if isinstance(img_local, dict):
+                img_local = img_local['x']
+
+            # 2. Extract global image token (CLS context is at index 0)
+            # Shape: [Batch, Hidden_Dim]
+            #img_local = self.vlm_encoder.visual.trunk.head(img_local)
+            img_embeds = img_local[:, 0, :]
+            # 3. Apply the final normalization if forward_features did not include it
+            # (Note: Most timm-based models apply this inside forward_features, but check if needed)
+            if hasattr(self.vlm_encoder.visual.trunk, 'norm') and not isinstance(img_local, dict):
+                # If the trunk's final norm layer wasn't already applied inside forward_features
+                img_embeds = self.vlm_encoder.visual.trunk.norm(img_embeds)
+            img_embeds = self.vlm_encoder.visual.trunk.head(img_embeds)            
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
+                        
         return img_embeds, img_local, img_all_layers
     
     
@@ -323,8 +339,7 @@ class LaVPR(pl.LightningModule):
             # text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)
             # text_local = self.vlm_encoder.text_projection(text_output.last_hidden_state)
             # text_embeds = text_output.pooler_output    
-            # text_all_layers = text_output.hidden_states
-    
+            # text_all_layers = text_output.hidden_states    
             text_outputs = self.vlm_encoder.text_model(
                 input_ids=text_tokens,
                 attention_mask=attention_mask,
@@ -349,9 +364,31 @@ class LaVPR(pl.LightningModule):
             text_local = text_output.last_hidden_state
             text_embeds = text_output.pooler_output                
         elif 'eva' in self.model_name:
+            # text_tokens = self.tokenizer(text).to(self.my_device)            
+            # text_embeds = self.vlm_encoder.encode_text(text_tokens)    
+            # text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)        
+            #1. Tokenize text inputs as you normally do
             text_tokens = self.tokenizer(text).to(self.my_device)            
-            text_embeds = self.vlm_encoder.encode_text(text_tokens)    
-            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)        
+            ## 2. Extract standard global pooled embeddings [Batch, 512] for your Miner Loss
+            text_embeds = self.vlm_encoder.encode_text(text_tokens)
+
+            # 3. FIX: Prepare inputs manually for the inner text transformer module
+            x = self.vlm_encoder.text.token_embedding(text_tokens)
+            x = x + self.vlm_encoder.text.positional_embedding
+
+            # 4. Call the transformer using the correct argument name 'x'
+            # indices=[-1] isolates the final sequence output layer block
+            _, intermediates = self.vlm_encoder.text.transformer.forward_intermediates(
+                x=x,                 # Note: The key name must be x, not text
+                attn_mask=self.vlm_encoder.text.attn_mask,
+                indices=[-1]
+            )
+
+            # 5. Extract and apply LayerNorm to match your text encoder's output configuration
+            # OpenCLIP internal format is [Sequence, Batch, Dim], so we permute to standard layout
+            text_local = intermediates[-1]#.permute(1, 0, 2)  # Shape: [Batch, 77, 512]
+            text_local = self.vlm_encoder.text.ln_final(text_local)
+            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
         
         return text_embeds, text_local, attention_mask, text_tokens, text_all_layers
     

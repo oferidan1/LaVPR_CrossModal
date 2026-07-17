@@ -48,6 +48,11 @@ def get_validation_recalls(r_list, q_list, k_values, gt, print_results=True, fai
         return d
 
 
+import numpy as np
+import torch
+from prettytable import PrettyTable
+import faiss
+
 def get_validation_recalls_rerank(
     r_list, 
     q_list, 
@@ -60,6 +65,7 @@ def get_validation_recalls_rerank(
     rerank_model=None,          # Your LaVPR_reranker or CrossAttnClassifier model
     r_local_list=None,          # Gathered database img_local tensors [Num_Db, Li, D]
     q_local_list=None,          # Gathered query text_local tensors [Num_Q, Lt, D]
+    q_attention_mask_list=None, # <-- CRITICAL ADDITION: [Num_Q, Lt] boolean padding masks
     max_rerank_k=25             # How many top FAISS candidates to rerank
 ):
     embed_size = r_list.shape[1]
@@ -77,7 +83,7 @@ def get_validation_recalls_rerank(
 
     faiss_index.add(r_list)
 
-    # Search for queries using a safe cap (at least max(k_values) or max_rerank_k)
+    # Search for queries using a safe cap
     search_k = max(max(k_values), max_rerank_k)
     _, predictions = faiss_index.search(q_list, search_k)
     
@@ -90,7 +96,6 @@ def get_validation_recalls_rerank(
         # Pull internal neural classifier if it's wrapped inside PyTorch Lightning
         classifier = rerank_model.cross_attn_classifier if hasattr(rerank_model, 'cross_attn_classifier') else rerank_model
         device = next(classifier.parameters()).device
-        # Determine the model's expected dtype (e.g., bfloat16 or float32)
         model_dtype = next(classifier.parameters()).dtype
         classifier.eval()
         
@@ -103,36 +108,45 @@ def get_validation_recalls_rerank(
         
         with torch.no_grad():
             for q_idx in range(num_queries):
-                # 1. Get the local token window for this query [1, Lt, D]
-                # Cast to the model's expected dtype to prevent mismatch
+                # 1. Get local token window for this query [1, Lt, D]
                 q_text_local = q_local_list[q_idx].unsqueeze(0).to(device=device, dtype=model_dtype) 
                 q_text_global = q_list_tensor[q_idx].unsqueeze(0) # [1, D]
                 
-                # 2. Extract indices of top global candidates to rerank
+                # 2. Extract index-matched top global candidates to rerank
                 candidate_db_indices = predictions[q_idx, :max_rerank_k]
+                num_candidates = len(candidate_db_indices)
                 
-                # 3. Gather and cast local patch maps for these candidates [K, Li, D]
+                # 3. Gather local patch maps for these candidates [K, Li, D]
                 cand_img_locals = torch.stack([r_local_list[db_idx] for db_idx in candidate_db_indices]).to(device=device, dtype=model_dtype)
                 cand_img_globals = r_list_tensor[candidate_db_indices] # [K, D]
                 
                 # 4. Match dimensions for cross-attention broadcast
                 Lt, D_dim = q_text_local.shape[1], q_text_local.shape[2]
-                q_text_local_expanded = q_text_local.expand(len(candidate_db_indices), Lt, D_dim)
-                q_text_global_expanded = q_text_global.expand(len(candidate_db_indices), -1) # [K, D]
+                q_text_local_expanded = q_text_local.expand(num_candidates, Lt, D_dim)
+                q_text_global_expanded = q_text_global.expand(num_candidates, -1)
                 
-                # 5. Compute fine-grained scores [K]
+                # --- CRITICAL FIX: Extract and expand the attention mask for this query ---
+                if q_attention_mask_list is not None:
+                    # Get the single query mask [1, Lt] and cast to boolean
+                    q_mask = q_attention_mask_list[q_idx].unsqueeze(0).to(device=device, dtype=torch.bool)
+                    # Expand mask to match our batch size of candidates [K, Lt]
+                    q_mask_expanded = q_mask.expand(num_candidates, -1)
+                else:
+                    q_mask_expanded = None
+                
+                # 5. Compute fine-grained scores [K] (Passing the expanded mask!)
                 scores = classifier(
-                    cand_img_locals, 
-                    q_text_local_expanded, 
-                    cand_img_globals, 
-                    q_text_global_expanded
+                    img_local=cand_img_locals, 
+                    text_local=q_text_local_expanded, 
+                    img_global=cand_img_globals, 
+                    text_global=q_text_global_expanded,
+                    text_attention_mask=q_mask_expanded # <-- FIXED
                 ).cpu().numpy()
                 
                 # 6. Sort candidate index subset descending by attention score
                 reranked_order = np.argsort(-scores)
                 reranked_predictions[q_idx, :max_rerank_k] = candidate_db_indices[reranked_order]
         
-        # Replace predictions with our refined reranked array for metrics extraction
         predictions = reranked_predictions
     # -------------------------------------------------------------------------
 

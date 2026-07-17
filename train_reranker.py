@@ -17,7 +17,8 @@ def parse_arguments():
     # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
-    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
+    #parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
+    parser.add_argument("--model_name", type=str, default="EVA02-B-16")            
     parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="llm2clip/LLM2CLIP-Openai-B-16")
@@ -50,7 +51,8 @@ def parse_arguments():
     parser.add_argument("--mined_negatives", type=int, default=16, help="num of mined negatives")    
     #parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
     #parser.add_argument("--resume", type=str, default=None, help="resume training from path")        
-    parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch_18.ckpt') 
+    #parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch_18.ckpt') 
+    parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_65_evaclip_b/checkpoints/last.ckpt')
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping from image id to vocab indices")
     
     
