@@ -119,7 +119,8 @@ class LaVPR(pl.LightningModule):
         self.tokens_idf_loss = tokens_idf_loss
         self.tokens_idf_file = tokens_idf_file
         self.idf_pooling = idf_pooling
-        vocab_size = 49408
+        #vocab_size = 49408
+        vocab_size = 256000
         self.vocab_path = vocab_path
         self.image_idf_path = image_idf_path
         self.vocab_idf_loss = vocab_idf_loss
@@ -288,10 +289,16 @@ class LaVPR(pl.LightningModule):
                 img_embeds = pooled_output            
             img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)
         elif 'siglip' in self.model_name:
-            img_output = self.vlm_encoder.get_image_features(pixel_values=img)
+            #img_output = self.vlm_encoder.get_image_features(pixel_values=img)
             #img_local = self.vlm_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
-            img_local = img_output.last_hidden_state            
-            img_embeds = img_output.pooler_output
+            vision_outputs = self.vlm_encoder.vision_model(
+                pixel_values=img, 
+                output_hidden_states=True
+            )
+            img_local = vision_outputs.last_hidden_state            
+            img_all_layers = vision_outputs.hidden_states
+            img_embeds = self.vlm_encoder.vision_model.head(vision_outputs.last_hidden_state)
+            
         elif 'eva' in self.model_name:            
             # img_embeds, img_local = self.vlm_encoder.encode_image(img)
             # img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)                        
@@ -359,10 +366,16 @@ class LaVPR(pl.LightningModule):
             attention_mask = None
             if 'attention_mask' in text_inputs:
                 attention_mask = text_inputs['attention_mask'].to(self.my_device)                
-            text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
-            #text_local = self.vlm_encoder.base_model.model.text_model.head(text_output.last_hidden_state)
-            text_local = text_output.last_hidden_state
-            text_embeds = text_output.pooler_output                
+            
+            # Call the text_model directly to get all hidden states
+            text_outputs = self.vlm_encoder.text_model(
+                input_ids=text_tokens,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )
+            text_local = text_outputs.last_hidden_state
+            text_embeds = text_outputs.pooler_output
+            text_all_layers = text_outputs.hidden_states
         elif 'eva' in self.model_name:
             # text_tokens = self.tokenizer(text).to(self.my_device)            
             # text_embeds = self.vlm_encoder.encode_text(text_tokens)    

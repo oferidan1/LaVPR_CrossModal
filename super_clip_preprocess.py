@@ -42,7 +42,8 @@ def precompute_dual_idfs(args):
             text=batch_texts, 
             padding=False, 
             truncation=True, 
-            max_length=args.max_len
+            max_length=args.max_len,
+            return_tensors=None  # Explicitly prevent tensor conversion
         )
         tokens_list = text_inputs.input_ids
         
@@ -102,11 +103,13 @@ if __name__ == "__main__":
     
     # Output file names
     parser.add_argument("--out_img_file", type=str, default="gsv_cities_image_idf.pt")    
-    parser.add_argument("--out_loc_file", type=str, default="gsv_cities_location_idf.pt")    
+    parser.add_argument("--out_loc_file", type=str, default="gsv_cities_location_idf.pt")        
     
-    parser.add_argument("--max_len", type=int, default=77, help="Max text context length")
     parser.add_argument("--batch_size", type=int, default=2048, help="Batch size for text processing")    
-    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16", help="Target CLIP backbone")        
+    #parser.add_argument("--max_len", type=int, default=77, help="Max text context length")
+    #parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16", help="Target CLIP backbone")        
+    parser.add_argument("--max_len", type=int, default=64, help="Max text context length")
+    parser.add_argument("--model_name", type=str, default="google/siglip2-base-patch16-224", help="Target CLIP backbone")        
     parser.add_argument("--gpu", type=str, default="0", help="Target GPU execution device")
     
     args = parser.parse_args()           

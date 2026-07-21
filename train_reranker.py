@@ -54,6 +54,7 @@ def parse_arguments():
     #parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch_18.ckpt') 
     parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_65_evaclip_b/checkpoints/last.ckpt')
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping from image id to vocab indices")
+    parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     
     
     args = parser.parse_args()
@@ -116,6 +117,9 @@ if __name__ == '__main__':
         pos_loss=args.pos_loss,
         neg_loss=args.neg_loss,      
         num_mined_negatives=args.mined_negatives,      
+        loss_name=args.loss_name,
+        miner_name='MultiSimilarityMiner', # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
+        miner_margin=0.1,
     )
     
     if args.resume is not None:
