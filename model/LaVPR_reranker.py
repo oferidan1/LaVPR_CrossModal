@@ -68,13 +68,18 @@ class CrossAttnClassifier(nn.Module):
         attn_logits = self.ln_post(fused + t_features)   
         
         if text_attention_mask is not None:
+            # Ensure boolean mask where True indicates PADDING positions
+            if text_attention_mask.dtype != torch.bool:
+                text_attention_mask = (text_attention_mask == 0)
+                
             mask_expanded = text_attention_mask.unsqueeze(-1).expand_as(attn_logits)
             attn_logits = attn_logits.masked_fill(mask_expanded, -1e9)
         
-        pooled = torch.mean(attn_logits, dim=1) # The Latent Vector [B, embeds_dim]
+        # Mean pooling across token sequence
+        pooled = torch.mean(attn_logits, dim=1) # [B, embeds_dim]
         local_score = self.score_head(pooled).squeeze(-1) 
         
-        # Blend global baseline scores when present
+        # Blend global baseline scores when present and not forced local
         if img_global is not None and text_global is not None and not force_local:            
             global_sim = F.cosine_similarity(text_global, img_global, dim=-1)                
             final_score = global_sim + self.local_scale * local_score
@@ -124,7 +129,7 @@ class LaVPR_reranker(pl.LightningModule):
         self.faiss_gpu = faiss_gpu
         self.num_mined_negatives = num_mined_negatives
         
-        # Initializing both loss functions        
+        # Initializing loss functions        
         self.loss_fn = utils.get_loss(loss_name)
         self.miner_name = miner_name
         self.miner_margin = miner_margin         
@@ -137,9 +142,6 @@ class LaVPR_reranker(pl.LightningModule):
         self.train_vlm = train_vlm
         self.pos_loss = pos_loss
         self.neg_loss = neg_loss      
-        
-        # text_dim = 512 
-        # img_dim = 768 
         
         self.cross_attn_classifier = CrossAttnClassifier(
             embeds_dim=embeds_dim, text_dim=embeds_dim, img_dim=embeds_dim
@@ -223,7 +225,6 @@ class LaVPR_reranker(pl.LightningModule):
             img_local = self.vlm_encoder.visual.trunk.forward_features(img)
             if isinstance(img_local, dict):
                 img_local = img_local['x']
-            #cls_token = img_local[:, 0]
             img_local = self.vlm_encoder.visual.trunk.head(img_local)
             img_embeds = img_local[:, 0]
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
@@ -270,7 +271,7 @@ class LaVPR_reranker(pl.LightningModule):
         elif 'eva' in self.model_name:
             text_tokens = self.tokenizer(text).to(self.device)            
             attention_mask = (text_tokens == 0)
-            text_embeds = self.vlm_encoder.encode_text(text_tokens)
+            
             x = self.vlm_encoder.text.token_embedding(text_tokens)
             x = x + self.vlm_encoder.text.positional_embedding
             _, intermediates = self.vlm_encoder.text.transformer.forward_intermediates(
@@ -280,8 +281,17 @@ class LaVPR_reranker(pl.LightningModule):
             )
             text_local = intermediates[-1] 
             text_local = self.vlm_encoder.text.ln_final(text_local)
+            
+            # Locate EOT token indices
+            eot_indices = text_tokens.argmax(dim=-1)
+            eot_features = text_local[torch.arange(text_local.shape[0]), eot_indices]
+            
             if hasattr(self.vlm_encoder.text, 'text_projection') and self.vlm_encoder.text.text_projection is not None:
-                text_local = text_local @ self.vlm_encoder.text.text_projection          
+                text_embeds = eot_features @ self.vlm_encoder.text.text_projection
+                text_local = text_local @ self.vlm_encoder.text.text_projection
+            else:
+                text_embeds = eot_features
+                
             text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)   
         
         return text_embeds, text_local, attention_mask, text_tokens, text_all_layers
@@ -292,6 +302,9 @@ class LaVPR_reranker(pl.LightningModule):
                 
         B, Lt, D_text = text_local.shape
         Li, D_img = img_local.shape[1], img_local.shape[2]
+
+        is_phase_1 = (self.current_epoch < 6)
+        force_local_flag = True if is_phase_1 else False
 
         if labels is None or not self.training:
             text_pairs = text_local[:, None].expand(B, B, Lt, D_text).reshape(B * B, Lt, D_text)
@@ -315,7 +328,8 @@ class LaVPR_reranker(pl.LightningModule):
                     text_local=text_pairs[chunk_start:chunk_end],
                     img_global=img_global_pairs[chunk_start:chunk_end],
                     text_global=text_global_pairs[chunk_start:chunk_end],
-                    text_attention_mask=attention_mask_pairs[chunk_start:chunk_end] if attention_mask_pairs is not None else None
+                    text_attention_mask=attention_mask_pairs[chunk_start:chunk_end] if attention_mask_pairs is not None else None,
+                    force_local=force_local_flag
                 )
                 all_flat_scores.append(chunk_scores)
             
@@ -362,17 +376,20 @@ class LaVPR_reranker(pl.LightningModule):
                 attn_logits = self.cross_attn_classifier.ln_post(fused + t_features)
 
                 if anchor_attention_mask is not None:
+                    if anchor_attention_mask.dtype != torch.bool:
+                        anchor_attention_mask = (anchor_attention_mask == 0)
                     mask_expanded = anchor_attention_mask.unsqueeze(-1).expand_as(attn_logits)
                     attn_logits = attn_logits.masked_fill(mask_expanded, -1e9)
 
-                pooled = torch.max(attn_logits, dim=1)[0]
+                # Changed to mean pooling across sequence length
+                pooled = torch.mean(attn_logits, dim=1)
                 local_screening_scores = self.cross_attn_classifier.score_head(pooled).squeeze(-1)
                 
                 _, top_hard_meta_indices = torch.topk(local_screening_scores, k=num_neg)
                 actual_hard_indices = candidate_pool_indices[top_hard_meta_indices]
                 final_hard_neg_indices.append(actual_hard_indices)
 
-        paired_text, paired_img, paired_text_global, paired_img_global, paired_attn_masks, flat_labels = [], [], [], [], [], []
+        paired_text, paired_img, paired_text_global, paired_img_global, paired_attn_masks, local_labels = [], [], [], [], [], []
         total_eval_elements = num_pos + num_neg
 
         for i in range(B):
@@ -392,21 +409,19 @@ class LaVPR_reranker(pl.LightningModule):
             if anchor_mask is not None:
                 paired_attn_masks.append(anchor_mask.expand(total_eval_elements, -1))
                 
-            pos_labels = labels[pos_mask[i]]
-            neg_labels = active_labels[final_hard_neg_indices[i]]
-            flat_labels.append(torch.cat([pos_labels, neg_labels], dim=0))
+            query_local_label = torch.cat([
+                torch.zeros(num_pos, dtype=torch.long, device=self.device),
+                torch.arange(1, num_neg + 1, dtype=torch.long, device=self.device)
+            ])
+            local_labels.append(query_local_label + (i * 100))
 
         flat_text_pairs = torch.cat(paired_text, dim=0)
         flat_img_pairs = torch.cat(paired_img, dim=0)
         flat_text_global = torch.cat(paired_text_global, dim=0)
         flat_img_global = torch.cat(paired_img_global, dim=0)
         flat_attn_masks = torch.cat(paired_attn_masks, dim=0) if len(paired_attn_masks) > 0 else None
-        batch_target_labels = torch.cat(flat_labels, dim=0)
+        ms_batch_labels = torch.cat(local_labels, dim=0)
 
-        is_phase_1 = (self.current_epoch < 6)
-        force_local_flag = True if (self.training and is_phase_1) else False
-
-        # Extract both latent representations and continuous final ranking scores
         latent_features, flat_scores = self.cross_attn_classifier(
             img_local=flat_img_pairs, 
             text_local=flat_text_pairs, 
@@ -423,25 +438,18 @@ class LaVPR_reranker(pl.LightningModule):
         self._dequeue_and_enqueue(img_embeds, img_local, labels)
         
         if return_embeddings:
-            return latent_features, batch_target_labels, score_matrix, num_pos, img_embeds, text_embeds, img_local, text_local, attention_mask        
-     
-        
-        return latent_features, batch_target_labels, score_matrix, num_pos    
+            return score_matrix, img_embeds, text_embeds, img_local, text_local, attention_mask
+            
+        return latent_features, ms_batch_labels, score_matrix, num_pos    
     
     def loss_function(self, latent_features, labels, score_matrix, num_pos):        
-        
-        if self.miner is not None:                                 
-            #mine hard negatives
+        miner_outputs = None
+        if self.miner is not None:                                                 
             miner_outputs = self.miner(latent_features, labels)                 
             
-        # 1. MS Loss on the latent representations before the classification head
-        #ms_loss = self.ms_loss_fn(latent_features, target_labels)
         ms_loss = self.loss_fn(latent_features, labels, indices_tuple=miner_outputs)              
-        
-        # 2. Listwise Rank Margin Loss tracking downstream final matching scores
         listwise_loss = self.listwise_loss_fn(score_matrix, num_pos)
         
-        # Combined multi-task training loss function
         total_loss = ms_loss + listwise_loss
         
         with torch.no_grad():
@@ -467,8 +475,8 @@ class LaVPR_reranker(pl.LightningModule):
             for j in range(N):
                 flat_texts.append(texts[j][i])
 
-        latent_features, target_labels, score_matrix, num_pos = self(images, flat_texts, labels=labels) 
-        loss = self.loss_function(latent_features, target_labels, score_matrix, num_pos)
+        latent_features, ms_labels, score_matrix, num_pos = self(images, flat_texts, labels=labels) 
+        loss = self.loss_function(latent_features, ms_labels, score_matrix, num_pos)
         
         self.log('loss', loss.item(), logger=True)        
         return {'loss': loss}
@@ -497,13 +505,7 @@ class LaVPR_reranker(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         places, _, texts = batch
-        outputs = self(places, texts, return_embeddings=True)
-        score_matrix = outputs[0]
-        img_embeds = outputs[1]
-        text_embeds = outputs[2]
-        img_local = outputs[3]
-        text_local = outputs[4]
-        attention_mask = outputs[5]
+        score_matrix, img_embeds, text_embeds, img_local, text_local, attention_mask = self(places, texts, return_embeddings=True)
         
         return {
             'scores': score_matrix.detach().cpu(), 
@@ -518,6 +520,9 @@ class LaVPR_reranker(pl.LightningModule):
         dm = self.trainer.datamodule
         if len(dm.val_datasets)==1:
             val_step_outputs = [val_step_outputs]
+            
+        is_phase_1 = (self.current_epoch < 6)
+        force_local_flag = True if is_phase_1 else False
         
         for i, (val_set_name, val_dataset) in enumerate(zip(dm.val_set_names, dm.val_datasets)):
             scores, img_embeds, text_embeds, img_local, text_local, attention_masks = [], [], [], [], [], []
@@ -561,8 +566,8 @@ class LaVPR_reranker(pl.LightningModule):
                 r_list=r_list, q_list=q_text_list, k_values=[1, 5, 10, 15, 20, 50, 100],
                 gt=positives, print_results=True, dataset_name=val_set_name, faiss_gpu=self.faiss_gpu,
                 rerank_model=self.cross_attn_classifier, r_local_list=r_list_local, q_local_list=q_text_list_local,
-                q_attention_mask_list=q_attention_masks
-            )                                                                        
+                q_attention_mask_list=q_attention_masks, force_local=force_local_flag
+            )                                                                                                                                                
             
             self.log(f'{val_set_name}/R1', pitts_dict[1], prog_bar=False, logger=True)
             self.log(f'{val_set_name}/R5', pitts_dict[5], prog_bar=False, logger=True)

@@ -66,7 +66,8 @@ def get_validation_recalls_rerank(
     r_local_list=None,          # Gathered database img_local tensors [Num_Db, Li, D]
     q_local_list=None,          # Gathered query text_local tensors [Num_Q, Lt, D]
     q_attention_mask_list=None, # <-- CRITICAL ADDITION: [Num_Q, Lt] boolean padding masks
-    max_rerank_k=25             # How many top FAISS candidates to rerank
+    max_rerank_k=25,             # How many top FAISS candidates to rerank
+    force_local=True
 ):
     embed_size = r_list.shape[1]
     if faiss_gpu:
@@ -140,7 +141,8 @@ def get_validation_recalls_rerank(
                     text_local=q_text_local_expanded, 
                     img_global=cand_img_globals, 
                     text_global=q_text_global_expanded,
-                    text_attention_mask=q_mask_expanded # <-- FIXED
+                    text_attention_mask=q_mask_expanded, # <-- FIXED
+                    force_local=force_local
                 ).cpu().numpy()
                 
                 # 6. Sort candidate index subset descending by attention score
