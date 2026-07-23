@@ -9,9 +9,7 @@ from transformers import AutoTokenizer, AutoModel, BlipProcessor, BlipModel, Aut
 import open_clip
 import utils
 import numpy as np
-
-# Standard deep metric learning library wrapper
-from pytorch_metric_learning import losses
+from model.tokens_classify_loss import TokensClassificationLoss, HierarchicalTokensLoss, VocabClassificationLoss
 
 
 class ListwiseRankMarginLoss(nn.Module):
@@ -19,7 +17,7 @@ class ListwiseRankMarginLoss(nn.Module):
     Optimizes downstream relative ranking margins instead of absolute scores
     for rectangular cross-encoder evaluation windows.
     """
-    def __init__(self, margin=0.3):
+    def __init__(self, margin=0.2):
         super().__init__()
         self.margin = margin
 
@@ -27,6 +25,7 @@ class ListwiseRankMarginLoss(nn.Module):
         pos_scores = score_matrix[:, :num_pos].unsqueeze(2)  # [B, num_pos, 1]
         neg_scores = score_matrix[:, num_pos:].unsqueeze(1)  # [B, 1, num_neg]
         
+        # Relative pair margin check
         ranking_violations = self.margin - (pos_scores - neg_scores)
         loss = torch.clamp(ranking_violations, min=0.0).mean()
         return loss
@@ -46,12 +45,13 @@ class CrossAttnClassifier(nn.Module):
             embed_dim=embeds_dim, num_heads=num_heads, batch_first=True
         )
         
-        # Kept linear to prevent gradient flattening within the combined loss pipeline
+        # Bounded score head to prevent logit explosion
         self.score_head = nn.Sequential(
             nn.Linear(embeds_dim, 256),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 1)
+            nn.Linear(256, 1),
+            nn.Sigmoid()  # Bound scores to [0.0, 1.0] to align scale with cosine similarity
         )
         
         self.local_scale = nn.Parameter(torch.tensor([0.1]))
@@ -68,18 +68,16 @@ class CrossAttnClassifier(nn.Module):
         attn_logits = self.ln_post(fused + t_features)   
         
         if text_attention_mask is not None:
-            # Ensure boolean mask where True indicates PADDING positions
             if text_attention_mask.dtype != torch.bool:
                 text_attention_mask = (text_attention_mask == 0)
                 
             mask_expanded = text_attention_mask.unsqueeze(-1).expand_as(attn_logits)
             attn_logits = attn_logits.masked_fill(mask_expanded, -1e9)
         
-        # Mean pooling across token sequence
+        # Mean pooling across sequence length
         pooled = torch.mean(attn_logits, dim=1) # [B, embeds_dim]
-        local_score = self.score_head(pooled).squeeze(-1) 
+        local_score = self.score_head(pooled).squeeze(-1) # [B] bounded in [0, 1]
         
-        # Blend global baseline scores when present and not forced local
         if img_global is not None and text_global is not None and not force_local:            
             global_sim = F.cosine_similarity(text_global, img_global, dim=-1)                
             final_score = global_sim + self.local_scale * local_score
@@ -114,6 +112,9 @@ class LaVPR_reranker(pl.LightningModule):
                  loss_name='MultiSimilarityLoss', 
                  miner_name='MultiSimilarityMiner', 
                  miner_margin=0.1,
+                 tokens_idf_loss=0.0,
+                 tokens_idf_file=None,
+                 idf_grad_scale=0.05,
                  ):
         super().__init__()       
         
@@ -129,19 +130,24 @@ class LaVPR_reranker(pl.LightningModule):
         self.faiss_gpu = faiss_gpu
         self.num_mined_negatives = num_mined_negatives
         
-        # Initializing loss functions        
         self.loss_fn = utils.get_loss(loss_name)
         self.miner_name = miner_name
         self.miner_margin = miner_margin         
         self.miner = utils.get_miner(miner_name, miner_margin)
-        self.listwise_loss_fn = ListwiseRankMarginLoss(margin=0.3)
+        self.listwise_loss_fn = ListwiseRankMarginLoss(margin=0.2) # Reduced from 0.3 to 0.2
         
         self.save_hyperparameters()
         self.batch_acc = [] 
         self.embeds_dim = embeds_dim        
         self.train_vlm = train_vlm
         self.pos_loss = pos_loss
-        self.neg_loss = neg_loss      
+        self.neg_loss = neg_loss  
+        self.tokens_idf_loss = tokens_idf_loss
+        self.tokens_idf_file = tokens_idf_file        
+        vocab_size = 49408    
+        
+        if self.tokens_idf_loss:
+            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale)
         
         self.cross_attn_classifier = CrossAttnClassifier(
             embeds_dim=embeds_dim, text_dim=embeds_dim, img_dim=embeds_dim
@@ -201,6 +207,7 @@ class LaVPR_reranker(pl.LightningModule):
         img_embeds = None
         img_local = None
         img_all_layers = None
+        img_local_unproj = None
         if 'blip' in self.model_name:
             img_local = self.vlm_encoder.encode_image(img)            
             img_embeds = img_local[:,0]
@@ -212,7 +219,8 @@ class LaVPR_reranker(pl.LightningModule):
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
         elif 'clip' in self.model_name:            
             vision_outputs = self.vlm_encoder.vision_model(pixel_values=img, output_hidden_states=True)
-            img_local = self.vlm_encoder.visual_projection(vision_outputs.last_hidden_state)
+            img_local_unproj = vision_outputs.last_hidden_state
+            img_local = self.vlm_encoder.visual_projection(img_local_unproj)
             img_all_layers = vision_outputs.hidden_states
             pooled_output = vision_outputs.pooler_output
             img_embeds = self.vlm_encoder.visual_projection(pooled_output)
@@ -222,14 +230,14 @@ class LaVPR_reranker(pl.LightningModule):
             img_local = img_output.last_hidden_state            
             img_embeds = img_output.pooler_output
         elif 'eva' in self.model_name:            
-            img_local = self.vlm_encoder.visual.trunk.forward_features(img)
+            img_local_unproj = self.vlm_encoder.visual.trunk.forward_features(img)
             if isinstance(img_local, dict):
                 img_local = img_local['x']
-            img_local = self.vlm_encoder.visual.trunk.head(img_local)
+            img_local = self.vlm_encoder.visual.trunk.head(img_local_unproj)
             img_embeds = img_local[:, 0]
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
         
-        return img_embeds, img_local, img_all_layers
+        return img_embeds, img_local, img_all_layers, img_local_unproj
     
     def encode_text(self, text):
         text_embeds = None
@@ -282,7 +290,6 @@ class LaVPR_reranker(pl.LightningModule):
             text_local = intermediates[-1] 
             text_local = self.vlm_encoder.text.ln_final(text_local)
             
-            # Locate EOT token indices
             eot_indices = text_tokens.argmax(dim=-1)
             eot_features = text_local[torch.arange(text_local.shape[0]), eot_indices]
             
@@ -296,9 +303,9 @@ class LaVPR_reranker(pl.LightningModule):
         
         return text_embeds, text_local, attention_mask, text_tokens, text_all_layers
 
-    def forward(self, img, text, labels=None, return_embeddings=False):
-        img_embeds, img_local, img_all_layers = self.encode_image(img)
-        text_embeds, text_local, attention_mask, text_tokens, text_all_layers = self.encode_text(text)      
+    def forward(self, img, text, flip_desc=None, labels=None, return_embeddings=False):
+        img_embeds, img_local, img_all_layers, img_local_unproj = self.encode_image(img)
+        text_embeds, text_local, attention_mask, text_tokens, text_all_layers = self.encode_text(text)             
                 
         B, Lt, D_text = text_local.shape
         Li, D_img = img_local.shape[1], img_local.shape[2]
@@ -339,6 +346,16 @@ class LaVPR_reranker(pl.LightningModule):
             if return_embeddings:
                 return score_matrix, img_embeds, text_embeds, img_local, text_local, attention_mask
             return score_matrix
+        
+        text_flip_embeds = None
+        tidf_loss = 0
+        if self.pos_loss:
+            if flip_desc is not None:
+                text_flip_embeds, text_flip_local, attention_mask_flip, text_flip_tokens, text_flip_all_layers = self.encode_text(flip_desc)
+                
+        img_embeds_pooled = img_local_unproj[:, 1:].mean(dim=1)        
+        if self.tokens_idf_loss:                         
+            tidf_loss = self.tokens_idf_loss * self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
 
         with torch.no_grad():
             queue_is_ready = (self.label_queue[0] != -1)
@@ -381,7 +398,6 @@ class LaVPR_reranker(pl.LightningModule):
                     mask_expanded = anchor_attention_mask.unsqueeze(-1).expand_as(attn_logits)
                     attn_logits = attn_logits.masked_fill(mask_expanded, -1e9)
 
-                # Changed to mean pooling across sequence length
                 pooled = torch.mean(attn_logits, dim=1)
                 local_screening_scores = self.cross_attn_classifier.score_head(pooled).squeeze(-1)
                 
@@ -440,17 +456,24 @@ class LaVPR_reranker(pl.LightningModule):
         if return_embeddings:
             return score_matrix, img_embeds, text_embeds, img_local, text_local, attention_mask
             
-        return latent_features, ms_batch_labels, score_matrix, num_pos    
+        return latent_features, ms_batch_labels, score_matrix, num_pos, img_embeds, text_embeds, text_flip_embeds, tidf_loss
     
-    def loss_function(self, latent_features, labels, score_matrix, num_pos):        
+    def loss_function(self, img_embeds, text_embeds, text_flip_embeds, tidf_loss, labels, score_matrix, num_pos):        
+        ref_labels = labels.clone()
+        ref_embs = text_embeds        
+        if self.pos_loss:
+            ref_embs = torch.cat([text_embeds, text_flip_embeds], dim=0)
+            ref_labels = torch.cat([ref_labels, labels], dim=0)        
         miner_outputs = None
-        if self.miner is not None:                                                 
-            miner_outputs = self.miner(latent_features, labels)                 
+        if self.miner is not None:                                                                                              
+            miner_outputs = self.miner(img_embeds, labels, ref_emb=ref_embs, ref_labels=ref_labels)     
             
-        ms_loss = self.loss_fn(latent_features, labels, indices_tuple=miner_outputs)              
+        ms_loss = self.loss_fn(img_embeds, labels, indices_tuple=miner_outputs, ref_emb=ref_embs, ref_labels=ref_labels)                
         listwise_loss = self.listwise_loss_fn(score_matrix, num_pos)
         
-        total_loss = ms_loss + listwise_loss
+        # Reduced listwise loss weight scale from 0.1 to 0.01 / 0.02
+        listwise_weight = 1
+        total_loss = ms_loss + tidf_loss + (listwise_weight * listwise_loss)
         
         with torch.no_grad():
             predicted_max_indices = score_matrix.argmax(dim=1)
@@ -471,12 +494,15 @@ class LaVPR_reranker(pl.LightningModule):
         labels = labels.view(-1)
         
         flat_texts = []
+        flat_flip_descs = []
         for i in range(BS):
             for j in range(N):
                 flat_texts.append(texts[j][i])
+                if self.pos_loss:
+                    flat_flip_descs.append(flip_descs[j][i])
 
-        latent_features, ms_labels, score_matrix, num_pos = self(images, flat_texts, labels=labels) 
-        loss = self.loss_function(latent_features, ms_labels, score_matrix, num_pos)
+        latent_features, ms_labels, score_matrix, num_pos, img_embeds, text_embeds, text_flip_embeds, tidf_loss = self(images, flat_texts, flip_desc=flat_flip_descs, labels=labels) 
+        loss = self.loss_function(img_embeds, text_embeds, text_flip_embeds, tidf_loss, labels, score_matrix, num_pos)
         
         self.log('loss', loss.item(), logger=True)        
         return {'loss': loss}
@@ -485,10 +511,21 @@ class LaVPR_reranker(pl.LightningModule):
         self.batch_acc = []
 
     def configure_optimizers(self):
+        # Differential learning rates: smaller for backbone/head, standard for cross-attn
+        head_params = list(self.cross_attn_classifier.parameters())
+        
+        param_groups = [
+            {'params': head_params, 'lr': self.lr, 'weight_decay': self.weight_decay}
+        ]
+        
+        if self.train_vlm:
+            backbone_params = [p for p in self.vlm_encoder.parameters() if p.requires_grad]
+            param_groups.append({'params': backbone_params, 'lr': self.lr * 0.1, 'weight_decay': self.weight_decay})
+
         if self.optimizer.lower() == 'sgd':
-            optimizer = torch.optim.SGD(self.parameters(), lr=self.lr, weight_decay=self.weight_decay, momentum=self.momentum)
+            optimizer = torch.optim.SGD(param_groups, momentum=self.momentum)
         elif self.optimizer.lower() in ['adam', 'adamw']:
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            optimizer = torch.optim.AdamW(param_groups)
         else:
             raise ValueError(f'Optimizer {self.optimizer} has not been added to "configure_optimizers()"')
         
@@ -500,7 +537,7 @@ class LaVPR_reranker(pl.LightningModule):
         if self.trainer.global_step < self.warmpup_steps:
             lr_scale = min(1., float(self.trainer.global_step + 1) / self.warmpup_steps)
             for pg in optimizer.param_groups:
-                pg['lr'] = lr_scale * self.lr
+                pg['lr'] = lr_scale * pg.get('initial_lr', self.lr)
         self.trainer.strategy.optimizer_step(optimizer, optimizer_idx, optimizer_closure)
 
     def validation_step(self, batch, batch_idx, dataloader_idx=None):

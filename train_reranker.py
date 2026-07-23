@@ -55,7 +55,9 @@ def parse_arguments():
     parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_65_evaclip_b/checkpoints/last.ckpt')
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping from image id to vocab indices")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
-    
+    parser.add_argument("--tokens_idf_loss", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")        
+    parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")    
     
     args = parser.parse_args()
     
@@ -120,6 +122,9 @@ if __name__ == '__main__':
         loss_name=args.loss_name,
         miner_name='MultiSimilarityMiner', # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
         miner_margin=0.1,
+        tokens_idf_loss=args.tokens_idf_loss,
+        tokens_idf_file=args.tokens_idf_file,
+        idf_grad_scale=args.idf_grad_scale,
     )
     
     if args.resume is not None:
