@@ -10,10 +10,10 @@ def parse_arguments():
     # parser.add_argument("--queries_folder", type=str, default="/mnt/d/data/amstertime/test/queries")        
     # parser.add_argument("--image_root", type=str, default="/mnt/d/data/amstertime/test")
     
-    # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/amstertime/test/database")    
-    # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/amstertime/test/queries")        
-    # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/amstertime/test")
-    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions.csv")
+    parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/amstertime/test/database")    
+    parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/amstertime/test/queries")        
+    parser.add_argument("--image_root", type=str, default="/home/shared/datasets/amstertime/test")
+    parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions.csv")
     #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions_subset.csv")                
 
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/pitts30k/images/test/database")    
@@ -25,12 +25,12 @@ def parse_arguments():
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/pitts30k/images/val/queries")    
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/pitts30k/images/val")    
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
-    
+       
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/msls/val/database")    
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/msls/val/query")   
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/msls/val/")    
-    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions.csv")
-    # #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_blur.csv")
+    # # # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions.csv")
+    # # # #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_blur.csv")
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_weather.csv")
 
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/msls_challenge")    
@@ -38,10 +38,10 @@ def parse_arguments():
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/msls_challenge/test")    
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_challenge_descriptions.csv")
     
-    parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/nordland/test/database")    
-    parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/nordland/test/queries")       
-    parser.add_argument("--image_root", type=str, default="/home/shared/datasets/nordland/test")    
-    parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/nordland_descriptions.csv")
+    # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/nordland/test/database")    
+    # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/nordland/test/queries")       
+    # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/nordland/test")    
+    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/nordland_descriptions.csv")
     
     
     parser.add_argument("--num_workers", type=int, default=4, help="_")
@@ -77,7 +77,7 @@ def parse_arguments():
     parser.add_argument(
         "--image_size",
         type=int,
-        default=384,
+        default=224,
         help="Resizing shape for images (HxW). If a single int is passed, set the"
         "smallest edge of all images to this value, while keeping aspect ratio",
     )
@@ -87,19 +87,20 @@ def parse_arguments():
         help="set to True if you want to save the descriptors extracted by the model",
     )
     parser.add_argument("--gpu", type=str, default="0", help="which gpu to use")
-    parser.add_argument("--model_name", type=str, default='Salesforce/blip-itm-base-coco')
-    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--model_name", type=str, default='openai/clip-vit-base-patch16 ')
+    parser.add_argument("--model_path", type=str, default='LOGS/resnet50/lightning_logs/version_61_clipb16_ms_sc_pos/checkpoints/resnet50_epoch\(18\)_step\(9899\)_R1\[0.5938\]_R5\[0.8275\].ckpt')
     parser.add_argument("--lora_path", type=str, default=None)        
     parser.add_argument("--is_normalize", type=int, default="0", help="is normalize features")    
     parser.add_argument("--max_rerank", type=int, default="20", help="max results for reranking")        
-    parser.add_argument("--train_vlm", type=int, default="0", help="train text encoder or not")
+    parser.add_argument("--train_vlm", type=int, default="2", help="train text encoder or not")
     parser.add_argument("--lora_all_linear", type=int, default="1", help="lora all linear 0=no/1=yes")
     parser.add_argument("--lora_target_modules", nargs='+', default=["query", "value", "qkv"], help="when not lora_all_linear, lora target modules")    
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
-    parser.add_argument("--embeds_dim", type=int, default="256", help="embeds dimension")    
+    parser.add_argument("--embeds_dim", type=int, default="512", help="embeds dimension")    
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model")        
     parser.add_argument("--reranker", type=int, default="0", help="reranker")        
+    parser.add_argument("--reranker_mllm", type=int, default="0", help="reranker")        
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
     parser.add_argument("--text_only", type=int, default="0", help="is text only")    
 

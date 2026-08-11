@@ -236,6 +236,8 @@ class WholeDatasetFromStruct(data.Dataset):
             skipinitialspace=True)
         image_path = df['image_path'].values
         description = df['description'].values    
+        #if 'compressed_description' in df.columns:
+        #    description = df['compressed_description'].values 
         image_path = [posixpath.join(image_root, p) for p in image_path]        
         image_path_database = [item for item in image_path if 'database' in item]
         image_path_queries = [item for item in image_path if 'queries' in item]

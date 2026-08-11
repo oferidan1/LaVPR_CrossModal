@@ -9,6 +9,7 @@ from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule, IMAGENET_MEAN_S
 import os
 import argparse
 from model.LaVPR_reranker import LaVPR_reranker
+from model.LaVPR_reranker2 import LaVPR_reranker_2
 
 
 def parse_arguments():
@@ -28,7 +29,7 @@ def parse_arguments():
     # parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
-    parser.add_argument("--epochs", type=int, default='8', help="number of epochs to train")    
+    parser.add_argument("--epochs", type=int, default='20', help="number of epochs to train")    
     parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_pos_rule_based.csv")    
     #parser.add_argument("--image_root", type=str, default="/mnt/d/data/gsv_cities/", help="root directory for images")
     parser.add_argument("--image_root", type=str, default="/home/shared/datasets/gsv_cities/", help="root directory for images")
@@ -43,21 +44,22 @@ def parse_arguments():
     parser.add_argument("--val_batch_size", type=int, default="100", help="batch size for training")
     parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")    
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
-    parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
+    parser.add_argument("--neg_loss", type=int, default="0", help="multplier for neg[[[[[ative loss, 0=no negative loss, >0 use negative loss")
     parser.add_argument("--opt", type=str, default="adamw", help="optimizer sgd/adam/adamw")    
     parser.add_argument("--lr", type=float, default="0.0002", help="learning rate")
     parser.add_argument("--lr_mult", type=float, default="0.5", help="learning rate")    
-    parser.add_argument("--milestones", nargs="+", type=int, default=[5,7], help="milestones for lr scheduler seperated by space")
+    parser.add_argument("--milestones", nargs="+", type=int, default=[10, 16], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--mined_negatives", type=int, default=16, help="num of mined negatives")    
     #parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
-    #parser.add_argument("--resume", type=str, default=None, help="resume training from path")        
+    parser.add_argument("--resume", type=str, default=None, help="resume training from path")        
     #parser.add_argument("--resume", type=str, default='checkpoints/clip_ms_sc_pos/epoch_18.ckpt') 
-    parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_65_evaclip_b/checkpoints/last.ckpt')
+    #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_65_evaclip_b/checkpoints/last.ckpt')
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v2.json', help="path to mapping from image id to vocab indices")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     parser.add_argument("--tokens_idf_loss", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")        
     parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")    
+    parser.add_argument("--detach", type=float, default="1", help="detach cross modal representations")    
     
     args = parser.parse_args()
     
@@ -100,32 +102,35 @@ if __name__ == '__main__':
         mapping_json_path=args.mapping_path,        
     )
 
-    model = LaVPR_reranker(
-        #---- Encoder
-        model_name=args.model_name.lower(),        
-        embeds_dim=args.embeds_dim,        
-        #---- Train hyperparameters        
-        lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        
-        optimizer=args.opt, # sgd, adamw
-        weight_decay=0.001, # 0.001 for sgd and 0 for adam,
-        momentum=0.9,
-        warmpup_steps=650,        
-        milestones=args.milestones,
-        lr_mult=args.lr_mult,
-        epochs=args.epochs,        
-        faiss_gpu=False,                
-        freeze_vlm=args.freeze_vlm,
-        train_vlm=args.train_vlm,        
-        pos_loss=args.pos_loss,
-        neg_loss=args.neg_loss,      
-        num_mined_negatives=args.mined_negatives,      
-        loss_name=args.loss_name,
-        miner_name='MultiSimilarityMiner', # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
-        miner_margin=0.1,
-        tokens_idf_loss=args.tokens_idf_loss,
-        tokens_idf_file=args.tokens_idf_file,
-        idf_grad_scale=args.idf_grad_scale,
-    )
+    # model = LaVPR_reranker(
+    #     #---- Encoder
+    #     model_name=args.model_name.lower(),        
+    #     embeds_dim=args.embeds_dim,        
+    #     #---- Train hyperparameters        
+    #     lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        
+    #     optimizer=args.opt, # sgd, adamw
+    #     weight_decay=0.001, # 0.001 for sgd and 0 for adam,
+    #     momentum=0.9,
+    #     warmpup_steps=650,        
+    #     milestones=args.milestones,
+    #     lr_mult=args.lr_mult,
+    #     epochs=args.epochs,        
+    #     faiss_gpu=False,                
+    #     freeze_vlm=args.freeze_vlm,
+    #     train_vlm=args.train_vlm,        
+    #     pos_loss=args.pos_loss,
+    #     neg_loss=args.neg_loss,      
+    #     num_mined_negatives=args.mined_negatives,      
+    #     loss_name=args.loss_name,
+    #     miner_name='MultiSimilarityMiner', # example: TripletMarginMiner, MultiSimilarityMiner, PairMarginMiner
+    #     miner_margin=0.1,
+    #     tokens_idf_loss=args.tokens_idf_loss,
+    #     tokens_idf_file=args.tokens_idf_file,
+    #     idf_grad_scale=args.idf_grad_scale,
+    #     detach=args.detach,
+    # )
+    model = LaVPR_reranker_2()
+    
     
     if args.resume is not None:
         #model = model.load_from_checkpoint(args.resume)

@@ -110,13 +110,324 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors, text_des
                 text_global_expanded = text_global_expanded.bfloat16()
 
             # Now cross-attention only sees real semantic tokens
-            scores = rerank_model.cross_attn_classifier(candidate_img_local, text_local_expanded, candidate_img_global, text_global_expanded)
+            scores = rerank_model.cross_attn_classifier(candidate_img_local, text_local_expanded, candidate_img_global, text_global_expanded, force_local=False)
             scores = scores.cpu().numpy()
             
             reranked_order = np.argsort(-scores)
             reranked_predictions[q_idx, :max_rerank_k] = candidate_db_indices[reranked_order]
 
     return reranked_predictions
+
+
+# import asyncio
+# import base64
+# import json
+# import mimetypes
+# import os
+# import re
+# from openai import AsyncOpenAI
+
+
+# def rerank_by_mllm(
+#     image_paths, target_text, predictions, max_concurrent_requests=128, debug=True
+# ):
+#     """Reranks candidates based on Viewpoint-Invariant visual scene text & landmark matching.
+
+#     Upgraded for Gemma-4-26B-A4B execution leveraging large batching & guided JSON decoding.
+#     """
+#     if len(image_paths) != len(predictions):
+#         raise ValueError(
+#             f"Length mismatch: {len(image_paths)} image paths vs {len(predictions)} predictions."
+#         )
+
+#     async def encode_image_async(image_path):
+#         def _read_and_b64(path):
+#             mime_type, _ = mimetypes.guess_type(path)
+#             if not mime_type:
+#                 mime_type = "image/jpeg"
+#             with open(path, "rb") as image_file:
+#                 b64_str = base64.b64encode(image_file.read()).decode("utf-8")
+#                 return f"data:{mime_type};base64,{b64_str}"
+
+#         return await asyncio.to_thread(_read_and_b64, image_path)
+
+#     async def evaluate_single_image(client, semaphore, orig_rank, pred_index, path):
+#         async with semaphore:
+#             if not os.path.exists(path):
+#                 if debug:
+#                     print(f"[Debug] Path missing: {path}")
+#                 return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
+
+#             try:
+#                 img_data_url = await encode_image_async(path)
+
+#                 # Gemma-4 optimized unified user message
+#                 prompt_text = f"""You are an expert visual place recognition and OCR assistant.
+# Analyze this image to evaluate if it shows the location described by the target text query.
+
+# TARGET QUERY: "{target_text}"
+
+# CRITICAL VIEWPOINT-INVARIANT GUIDELINES:
+# 1. VIEWPOINT & ANGLE INVARIANCE: The database image may be taken from a DIFFERENT camera angle, opposite street direction, or different field-of-view than the text description. DO NOT penalize the image if elements appear on different sides (left/right/center) or in a different spatial order!
+# 2. KEY VISUAL ANCHORS: Look for shop names, storefront signs, street signs, building facades, banners, logos, and plaques mentioned in or matching the query.
+# 3. MATCH RULE: If the key text, shop names, or primary landmarks mentioned in the query are present anywhere in the image, it is a Strong Match.
+
+# SCORING CRITERIA (0 to 100):
+# - 85–100: High confidence. Key shop names, street signs, or prominent landmark text from the query are clearly present in the scene.
+# - 50–84: Partial confidence. Moderate text match, secondary landmarks visible, or partially occluded shop name.
+# - 0–49: Low confidence. Completely different location, unrelated storefront text, or no matching landmarks.
+
+# Generate your chain-of-thought analysis within reasoning tags, then output the score and concise justification following the structural schema requested."""
+
+#                 # Enforce native schema constraints at the engine level to bypass regex parsing errors
+#                 response = await client.chat.completions.create(
+#                     model="nvidia/Gemma-4-26B-A4B-NVFP4",  # Match your vLLM model string
+#                     messages=[
+#                         {
+#                             "role": "user",
+#                             "content": [
+#                                 {"type": "text", "text": prompt_text.strip()},
+#                                 {
+#                                     "type": "image_url",
+#                                     "image_url": {"url": img_data_url},
+#                                 },
+#                             ],
+#                         }
+#                     ],
+#                     temperature=0.0,
+#                     max_tokens=256,  # Raised slightly to accommodate reasoning loops + JSON payload
+#                     response_format={
+#                         "type": "json_object",
+#                         "schema": {
+#                             "type": "object",
+#                             "properties": {
+#                                 "score": {"type": "number", "minimum": 0, "maximum": 100},
+#                                 "reason": {"type": "string"}
+#                             },
+#                             "required": ["score", "reason"]
+#                         }
+#                     }
+#                 )
+
+#                 raw_output = response.choices[0].message.content.strip()
+
+#                 score = 0.0
+#                 try:
+#                     data = json.loads(raw_output)
+#                     score = float(data.get("score", 0.0))
+#                 except Exception:
+#                     # Fallback structural extraction regex if manual payload bypass occurs
+#                     match = re.search(r'"score"\s*:\s*(\d+(?:\.\d+)?)', raw_output)
+#                     if match:
+#                         score = float(match.group(1))
+
+#                 if debug:
+#                     print(
+#                         f"[Debug] Orig Rank {orig_rank:02d} | Pred {pred_index} | Score: {score} | File: {os.path.basename(path)}"
+#                     )
+
+#                 return {"pred_index": pred_index, "score": score, "orig_rank": orig_rank}
+
+#             except Exception as e:
+#                 if debug:
+#                     print(f"[Debug Error] Candidate {pred_index} failed: {e}")
+#                 return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
+
+#     async def run_batch():
+#         semaphore = asyncio.Semaphore(max_concurrent_requests)
+#         async with AsyncOpenAI(
+#             base_url="http://localhost:8000/v1", api_key="not-needed"
+#         ) as client:
+#             tasks = [
+#                 evaluate_single_image(client, semaphore, orig_idx, pred_idx, path)
+#                 for orig_idx, (pred_idx, path) in enumerate(zip(predictions, image_paths))
+#             ]
+#             return await asyncio.gather(*tasks)
+
+#     try:
+#         loop = asyncio.get_running_loop()
+#     except RuntimeError:
+#         loop = None
+
+#     if loop and loop.is_running():
+#         import nest_asyncio
+
+#         nest_asyncio.apply()
+#         results = loop.run_until_complete(run_batch())
+#     else:
+#         results = asyncio.run(run_batch())
+
+#     # --- TIE-BREAKING SORTING LOGIC ---
+#     sorted_results = sorted(
+#         results, key=lambda x: (-x["score"], x["orig_rank"])
+#     )
+
+#     reranked_preds = [res["pred_index"] for res in sorted_results]
+
+#     if debug:
+#         print("\n--- Final Reranked Candidate Order ---")
+#         for new_rank, res in enumerate(sorted_results):
+#             print(
+#                 f"New Rank {new_rank+1:02d}: Candidate {res['pred_index']} (Orig Rank: {res['orig_rank']}) -> Score: {res['score']}"
+#             )
+
+#     return reranked_preds
+
+
+import asyncio
+import base64
+import json
+import mimetypes
+import os
+import re
+from openai import AsyncOpenAI
+
+
+def rerank_by_mllm(
+    image_paths, target_text, predictions, max_concurrent_requests=8, debug=True
+):
+    """Reranks candidates based on Viewpoint-Invariant visual scene text & landmark matching.
+
+    Preserves the original Stage 1 retrieval rank whenever candidates have identical MLLM scores.
+    """
+    if len(image_paths) != len(predictions):
+        raise ValueError(
+            f"Length mismatch: {len(image_paths)} image paths vs {len(predictions)} predictions."
+        )
+
+    async def encode_image_async(image_path):
+        def _read_and_b64(path):
+            mime_type, _ = mimetypes.guess_type(path)
+            if not mime_type:
+                mime_type = "image/jpeg"
+            with open(path, "rb") as image_file:
+                b64_str = base64.b64encode(image_file.read()).decode("utf-8")
+                return f"data:{mime_type};base64,{b64_str}"
+
+        return await asyncio.to_thread(_read_and_b64, image_path)
+
+    async def evaluate_single_image(client, semaphore, orig_rank, pred_index, path):
+        async with semaphore:
+            if not os.path.exists(path):
+                if debug:
+                    print(f"[Debug] Path missing: {path}")
+                return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
+
+            try:
+                img_data_url = await encode_image_async(path)
+
+                prompt_text = f"""
+You are an expert visual place recognition and OCR assistant.
+Analyze this image to evaluate if it shows the location described by the target text query.
+
+TARGET QUERY: "{target_text}"
+
+CRITICAL VIEWPOINT-INVARIANT GUIDELINES:
+1. VIEWPOINT & ANGLE INVARIANCE: The database image may be taken from a DIFFERENT camera angle, opposite street direction, or different field-of-view than the text description. DO NOT penalize the image if elements appear on different sides (left/right/center) or in a different spatial order!
+2. KEY VISUAL ANCHORS: Look for shop names, storefront signs, street signs, building facades, banners, logos, and plaques mentioned in or matching the query.
+3. MATCH RULE: If the key text, shop names, or primary landmarks mentioned in the query are present anywhere in the image, it is a Strong Match.
+
+SCORING CRITERIA (0 to 100):
+- 85–100: High confidence. Key shop names, street signs, or prominent landmark text from the query are clearly present in the scene.
+- 50–84: Partial confidence. Moderate text match, secondary landmarks visible, or partially occluded shop name.
+- 0–49: Low confidence. Completely different location, unrelated storefront text, or no matching landmarks.
+
+OUTPUT FORMAT:
+Respond ONLY with a JSON object: {{"score": <number 0-100>, "reason": "<brief justification>"}}
+"""
+
+                response = await client.chat.completions.create(
+                    model="neuralmagic/Qwen2.5-VL-72B-Instruct-FP8-Dynamic",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text.strip()},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": img_data_url},
+                                },
+                            ],
+                        }
+                    ],
+                    temperature=0.0,
+                    max_tokens=80,
+                )
+
+                raw_output = response.choices[0].message.content.strip()
+
+                # Score extraction logic
+                score = 0.0
+                try:
+                    clean_json = raw_output
+                    if "```" in clean_json:
+                        clean_json = re.sub(
+                            r"```[a-zA-Z]*", "", clean_json
+                        ).strip()
+                    data = json.loads(clean_json)
+                    score = float(data.get("score", data.get("confidence_score", 0.0)))
+                except Exception:
+                    match = re.search(
+                        r'"(?:score|confidence_score)"\s*:\s*(\d+(?:\.\d+)?)',
+                        raw_output,
+                    )
+                    if match:
+                        score = float(match.group(1))
+
+                if debug:
+                    print(
+                        f"[Debug] Orig Rank {orig_rank:02d} | Pred {pred_index} | Score: {score} | File: {os.path.basename(path)}"
+                    )
+
+                return {"pred_index": pred_index, "score": score, "orig_rank": orig_rank}
+
+            except Exception as e:
+                if debug:
+                    print(f"[Debug Error] Candidate {pred_index} failed: {e}")
+                return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
+
+    async def run_batch():
+        semaphore = asyncio.Semaphore(max_concurrent_requests)
+        async with AsyncOpenAI(
+            base_url="http://localhost:8000/v1", api_key="not-needed"
+        ) as client:
+            tasks = [
+                evaluate_single_image(client, semaphore, orig_idx, pred_idx, path)
+                for orig_idx, (pred_idx, path) in enumerate(zip(predictions, image_paths))
+            ]
+            return await asyncio.gather(*tasks)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import nest_asyncio
+
+        nest_asyncio.apply()
+        results = loop.run_until_complete(run_batch())
+    else:
+        results = asyncio.run(run_batch())
+
+    # --- TIE-BREAKING SORTING LOGIC ---
+    # Primary Key:   score (Descending -> Higher is better)
+    # Secondary Key: orig_rank (Ascending -> Smaller original index comes first)
+    sorted_results = sorted(
+        results, key=lambda x: (-x["score"], x["orig_rank"])
+    )
+
+    reranked_preds = [res["pred_index"] for res in sorted_results]
+
+    if debug:
+        print("\n--- Final Reranked Candidate Order ---")
+        for new_rank, res in enumerate(sorted_results):
+            print(
+                f"New Rank {new_rank+1:02d}: Candidate {res['pred_index']} (Orig Rank: {res['orig_rank']}) -> Score: {res['score']}"
+            )
+
+    return reranked_preds
+
 
 
 def main(args):
@@ -189,7 +500,7 @@ def main(args):
         vision_descriptors = np.empty((len(test_ds), model.encoder_dim), dtype="float32")
         text_descriptors = np.empty((len(test_ds), model.encoder_dim), dtype="float32")            
         all_descriptors = np.empty((len(test_ds), model.encoder_dim), dtype="float32")
-        img_local_descs = np.empty((len(test_ds), num_img_tokens, model.encoder_dim), dtype="float32")
+        img_local_descs = np.empty((len(test_ds), num_img_tokens, 768), dtype="float32")
         text_local_desc = np.empty((len(test_ds), num_text_tokens, model.encoder_dim), dtype="float32")
             
         for images, indices, texts in tqdm(database_dataloader):
@@ -227,6 +538,18 @@ def main(args):
         predictions = rerank_predictions(
             model, test_ds, predictions, vision_descriptors, text_descriptors, img_local_descs, text_local_desc, max_rerank_k=max_rerank_k, device=args.device
         )
+        
+    if args.reranker_mllm:
+        # get query texts
+        q_texts = test_ds.descriptions[test_ds.num_database :]
+        # get db image paths for predictions per query text
+        db_paths_array = np.array(test_ds.images_paths[:test_ds.num_database    ])
+        db_images = db_paths_array[predictions]
+        for i in range(len(q_texts)):
+            print(f"Sending query {i} to LLM")
+            q = q_texts[i]
+            db = db_images[i]
+            predictions[i] = rerank_by_mllm(db, q, predictions[i])
 
     # 3. Calculate metrics using the updated reranked predictions
     if is_msls_challenge:

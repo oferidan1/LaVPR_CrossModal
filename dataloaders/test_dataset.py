@@ -164,6 +164,8 @@ class TestDataset(data.Dataset):
             skipinitialspace=True)
         image_path = df['image_path'].values
         description = df['description'].values    
+        # if 'compressed_description' in df.columns:
+        #     description = df['compressed_description'].values 
         image_path = [posixpath.join(image_root, p) for p in image_path]
         return image_path, description
         

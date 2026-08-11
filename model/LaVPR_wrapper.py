@@ -103,7 +103,7 @@ class LaVPR_wrapper():
         img_local, text_local = None, None
         with torch.no_grad():
             if self.reranker:
-                score_matrix, features, text_features, img_local, text_local= self.single_encoder(images, texts, return_embeddings=True)
+                score_matrix, features, text_features, img_local, text_local, attention_mask= self.single_encoder(images, texts, return_embeddings=True)
             else:
                 features, text_features, _ , _ , _, _, _  = self.single_encoder(images, texts)
         return features, text_features, img_local, text_local

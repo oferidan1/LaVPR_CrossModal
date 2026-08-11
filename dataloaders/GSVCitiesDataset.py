@@ -60,7 +60,7 @@ class GSVCitiesDataset(Dataset):
         self.places_ids = pd.unique(self.dataframe.index)
         self.total_nb_images = len(self.dataframe)        
         
-        self.image_path, self.image_full_path, self.description, self.flip_desc, self.color_change_desc = GSVCitiesDataset.read_csv_file(train_csv, base_path)
+        self.image_path, self.image_full_path, self.description, self.flip_desc, self.hn_desc = GSVCitiesDataset.read_csv_file(train_csv, base_path)
         
         #load SG JSON
         # with open(SG_JSON, 'r') as f:
@@ -136,8 +136,9 @@ class GSVCitiesDataset(Dataset):
         descriptions = []
         flip_descs = []
         neg_attr_descs = []
-        color_change_descs = []
+        hn_descs = []
         concepts_ids = []
+        #text_seg_per_place = []
         
         for i, row in place.iterrows():
             img_name = self.get_img_name(row)
@@ -152,14 +153,19 @@ class GSVCitiesDataset(Dataset):
             
             # get the description for this image
             # find image_path index in self.image_path  
-            neg_desc, flip_desc, color_change_desc, description = "", "", "", ""
+            neg_desc, flip_desc, hn_desc, description = "", "", "", ""
+            text_seg = []
             img_concepts_ids = torch.zeros(self.max_concepts, dtype=torch.long)
             if img_path in self.image_full_path:
                 max_length = 256
                 desc_index = self.image_full_path.index(img_path)                
                 description = self.description[desc_index][:max_length]
-                flip_desc = self.flip_desc[desc_index][:max_length]
-                color_change_desc = self.color_change_desc[desc_index][:max_length]
+                if self.flip_desc:
+                    flip_desc = self.flip_desc[desc_index][:max_length]
+                if self.hn_desc:
+                    hn_desc = self.hn_desc[desc_index][:max_length]
+                # if self.text_seg:
+                #     text_seg = self.text_seg[desc_index]
                 
                 image_id = self.image_path[desc_index]                
                 active_ids = self.image_to_indices.get(image_id, [])
@@ -200,15 +206,16 @@ class GSVCitiesDataset(Dataset):
                 
             descriptions.append(description) 
             flip_descs.append(flip_desc)
-            color_change_descs.append(color_change_desc)
+            hn_descs.append(hn_desc)
             #neg_attr_descs.append(neg_desc)
             concepts_ids.append(img_concepts_ids)
+            #text_seg_per_place.append(text_seg)
             
          # NOTE: contrary to image classification where __getitem__ returns only one image 
         # in GSVCities, we return a place, which is a Tesor of K images (K=self.img_per_place)
         # this will return a Tensor of shape [K, channels, height, width]. This needs to be taken into account 
         # in the Dataloader (which will yield batches of shape [BS, K, channels, height, width])
-        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place), descriptions, flip_descs, color_change_descs, neg_attr_descs, torch.stack(concepts_ids)
+        return torch.stack(imgs), torch.tensor(place_id).repeat(self.img_per_place), descriptions, flip_descs, hn_descs, neg_attr_descs, torch.stack(concepts_ids)
 
     def __len__(self):
         '''Denotes the total number of places (not images)'''
@@ -239,7 +246,7 @@ class GSVCitiesDataset(Dataset):
         name = city+'_'+pl_id+'_'+year+'_'+month+'_' + \
             northdeg+'_'+lat+'_'+lon+'_'+panoid+'.jpg'
         return name
-    
+
     @staticmethod
     def read_csv_file(labels_file, image_root):    
         df = pd.read_csv(labels_file, 
@@ -248,14 +255,29 @@ class GSVCitiesDataset(Dataset):
             on_bad_lines='skip',
             quotechar='"',
             skipinitialspace=True)
+        flip_desc = None
+        hn_desc = None
         image_path = df['image_path'].values
         description = df['description'].values    
-        flip_desc = df['flip'].values    
-        color_change_desc = df['change_color'].values            
+        # if 'flip' in df.columns:
+        #     flip_desc = df['flip'].values                    
+        if 'hn' in df.columns:
+            hn_desc = df['hn'].values    
+        # if 'compressed_description' in df.columns:
+        #     description = df['compressed_description'].values       
+        flip_desc_ = [flip_text_by_comma(t) for t in description]        
+        # text_seg = [
+        #     [seg.strip() for seg in str(text).split(',') if seg.strip()] or [str(text)]
+        #     for text in description
+        # ]
         image_full_path = [posixpath.join(image_root, p) for p in image_path]        
-        return image_path, image_full_path, description, flip_desc, color_change_desc
+        return image_path, image_full_path, description, flip_desc, hn_desc#, text_seg
 
-
+   
+@staticmethod
+def flip_text_by_comma(text):
+    phrases = [p.strip() for p in text.split(',')]
+    return ', '.join(phrases[::-1])
 
 class CachedVPRSGDataset(Dataset):
     """

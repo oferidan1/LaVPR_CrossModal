@@ -49,6 +49,46 @@ TRAIN_CITIES = [
     'PRS',
 ]
 
+import torch
+
+def gsv_cities_collate_fn(batch):
+    """
+    Custom collate function for GSVCitiesDataset that safely handles variable-length 
+    segment strings (text_seg_per_place) and preserves the GSVCities tensor batching layout.
+    
+    Expected return per sample from GSVCitiesDataset.__getitem__:
+        0: imgs                 -> Tensor [K, 3, H, W]
+        1: place_ids            -> Tensor [K]
+        2: descriptions         -> List of K strings
+        3: flip_descs           -> List of K strings
+        4: hn_descs             -> List of K strings
+        5: neg_attr_descs       -> List of K strings (or empty)
+        6: concepts_ids         -> Tensor [K, max_concepts]
+        7: text_seg_per_place   -> List of K lists of string segments
+    """
+    transposed = list(zip(*batch))
+    
+    # 1. Stack Tensors across the Batch Dimension (BS)
+    # Shape becomes: [BS, K, Channels, Height, Width]
+    imgs = torch.stack(transposed[0], dim=0)
+    
+    # Shape becomes: [BS, K] -> flattened to [BS*K] inside training_step
+    place_ids = torch.stack(transposed[1], dim=0)
+    
+    # Shape becomes: [BS, K, max_concepts]
+    concepts_ids = torch.stack(transposed[6], dim=0)
+    
+    # 2. Keep String Lists as Python Lists
+    descriptions = list(transposed[2])      # List of length BS, each containing K strings
+    flip_descs = list(transposed[3])        # List of length BS, each containing K strings
+    hn_descs = list(transposed[4])          # List of length BS, each containing K strings
+    neg_attr_descs = list(transposed[5])    # List of length BS, each containing K strings
+    
+    # 3. Keep text_seg_per_place as a nested Python list (BS x K x Segments)
+    text_seg_per_place = list(transposed[7])
+    
+    return imgs, place_ids, descriptions, flip_descs, hn_descs, neg_attr_descs, concepts_ids, text_seg_per_place
+
 
 class GSVCitiesDataModule(pl.LightningDataModule):
     def __init__(self,
@@ -112,6 +152,7 @@ class GSVCitiesDataModule(pl.LightningDataModule):
             'drop_last': False,
             'pin_memory': True,
             'shuffle': self.shuffle_all}
+            #'collate_fn':gsv_cities_collate_fn}
 
         self.valid_loader_config = {
             'batch_size': self.val_batch_size,

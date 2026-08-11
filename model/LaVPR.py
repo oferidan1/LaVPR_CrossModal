@@ -119,8 +119,7 @@ class LaVPR(pl.LightningModule):
         self.tokens_idf_loss = tokens_idf_loss
         self.tokens_idf_file = tokens_idf_file
         self.idf_pooling = idf_pooling
-        #vocab_size = 49408
-        vocab_size = 256000
+        vocab_size = self.get_vocab_size(model_name)        
         self.vocab_path = vocab_path
         self.image_idf_path = image_idf_path
         self.vocab_idf_loss = vocab_idf_loss
@@ -255,7 +254,21 @@ class LaVPR(pl.LightningModule):
             nn.init.kaiming_uniform_(module.weight, mode='fan_in', nonlinearity='relu')
             # For biases, it's common to initialize them to zero
             if module.bias is not None:
-                nn.init.constant_(module.bias, 0)        
+                nn.init.constant_(module.bias, 0)      
+                
+    def get_vocab_size(self, model_name):
+        vocab_size = 0
+        if 'blip' in model_name:
+            vocab_size = 30524           
+        elif 'llm2clip' in model_name:
+            vocab_size = 128256
+        elif 'clip' in model_name:            
+            vocab_size = 49408            
+        elif 'eva' in model_name:
+            vocab_size = 49408
+        elif 'siglip' in model_name:
+            vocab_size = 256000        
+        return vocab_size
                 
     def encode_image(self, img):
         img_embeds = None
@@ -288,6 +301,7 @@ class LaVPR(pl.LightningModule):
             else:
                 img_embeds = pooled_output            
             img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)
+            
         elif 'siglip' in self.model_name:
             #img_output = self.vlm_encoder.get_image_features(pixel_values=img)
             #img_local = self.vlm_encoder.base_model.model.vision_model.head(img_output.last_hidden_state)                     
@@ -347,6 +361,7 @@ class LaVPR(pl.LightningModule):
             # text_local = self.vlm_encoder.text_projection(text_output.last_hidden_state)
             # text_embeds = text_output.pooler_output    
             # text_all_layers = text_output.hidden_states    
+            
             text_outputs = self.vlm_encoder.text_model(
                 input_ids=text_tokens,
                 attention_mask=attention_mask,
@@ -360,6 +375,7 @@ class LaVPR(pl.LightningModule):
             else:
                 text_embeds = pooled_text                            
             text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+            
         elif 'siglip' in self.model_name:
             text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
             text_tokens = text_inputs.input_ids.to(self.my_device)
