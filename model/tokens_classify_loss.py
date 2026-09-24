@@ -321,3 +321,246 @@ class VocabClassificationLoss(nn.Module):
 #         )
         
 #         return classification_loss * self.loss_scale
+
+
+# Replace the FILIPLoss class inside model/tokens_classify_loss.py with this.
+# GradientScaleFunction is already defined in that file.
+
+
+class FILIPLoss(nn.Module):
+    """FILIP token-wise maximum similarity (late interaction).
+
+        s(t->i) = sum_i w_i * max_j (t_i . v_j)
+        s(i->t) = (1/m) sum_j max_i (v_j . t_i)
+
+    loss_type
+    ---------
+    'infonce' : softmax cross-entropy over the batch, as in the FILIP paper.
+                Needs very large batches - the paper uses 40,960 over 340M
+                pairs. Degrades badly with few distinct negatives.
+    'ms'      : Multi-Similarity pair weighting on the same MaxSim scores.
+                Built for the small-batch regime, which is what place-labelled
+                VPR batches are (~BS distinct places, since same-place items
+                are positives, not BS*N).
+
+    queue_size > 0 adds a MoCo-style FIFO of past image tokens (no gradient),
+    so the text->image direction sees thousands of negative places instead of
+    BS. Volume from the queue, selection from MS pair weighting.
+
+    use_norm=False reproduces the original module exactly, for loading
+    checkpoints trained before the LayerNorms were added.
+    """
+
+    def __init__(self,
+                 text_dim=512,
+                 vision_dim=768,
+                 joint_dim=512,
+                 num_patches=196,           # ViT-B/16 @224; needed for the queue
+                 temperature=0.2,
+                 chunk=8,
+                 idf_path=None,
+                 vocab_size=49408,
+                 use_idf=True,
+                 use_norm=True,
+                 grad_scale=0.1,
+                 warmup_steps=200,
+                 max_logit_scale=30.0,
+                 loss_type='ms',            # 'ms' | 'infonce'
+                 ms_alpha=2.0,
+                 ms_beta=50.0,
+                 ms_base=0.5,
+                 ms_dynamic_base=True,
+                 queue_size=0):             # 0 disables the memory queue
+        super().__init__()
+        # HF CLIP returns vision last_hidden_state BEFORE post_layernorm but
+        # text last_hidden_state AFTER final_layer_norm -> very different scales
+        self.v_norm = nn.LayerNorm(vision_dim) if use_norm else None
+        self.t_norm = nn.LayerNorm(text_dim) if use_norm else None
+
+        self.vision_proj = nn.Linear(vision_dim, joint_dim, bias=False)
+        self.text_proj = nn.Linear(text_dim, joint_dim, bias=False)
+        self.logit_scale = nn.Parameter(torch.tensor(1.0 / temperature).log())
+
+        self.max_logit_scale = max_logit_scale
+        self.chunk = chunk
+        self.use_idf = use_idf
+        self.grad_scale = grad_scale
+        self.warmup_steps = warmup_steps
+
+        self.loss_type = loss_type
+        self.ms_alpha = ms_alpha
+        self.ms_beta = ms_beta
+        self.ms_base = ms_base
+        self.ms_dynamic_base = ms_dynamic_base
+
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
+
+        # ---- cross-batch memory queue (image side only) ------------------
+        self.queue_size = queue_size
+        if queue_size:
+            self.register_buffer("q_v", torch.zeros(queue_size, num_patches,
+                                                    joint_dim, dtype=torch.half))
+            self.register_buffer("q_lab", torch.full((queue_size,), -1, dtype=torch.long))
+            self.register_buffer("q_ptr", torch.zeros(1, dtype=torch.long))
+
+        if use_idf and idf_path is not None:
+            try:
+                w = torch.load(idf_path, weights_only=True).clamp(min=0.0)
+                # temper: raw inverse frequency is unstable on large vocabularies
+                w = torch.log1p(w)
+                w = w / w.mean().clamp(min=1e-6)
+            except (FileNotFoundError, RuntimeError):
+                print(f"FILIPLoss: {idf_path} not found, uniform weights.")
+                w = torch.ones(vocab_size)
+        else:
+            w = torch.ones(vocab_size)
+        self.register_buffer("idf_weights", w)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Call again after any global kaiming/relu init in the parent module."""
+        nn.init.normal_(self.vision_proj.weight, std=0.02)
+        nn.init.normal_(self.text_proj.weight, std=0.02)
+
+    # ------------------------------------------------------------------
+    def _weights(self, text_tokens, t_mask):
+        if self.use_idf:
+            idx = text_tokens.clamp(0, self.idf_weights.numel() - 1)
+            w = self.idf_weights[idx].to(t_mask.dtype)
+        else:
+            w = torch.ones_like(t_mask)
+        w = w * t_mask
+        return w / w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def _scores(self, t, v, w, t_mask, both=True):
+        """t: (Bt, n, d) | v: (Bv, m, d) | w, t_mask: (Bt, n)
+
+        Chunked over the text batch - the full (Bt, Bv, n, m) tensor is far too
+        large to materialise. Padded text positions are pushed to -1e4 so they
+        never win the image->text argmax and contribute nothing to the
+        text->image weighted sum.
+        """
+        t2i, i2t = [], []
+        for s in range(0, t.size(0), self.chunk):
+            tc = t[s:s + self.chunk]
+            wc = w[s:s + self.chunk]
+            mc = t_mask[s:s + self.chunk]
+            sim = torch.einsum('cnd,bmd->cbnm', tc, v)
+            sim = sim + (1.0 - mc)[:, None, :, None] * (-1e4)
+            t2i.append((sim.max(dim=-1).values * wc[:, None, :]).sum(-1))
+            if both:
+                i2t.append(sim.max(dim=-2).values.mean(-1))
+            del sim
+        t2i = torch.cat(t2i, dim=0)
+        i2t = torch.cat(i2t, dim=0) if both else None
+        return t2i, i2t
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _enqueue(self, v, labels):
+        B = v.shape[0]
+        p = int(self.q_ptr.item())
+        idx = (torch.arange(B, device=v.device) + p) % self.queue_size
+        self.q_v[idx] = v.detach().half()
+        self.q_lab[idx] = labels.detach()
+        self.q_ptr[0] = (p + B) % self.queue_size
+
+    # ------------------------------------------------------------------
+    def _ms_loss(self, S, same, base):
+        """Multi-Similarity pair weighting on a CROSS-MODAL score matrix.
+
+        S: [Bt, Bv], same: [Bt, Bv] boolean positive mask.
+        The diagonal is a genuine positive here (text i describes image i), so
+        unlike unimodal MS it is NOT excluded. S need not be square once the
+        memory queue is in use.
+        """
+        neg = ~same
+        lp = torch.where(same, torch.exp(-self.ms_alpha * (S - base)),
+                         torch.zeros_like(S)).sum(dim=1)
+        ln = torch.where(neg, torch.exp(self.ms_beta * (S - base)),
+                         torch.zeros_like(S)).sum(dim=1)
+        return (torch.log1p(lp) / self.ms_alpha
+                + torch.log1p(ln) / self.ms_beta).mean()
+
+    def _base_for(self, S, same):
+        """MaxSim scores are averages of per-token maxima over ~196 patches, so
+        they sit well above plain cosine and a fixed margin transfers badly.
+        Track the mean positive score instead, clamped to a sane band.
+        """
+        if not self.ms_dynamic_base:
+            return self.ms_base
+        with torch.no_grad():
+            pos = S[same]
+            if pos.numel() == 0:
+                return self.ms_base
+            return float(pos.mean().clamp(0.2, 0.9))
+
+    def _infonce(self, s_t2i, s_i2t, same_t2i, same_i2t, dtype):
+        scale = self.logit_scale.exp().clamp(max=self.max_logit_scale)
+
+        def ce(S, same):
+            q = same.to(dtype)
+            q = q / q.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            return -(q * F.log_softmax(S * scale, dim=-1)).sum(-1).mean()
+
+        if s_i2t is None:
+            return ce(s_t2i, same_t2i)
+        return 0.5 * (ce(s_t2i, same_t2i) + ce(s_i2t.t(), same_i2t))
+
+    # ------------------------------------------------------------------
+    def forward(self, img_local, text_local, t_mask, text_tokens, labels):
+        """
+        img_local  : (B, m, vision_dim)  patch tokens, CLS already stripped
+        text_local : (B, n, text_dim)    text tokens
+        t_mask     : (B, n)              1 for real tokens, 0 for padding
+        text_tokens: (B, n)              token ids, for the IDF lookup
+        labels     : (B,)                place labels
+        """
+        if self.training:
+            self._step += 1
+            if self._step.item() <= self.warmup_steps:
+                # train the projections alone first; a random head otherwise
+                # floods the encoders with noise
+                img_local, text_local = img_local.detach(), text_local.detach()
+            elif self.grad_scale < 1.0:
+                img_local = GradientScaleFunction.apply(img_local, self.grad_scale)
+                text_local = GradientScaleFunction.apply(text_local, self.grad_scale)
+
+        vi = self.v_norm(img_local) if self.v_norm is not None else img_local
+        te = self.t_norm(text_local) if self.t_norm is not None else text_local
+        v = F.normalize(self.vision_proj(vi), dim=-1)
+        t = F.normalize(self.text_proj(te), dim=-1)
+
+        t_mask = t_mask.to(t.dtype)
+        w = self._weights(text_tokens, t_mask)
+
+        use_q = self.queue_size > 0 and bool((self.q_lab >= 0).any())
+        if use_q:
+            valid = self.q_lab >= 0
+            v_all = torch.cat([v, self.q_v[valid].to(v.dtype)], dim=0)
+            lab_img = torch.cat([labels, self.q_lab[valid]], dim=0)
+            # image->text is not defined for queued images (no queued text),
+            # so with a queue we optimise the text->image direction only -
+            # which is the direction the benchmark evaluates anyway.
+            s_t2i, s_i2t = self._scores(t, v_all, w, t_mask, both=False)
+        else:
+            v_all, lab_img = v, labels
+            s_t2i, s_i2t = self._scores(t, v_all, w, t_mask, both=True)
+
+        # a queued image of the same place is a POSITIVE, not a negative -
+        # treating it as negative trains the model to reject correct matches
+        same_t2i = labels.view(-1, 1) == lab_img.view(1, -1)      # [B, B+Q]
+        same_i2t = labels.view(-1, 1) == labels.view(1, -1)       # [B, B]
+
+        if self.loss_type == 'ms':
+            base = self._base_for(s_t2i, same_t2i)
+            loss = self._ms_loss(s_t2i, same_t2i, base)
+            if s_i2t is not None:
+                loss = 0.5 * (loss + self._ms_loss(s_i2t.t(), same_i2t, base))
+        else:
+            loss = self._infonce(s_t2i, s_i2t, same_t2i, same_i2t, t.dtype)
+
+        if self.training and self.queue_size:
+            self._enqueue(v, labels)
+        return loss

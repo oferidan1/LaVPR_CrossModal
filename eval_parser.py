@@ -87,8 +87,8 @@ def parse_arguments():
         help="set to True if you want to save the descriptors extracted by the model",
     )
     parser.add_argument("--gpu", type=str, default="0", help="which gpu to use")
-    parser.add_argument("--model_name", type=str, default='openai/clip-vit-base-patch16 ')
-    parser.add_argument("--model_path", type=str, default='LOGS/resnet50/lightning_logs/version_61_clipb16_ms_sc_pos/checkpoints/resnet50_epoch\(18\)_step\(9899\)_R1\[0.5938\]_R5\[0.8275\].ckpt')
+    parser.add_argument("--model_name", type=str, default='openai/clip-vit-base-patch16')
+    parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--lora_path", type=str, default=None)        
     parser.add_argument("--is_normalize", type=int, default="0", help="is normalize features")    
     parser.add_argument("--max_rerank", type=int, default="20", help="max results for reranking")        
@@ -101,9 +101,11 @@ def parse_arguments():
     parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model")        
     parser.add_argument("--reranker", type=int, default="0", help="reranker")        
     parser.add_argument("--reranker_mllm", type=int, default="0", help="reranker")        
+    parser.add_argument("--reranker_filip", type=int, default="0", help="reranker")        
+    parser.add_argument("--filip_alpha", type=float, default="1", help="reranker")      
+    parser.add_argument("--filip_retrieval", type=int, default="0", help="reranker")                  
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
     parser.add_argument("--text_only", type=int, default="0", help="is text only")    
-
 
     args = parser.parse_args()
     

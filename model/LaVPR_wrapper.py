@@ -60,7 +60,8 @@ class LaVPR_wrapper():
                     lora_all_linear=args.lora_all_linear,
                     lora_target_modules=args.lora_target_modules,
                     lora_r=args.lora_r,                  
-                    agg_type=args.agg_type,            
+                    agg_type=args.agg_type,     
+                    filip=args.reranker_filip or args.filip_retrieval   
                 )
 
             if args.lora_path is not None:
@@ -100,13 +101,13 @@ class LaVPR_wrapper():
         return image_features, text_features
     
     def encode_single(self, images, texts):
-        img_local, text_local = None, None
+        img_local, text_local, text_tokens = None, None, None
         with torch.no_grad():
             if self.reranker:
                 score_matrix, features, text_features, img_local, text_local, attention_mask= self.single_encoder(images, texts, return_embeddings=True)
             else:
-                features, text_features, _ , _ , _, _, _  = self.single_encoder(images, texts)
-        return features, text_features, img_local, text_local
+                features, text_features, _, _, _, _, img_local, text_local, text_tokens, _  = self.single_encoder(images, texts)
+        return features, text_features, img_local, text_local, text_tokens
     
     def encode_image(self, images):
         if 'blip' in self.model_name:
