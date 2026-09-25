@@ -47,7 +47,7 @@ def _z(x):
 
 def encode_batch(model, args, images, texts, indices, all_descriptors,
                  vision_descriptors, text_descriptors, img_local_descs,
-                 text_local_descs, text_tokens_all):
+                 text_local_descs, text_tokens_all, text_attentions):
     if args.bfloat16:
         images = images.bfloat16()
 
@@ -63,9 +63,9 @@ def encode_batch(model, args, images, texts, indices, all_descriptors,
         vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
         text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
         img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
-        text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()
-        # .long(), not .float(): SigLIP ids exceed float32's exact integer range
-        text_tokens_all[indices.numpy(), :] = text_tokens.cpu().long().numpy()
+        text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()        
+        #text_tokens_all[indices.numpy(), :] = text_tokens.cpu().long().numpy()
+        #text_attentions[indices.numpy(), :] = text_attention_mask.cpu().long().numpy()
 
 
 def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors,
@@ -180,10 +180,9 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
 # ---------------------------------------------------------------------------
 # Rerankers
 # ---------------------------------------------------------------------------
-
 def rerank_predictions(model, test_ds, predictions, vision_descriptors,
                        text_descriptors, img_local_descs, text_local_desc,
-                       max_rerank_k=25, device="cuda"):
+                       text_attentions=None, max_rerank_k=25, device="cuda"):
     logger.info(f"Reranking top-{max_rerank_k} candidates using Cross-Attention...")
 
     rerank_model = model.single_encoder
@@ -196,40 +195,60 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
     text_local_desc_tensor = torch.from_numpy(text_local_desc).to(device)
     vision_descriptors_tensor = torch.from_numpy(vision_descriptors).to(device)
     text_descriptors_tensor = torch.from_numpy(text_descriptors).to(device)
+    text_attn_tensor = (torch.from_numpy(text_attentions).to(device) if text_attentions is not None else None)
+    if text_attn_tensor is None:
+        logger.warning("rerank_predictions: no attention mask supplied, "
+                       "falling back to non-zero-row detection.")
+
+    n_cand = int(max_rerank_k)
 
     with torch.no_grad():
         for q_idx in tqdm(range(test_ds.num_queries), desc="Reranking queries"):
             actual_q_ds_idx = test_ds.num_database + q_idx
 
             query_text_global = text_descriptors_tensor[actual_q_ds_idx].unsqueeze(0)
-            raw_text_local = text_local_desc_tensor[actual_q_ds_idx]
+            raw_text_local = text_local_desc_tensor[actual_q_ds_idx]        # (Lt, D)
 
-            # drop padding: stored rows are exactly zero where padded
-            non_zero_mask = raw_text_local.any(dim=-1)
-            true_len = max(1, non_zero_mask.sum().item())
-            query_text_local = raw_text_local[:true_len].unsqueeze(0)
+            if text_attn_tensor is not None:
+                mask_row = text_attn_tensor[actual_q_ds_idx]                # (Lt,)
+            else:
+                mask_row = raw_text_local.any(dim=-1).long()
+            if mask_row.sum() == 0:
+                mask_row = torch.ones_like(mask_row)
 
-            candidate_db_indices = predictions[q_idx, :max_rerank_k]
+            # Trim to the longest real position, keeping tokens and mask ALIGNED.
+            # Slicing by a count (the old `true_len`) silently reorders whenever
+            # the real positions are not a contiguous prefix.
+            true_len = int(mask_row.nonzero()[-1].item()) + 1
+            query_text_local = raw_text_local[:true_len].unsqueeze(0)       # (1, L, D)
+            query_mask = mask_row[:true_len].unsqueeze(0)                   # (1, L)
+
+            candidate_db_indices = predictions[q_idx, :n_cand]
+            B = len(candidate_db_indices)
             candidate_img_local = img_local_descs_tensor[candidate_db_indices]
             candidate_img_global = vision_descriptors_tensor[candidate_db_indices]
 
-            True_Lt, D_dim = query_text_local.shape[1], query_text_local.shape[2]
-            text_local_expanded = query_text_local.expand(len(candidate_db_indices), True_Lt, D_dim)
-            text_global_expanded = query_text_global.expand(len(candidate_db_indices), -1)
+            L, D_dim = query_text_local.shape[1], query_text_local.shape[2]
+            text_local_expanded = query_text_local.expand(B, L, D_dim)
+            text_global_expanded = query_text_global.expand(B, -1)
+            text_mask_expanded = query_mask.expand(B, L)
 
             if next(rerank_model.parameters()).dtype == torch.bfloat16:
                 candidate_img_local = candidate_img_local.bfloat16()
                 text_local_expanded = text_local_expanded.bfloat16()
                 candidate_img_global = candidate_img_global.bfloat16()
                 text_global_expanded = text_global_expanded.bfloat16()
+                # the mask stays integer: casting it to bf16 and then comparing
+                # or multiplying inside the attention module is how masks turn
+                # into 0.99609375 and stop masking
 
             scores = rerank_model.cross_attn_classifier(
                 candidate_img_local, text_local_expanded,
-                candidate_img_global, text_global_expanded, force_local=False)
-            scores = scores.cpu().numpy()
+                candidate_img_global, text_global_expanded)
+            scores = scores.float().cpu().numpy()
 
             reranked_order = np.argsort(-scores)
-            reranked_predictions[q_idx, :max_rerank_k] = candidate_db_indices[reranked_order]
+            reranked_predictions[q_idx, :n_cand] = candidate_db_indices[reranked_order]
 
     return reranked_predictions
 
@@ -510,19 +529,16 @@ def main(args):
         # zeros, not empty: an unpopulated buffer should fail loudly
         vision_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")
         text_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")
-        all_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")
-        if need_local:
-            img_local_descs = np.zeros((len(test_ds), num_img_tokens, 768), dtype="float32")
-            text_local_desc = np.zeros((len(test_ds), num_text_tokens, model.encoder_dim),
-                                       dtype="float32")
-            text_tokens_all = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)
-        else:
-            img_local_descs = text_local_desc = text_tokens_all = None
+        all_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")        
+        img_local_descs = np.zeros((len(test_ds), num_img_tokens, model.encoder_dim), dtype="float32")
+        text_local_desc = np.zeros((len(test_ds), num_text_tokens, model.encoder_dim), dtype="float32")
+        text_tokens_all = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)       
+        text_attentions = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)       
 
         for images, indices, texts in tqdm(database_dataloader):
             encode_batch(model, args, images, texts, indices, all_descriptors,
                          vision_descriptors, text_descriptors, img_local_descs,
-                         text_local_desc, text_tokens_all)
+                         text_local_desc, text_tokens_all, text_attentions)
 
         logger.debug("Extracting queries descriptors for evaluation/testing")
         queries_subset_ds = Subset(
@@ -534,7 +550,7 @@ def main(args):
         for images, indices, texts in tqdm(queries_dataloader):
             encode_batch(model, args, images, texts, indices, all_descriptors,
                          vision_descriptors, text_descriptors, img_local_descs,
-                         text_local_desc, text_tokens_all)
+                         text_local_desc, text_tokens_all, text_attentions)
 
     if need_local:
         logger.info(f"local buffers | img {np.abs(img_local_descs).sum():.1f}  "

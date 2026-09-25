@@ -73,7 +73,7 @@ def parse_arguments():
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v3.json', help="path to mapping_path")
     parser.add_argument("--cls_adapter", type=int, default="0", help="classification adapter in loss , use or not")
     parser.add_argument("--filip", type=float, default="0", help="filip use or not")
-    parser.add_argument("--filip_queue", type=int, default="0", help="filip queue size")
+    parser.add_argument("--filip_queue", type=int, default="0", help="filip dqueue size")
     parser.add_argument("--global_token", type=int, default="1", help="global_token use or not")
     
     
