@@ -62,8 +62,8 @@ def encode_batch(model, args, images, texts, indices, all_descriptors,
             model.encode_single(images.to(args.device), texts)
         vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
         text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
-        img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
-        text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()        
+        #img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
+        #text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()        
         #text_tokens_all[indices.numpy(), :] = text_tokens.cpu().long().numpy()
         #text_attentions[indices.numpy(), :] = text_attention_mask.cpu().long().numpy()
 

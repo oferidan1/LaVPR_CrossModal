@@ -1,8 +1,36 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-import json
+
+"""
+Attention-weighted token supervision - the training-side counterpart to the
+deletion probe.
+
+The probe established, on two checkpoints, that last-layer EOT attention
+identifies the tokens the retrieval score depends on significantly better than
+corpus TF-IDF (p = 0.0005 at k=10, Bonferroni-corrected). This replaces the
+TF-IDF weighting in the SuperCLIP-style token/vocab loss with exactly the same
+quantity the probe measured, so the thing that was validated is the thing that
+gets trained.
+
+Two design points that are not optional:
+
+  STOP-GRADIENT. The target comes from the text tower. Without detach the model
+  can minimise the loss by moving the target, and the objective collapses. The
+  gradient must flow only into the prediction head and the vision tower.
+
+  INSTANCE-LEVEL. The target is the attention of the pair's OWN text, never a
+  same-place text from another view. Place-level supervision is correct for the
+  global metric loss and wrong here: forcing an image to predict the salient
+  words of a description written from a different viewpoint is wrong-label
+  supervision at exactly the granularity this loss operates on.
+
+weight_mode gives the ablation ladder measured by the probe:
+    'uniform'  - presence only, no weighting          (floor)
+    'idf'      - corpus prior                         (current baseline)
+    'attn'     - EOT attention                        (the proposal)
+    'idf_attn' - product of the two, renormalised     (does IDF add anything?)
+"""
 
 class GradientScaleFunction(torch.autograd.Function):
     @staticmethod
@@ -14,175 +42,219 @@ class GradientScaleFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         return grad_output * ctx.scale, None
 
+
+# ---------------------------------------------------------------------------
+# the attention target
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def eot_attention_weights(text_model, hidden_states, ids, mask,
+                          drop_specials=True):
+    """(B, L) last-layer EOT attention, head-averaged. Identical to what the
+    deletion probe scored, so the trained target is the measured quantity.
+
+    Computed from hidden_states rather than a second forward pass: the input to
+    the last encoder layer is hidden_states[-2], and `encode_text` already
+    requests output_hidden_states=True. Cost is one extra q/k matmul.
+
+    output_attentions=True is NOT used: transformers >= 4.36 defaults CLIP to
+    the SDPA path, whose fused kernel never materialises the attention matrix,
+    so that field silently comes back None.
+    """
+    layer = text_model.encoder.layers[-1]
+    x = layer.layer_norm1(hidden_states[-2])
+    attn = layer.self_attn
+    B, L, D = x.shape
+    nh = getattr(attn, 'num_heads', None) or text_model.config.num_attention_heads
+    hd = D // nh
+
+    q = attn.q_proj(x).view(B, L, nh, hd).transpose(1, 2)
+    k = attn.k_proj(x).view(B, L, nh, hd).transpose(1, 2)
+
+    b = torch.arange(B, device=ids.device)
+    eot = ids.argmax(dim=-1)                       # EOT = largest vocab id
+    logits = torch.einsum('bhd,bhld->bhl', q[b, :, eot], k) * (hd ** -0.5)
+
+    pos = torch.arange(L, device=ids.device).unsqueeze(0)
+    allow = (pos <= eot.unsqueeze(1)) & mask.bool()
+    if drop_specials:
+        # the EOT's attention to itself is an attention-sink artifact, and BOS
+        # carries no content. Both would otherwise dominate the target.
+        allow = allow & (pos != eot.unsqueeze(1)) & (pos != 0)
+
+    logits = logits.masked_fill(~allow.unsqueeze(1), float('-inf'))
+    w = torch.softmax(logits.float(), dim=-1).mean(dim=1)
+    return torch.nan_to_num(w, nan=0.0).detach()   # <- stop-gradient
+
+
 class TokensClassificationLoss(nn.Module):
+    """Predict, from the pooled VISION embedding, which words its own caption
+    emphasises.
+
+    The image has no access to the sentence, so it must infer from pixels which
+    properties a describer would foreground. That is a cross-modal transfer,
+    not self-distillation - which is what makes an attention target
+    non-circular here.
     """
-    Strict SuperCLIP token-grounding loss optimized for Full-Weight Fine-Tuning.
-    Protects the highly flexible ViT backbone from gradient flooding using internal scaling.
-    """
-    def __init__(self, vision_dim=768, vocab_size=49408, idf_path="dataset_token_idf.pt", pad_token_id=49407, grad_scale=0.05, cls_adapter=0):
+
+    def __init__(self,
+                 vision_dim=768,
+                 vocab_size=49408,
+                 idf_path=None,
+                 weight_mode='attn',        # uniform | idf | attn | idf_attn
+                 grad_scale=0.05,
+                 warmup_steps=200,
+                 target_temp=1.0,
+                 label_smooth=0.0,
+                 drop_specials=True):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.pad_token_id = pad_token_id
-        self.grad_scale = grad_scale # שומר על משקולות ה-ViT מפני הצפה
-        
-        self.classification_head = nn.Linear(vision_dim, vocab_size)
-        
-        self.cls_adapter = cls_adapter
-        if cls_adapter:
-            self.word_bridge_norm = nn.LayerNorm(vision_dim)
-            self.word_bridge_adapter = nn.Sequential(
-                nn.Linear(vision_dim, 256),
-                nn.GELU(),
-                nn.Linear(256, vision_dim)
-            )
-        
-        try:
-            idf_weights = torch.load(idf_path, weights_only=True)
-            idf_weights = torch.clamp(idf_weights, min=0.0)
-        except (FileNotFoundError, RuntimeError):
-            print(f"Warning: {idf_path} not found. Defaulting to uniform weights.")
-            idf_weights = torch.ones(vocab_size)
-            
-        self.register_buffer("idf_weights", idf_weights)
+        self.head = nn.Linear(vision_dim, vocab_size)
+        self.weight_mode = weight_mode
+        self.grad_scale = grad_scale
+        self.warmup_steps = warmup_steps
+        self.target_temp = target_temp
+        self.label_smooth = label_smooth
+        self.drop_specials = drop_specials
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
 
-    def forward(self, vision_embeddings, batch_text_ids):
-          
-        # Normalize and pass through the adapter to cushion backward gradients
-        if self.cls_adapter:
-            normalized_words = self.word_bridge_norm(vision_embeddings)
-            vision_embeddings = vision_embeddings + self.word_bridge_adapter(normalized_words)
-        # 🛡️ הגנה אקטיבית על ה-ViT באימון מלא: החלשת הגרדיאנטים הלשוניים ב-95%
-        scaled_vision_features = GradientScaleFunction.apply(vision_embeddings, self.grad_scale)
-        logits = self.classification_head(scaled_vision_features)
-        
-        B, C = logits.shape
-        targets = torch.zeros(B, C, dtype=logits.dtype, device=logits.device)
-        targets.scatter_(1, batch_text_ids, 1.0)
-        
-        # ניקוי קשיח של טוקני ה-Padding והמערכת
-        if self.pad_token_id < C:
-            targets[:, self.pad_token_id] = 0.0
-        if (self.pad_token_id - 1) < C:
-            targets[:, self.pad_token_id - 1] = 0.0
-            
-        # שקלול IDF סטטי ומיוצב
-        weighted_targets = targets * self.idf_weights.unsqueeze(0)
-        target_distribution = weighted_targets / (weighted_targets.sum(dim=1, keepdim=True) + 1e-6)
-        
-        # חישוב ה-Loss המקורי (Multinomial Cross Entropy over Log-Softmax)
-        log_probs = F.log_softmax(logits, dim=1)
-        classification_loss = -torch.sum(target_distribution * log_probs, dim=1)
-        
-        return classification_loss.mean()
-    
+        w = torch.ones(vocab_size)
+        if idf_path is not None:
+            try:
+                raw = torch.load(idf_path, weights_only=True).clamp(min=0.0)
+                raw = torch.log1p(raw)                # raw inverse frequency is
+                w = raw / raw.mean().clamp(min=1e-6)  # far too heavy-tailed
+            except (FileNotFoundError, RuntimeError):
+                print(f"TokensClassificationLoss: {idf_path} missing, uniform IDF.")
+        self.register_buffer("idf", w)
+
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+
+    # -- target -------------------------------------------------------------
+    def build_target(self, ids, mask, attn_w=None):
+        """(B, vocab) soft distribution over the pair's own caption."""
+        B, L = ids.shape
+        keep = mask.float().clone()
+        if self.drop_specials:
+            b = torch.arange(B, device=ids.device)
+            keep[:, 0] = 0.0
+            keep[b, ids.argmax(-1)] = 0.0
+
+        if self.weight_mode == 'uniform':
+            w = keep
+        elif self.weight_mode == 'idf':
+            w = self.idf[ids.clamp(0, self.idf.numel() - 1)].float() * keep
+        elif self.weight_mode == 'attn':
+            assert attn_w is not None, "weight_mode='attn' needs attn_w"
+            w = attn_w.float() * keep
+        elif self.weight_mode == 'idf_attn':
+            assert attn_w is not None, "weight_mode='idf_attn' needs attn_w"
+            w = self.idf[ids.clamp(0, self.idf.numel() - 1)].float() * attn_w.float() * keep
+        else:
+            raise ValueError(self.weight_mode)
+
+        if self.target_temp != 1.0:
+            # < 1 sharpens toward the peak token, > 1 flattens. Attention can be
+            # peaky or near-uniform depending on the sentence; this is the knob
+            # that makes the two weightings comparable in entropy.
+            w = w.clamp(min=0).pow(1.0 / self.target_temp) * keep
+
+        w = w / w.sum(-1, keepdim=True).clamp(min=1e-6)
+
+        tgt = torch.zeros(B, self.idf.numel(), device=ids.device, dtype=w.dtype)
+        # scatter_add, not scatter: a word appearing twice should carry twice
+        # the mass
+        tgt.scatter_add_(1, ids.clamp(0, self.idf.numel() - 1), w)
+        if self.label_smooth > 0:
+            tgt = (1 - self.label_smooth) * tgt + self.label_smooth / tgt.shape[1]
+        return tgt.detach()
+
+    # -- forward ------------------------------------------------------------
+    def forward(self, vision_embeddings, ids, mask, attn_w=None):
+        """
+        vision_embeddings : (B, vision_dim)  pooled patch tokens of the image
+        ids, mask         : (B, L)           the pair's OWN caption
+        attn_w            : (B, L)           from eot_attention_weights(), or None
+
+        The i-th image is supervised by the i-th caption. No place-level mask
+        anywhere in this function - that is deliberate.
+        """
+        if self.training:
+            self._step += 1
+            if self._step.item() <= self.warmup_steps:
+                # a random head otherwise floods the vision tower with noise
+                vision_embeddings = vision_embeddings.detach()
+            elif self.grad_scale < 1.0:
+                vision_embeddings = GradientScaleFunction.apply(
+                    vision_embeddings, self.grad_scale)
+
+        tgt = self.build_target(ids, mask, attn_w)
+        logp = F.log_softmax(self.head(vision_embeddings).float(), dim=-1)
+        loss = -(tgt * logp).sum(-1).mean()
+
+        with torch.no_grad():
+            # log this. if the two weightings differ wildly in entropy you are
+            # comparing target sharpness, not target quality - use target_temp
+            # to match them before believing the ablation.
+            self.last_target_entropy = -(tgt * (tgt + 1e-9).log()).sum(-1).mean()
+        return loss
 
 
-class HierarchicalTokensLoss(nn.Module):
+# ---------------------------------------------------------------------------
+# optional: the other direction
+# ---------------------------------------------------------------------------
+
+class PatchAttentionLoss(nn.Module):
+    """Predict, from the pooled TEXT embedding, which image regions the vision
+    CLS attends to.
+
+    The bidirectional half of the proposal. Same stop-gradient and
+    instance-level rules. Note this one is more fragile than the vocab
+    direction: ViTs develop high-norm 'register' patches in background regions
+    that absorb CLS attention regardless of content (Darcet et al.), so the
+    target carries a systematic, not random, bias. Ablate it separately and do
+    not bundle it with the vocab term.
     """
-    Strict SuperCLIP Hierarchical token-grounding loss optimized for Full-Weight Fine-Tuning.
-    Combines blended Hierarchical IDF (Image + Location) with dynamic Term Frequency (TF) scaling,
-    while protecting the highly flexible ViT backbone from gradient flooding.
-    """
-    def __init__(self, vision_dim=768, vocab_size=49408, 
-                 image_idf_path="datasets/gsv_cities_image_idf_clipb16.pt", 
-                 location_idf_path="datasets/gsv_cities_location_idf_clipb16.pt", 
-                 pad_token_id=49407, grad_scale=0.05,
-                 alpha=0.6, target_initial_loss=4.0):
+
+    def __init__(self, text_dim=512, num_patches=196, grad_scale=0.05,
+                 warmup_steps=200):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.pad_token_id = pad_token_id
-        self.grad_scale = grad_scale  # Protects ViT weights from gradient flooding
-        self.alpha = alpha
-        
-        # 1. Linear Classification Head hooked onto raw visual dimensions
-        self.classification_head = nn.Linear(vision_dim, vocab_size)
-        
-        # 2. Securely load precomputed tensors with fallback safety
-        try:
-            img_idf = torch.load(image_idf_path, weights_only=True).clamp(min=0.0)
-            loc_idf = torch.load(location_idf_path, weights_only=True).clamp(min=0.0)
-        except (FileNotFoundError, RuntimeError):
-            print(f"Warning: Hierarchical IDF files not found. Defaulting to uniform weights.")
-            img_idf = torch.ones(vocab_size)
-            loc_idf = torch.ones(vocab_size)
-        
-        # 3. Apply formula to precompute static global weights
-        combined_idf = (self.alpha * img_idf) + ((1.0 - self.alpha) * loc_idf)
-        self.register_buffer("global_idf", combined_idf)
-        
-        # 4. Dynamic scaling to balance auxiliary loss with ranking loss
-        initial_mean_loss = -torch.log(torch.tensor(0.5)).item()
-        self.loss_scale = target_initial_loss / initial_mean_loss
+        self.head = nn.Linear(text_dim, num_patches)
+        self.grad_scale = grad_scale
+        self.warmup_steps = warmup_steps
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
 
-    def forward(self, vision_embeddings, batch_text_ids):
-        """
-        Args:
-            vision_embeddings (Tensor): Unprojected pooled ViT features [Batch, vision_dim]
-            batch_text_ids (Tensor): Target caption token IDs from tokenizer [Batch, Seq_Len]
-        """
-        batch_size = vision_embeddings.size(0)
-        device = vision_embeddings.device
-        
-        # 🛡️ Active ViT Backbone Protection: Suppress linguistic gradients during full fine-tuning
-        scaled_vision_features = GradientScaleFunction.apply(vision_embeddings, self.grad_scale)
-        
-        # =====================================================================
-        # 1. VECTORIZED TERM FREQUENCIES (TF) CALCULATION
-        # =====================================================================
-        # Build an explicit mask for invalid/padding tokens based on your original rules
-        invalid_mask = (batch_text_ids == 0) | \
-                       (batch_text_ids == self.pad_token_id) | \
-                       (batch_text_ids == (self.pad_token_id - 1))
-        
-        # Prepare updates: set step increments to 0 for padding tokens
-        increments = torch.ones_like(batch_text_ids, dtype=torch.float32, device=device)
-        increments[invalid_mask] = 0.0
-        
-        # Prevent out-of-bounds errors on target index scatter mapping
-        safe_text_ids = batch_text_ids.clamp(0, self.vocab_size - 1)
-        
-        # Compute dynamic raw counts purely in parallel
-        tokens_count = torch.zeros(batch_size, self.vocab_size, device=device)
-        tokens_count.scatter_add_(1, safe_text_ids, increments)
-        
-        # Apply Augmented TF scaling across the matrix row-wise
-        max_tf = tokens_count.max(dim=1, keepdim=True).values
-        max_tf = torch.where(max_tf > 0, max_tf, torch.ones_like(max_tf)) # Guard against div-by-zero
-        
-        tf_matrix = torch.where(
-            tokens_count > 0, 
-            0.5 + 0.5 * (tokens_count / max_tf), 
-            torch.zeros_like(tokens_count)
-        )
+    @staticmethod
+    @torch.no_grad()
+    def cls_attention(vision_model, hidden_states, has_cls=True):
+        """(B, num_patches) vision CLS attention over patches, head-averaged."""
+        layer = vision_model.encoder.layers[-1]
+        x = layer.layer_norm1(hidden_states[-2])
+        attn = layer.self_attn
+        B, L, D = x.shape
+        nh = getattr(attn, 'num_heads', None) or vision_model.config.num_attention_heads
+        hd = D // nh
+        q = attn.q_proj(x).view(B, L, nh, hd).transpose(1, 2)
+        k = attn.k_proj(x).view(B, L, nh, hd).transpose(1, 2)
+        cls = 0 if has_cls else None
+        if cls is None:
+            raise ValueError("no CLS token; use mean pooling instead")
+        logits = torch.einsum('bhd,bhld->bhl', q[:, :, cls], k) * (hd ** -0.5)
+        logits = logits[..., 1:]                    # drop CLS self-attention
+        return torch.softmax(logits.float(), -1).mean(1).detach()
 
-        # =====================================================================
-        # 2. COMBINE DYNAMIC TF WITH THE BLENDED HIERARCHICAL IDF
-        # =====================================================================
-        weighted_targets = tf_matrix * self.global_idf.unsqueeze(0)
-        
-        # Double-check rigid cleanup of system token frequencies 
-        if self.pad_token_id < self.vocab_size:
-            weighted_targets[:, self.pad_token_id] = 0.0
-        if (self.pad_token_id - 1) < self.vocab_size:
-            weighted_targets[:, self.pad_token_id - 1] = 0.0
-            
-        # Row-normalize to build an uncollapsible sparse target distribution
-        target_distribution = weighted_targets / (weighted_targets.sum(dim=1, keepdim=True) + 1e-6)
-        
-        # =====================================================================
-        # 3. BINARY CROSS ENTROPY LOSS SETUP WITH GRADIENT CONTROL
-        # =====================================================================
-        vision_logits = self.classification_head(scaled_vision_features)
-        
-        classification_loss = F.binary_cross_entropy_with_logits(
-            vision_logits, 
-            target_distribution, 
-            reduction='none'
-        )
-        
-        # Average across vocabulary, then average across batch, scale dynamically
-        mean_vocab_loss = classification_loss.mean(dim=1).mean()
-        return mean_vocab_loss * self.loss_scale
+    def forward(self, text_embeddings, patch_attn):
+        if self.training:
+            self._step += 1
+            if self._step.item() <= self.warmup_steps:
+                text_embeddings = text_embeddings.detach()
+            elif self.grad_scale < 1.0:
+                text_embeddings = GradientScaleFunction.apply(
+                    text_embeddings, self.grad_scale)
+        logp = F.log_softmax(self.head(text_embeddings).float(), dim=-1)
+        return -(patch_attn * logp).sum(-1).mean()
 
 
 class VocabClassificationLoss(nn.Module):

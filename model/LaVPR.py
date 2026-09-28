@@ -15,7 +15,7 @@ import open_clip
 from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
 from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
-from model.tokens_classify_loss import TokensClassificationLoss, HierarchicalTokensLoss, VocabClassificationLoss, FILIPLoss
+from model.tokens_classify_loss import TokensClassificationLoss, eot_attention_weights, VocabClassificationLoss, FILIPLoss
 from model.pooling_cm import TextGatedAttentionPooler, GeMPooling1D, AttentionGatedPatchPooler, SpatialLayoutPooler, MultiLayerAttentionTextPooler, ResidualTextPooler
 
 
@@ -63,14 +63,10 @@ class LaVPR(pl.LightningModule):
                 cross_modal=0,
                 lora_all_linear=False,
                 lora_target_modules=None,
-                lora_r=64,
-                agg_type=0,
-                ot_loss=0.0,
+                lora_r=64,                
                 unimodal_loss=0.0,
                 pos_loss=0,
-                neg_loss=0,
-                latent_mixup=0.0,
-                dynamic_gamma=0,
+                neg_loss=0,                                
                 tokens_idf_loss=0.0,
                 tokens_idf_file=None,
                 idf_grad_scale=0.05,
@@ -79,7 +75,6 @@ class LaVPR(pl.LightningModule):
                 vocab_path=None,
                 image_idf_path=None,
                 vocab_grad_scale=0.05,
-                cls_adapter=0,
                 # ----- FILIP late interaction
                 filip=0.0,
                 filip_queue=0,
@@ -87,6 +82,8 @@ class LaVPR(pl.LightningModule):
                 filip_use_idf=True,
                 global_token=True,       # False + filip>0 -> FILIP-only retrieval
                 filip_db_chunk=256,      # gallery chunk size for val-time MaxSim
+                loss_direction=0,
+                token_loss_type=0
                  ):
         super().__init__()
 
@@ -119,22 +116,16 @@ class LaVPR(pl.LightningModule):
         else:
             self.loss_fn = utils.get_loss(loss_name)
 
-        if ot_loss:
-            self.local_ot_loss = LocalOTLoss()
         self.miner = utils.get_miner(miner_name, miner_margin)
         self.batch_acc = []
 
         self.my_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.embeds_dim = embeds_dim
-        self.train_vlm = train_vlm
-        self.agg_type = agg_type
-        self.ot_loss = ot_loss
+        self.train_vlm = train_vlm        
         self.unimodal_loss = unimodal_loss
         self.pos_loss = pos_loss
-        self.neg_loss = neg_loss
-        self.latent_mixup = latent_mixup
-        self.dynamic_gamma = dynamic_gamma
+        self.neg_loss = neg_loss                
         self.tokens_idf_loss = tokens_idf_loss
         self.tokens_idf_file = tokens_idf_file
         self.idf_pooling = idf_pooling
@@ -143,19 +134,18 @@ class LaVPR(pl.LightningModule):
         self.image_idf_path = image_idf_path
         self.vocab_idf_loss = vocab_idf_loss
         self.vocab_grad_scale = vocab_grad_scale
-        self.cls_adapter = cls_adapter
+        self.loss_direction = loss_direction
+        self.token_loss_type = token_loss_type
 
         # SigLIP's vision tower uses attention pooling and has NO CLS token,
         # every other backbone here prepends one at index 0.
         self.has_cls = 'siglip' not in model_name
 
         if self.tokens_idf_loss == 1:
-            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, cls_adapter=cls_adapter)
-        elif self.tokens_idf_loss == 2:
-            self.tokens_classification_loss = HierarchicalTokensLoss()
-
+            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
+       
         if self.vocab_idf_loss:
-            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=768, vocab_path=vocab_path, image_idf_path=image_idf_path, grad_scale=vocab_grad_scale, cls_adapter=cls_adapter)
+            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=768, vocab_path=vocab_path, image_idf_path=image_idf_path, grad_scale=vocab_grad_scale)
 
         # ---- FILIP late interaction
         self.filip = filip
@@ -262,7 +252,9 @@ class LaVPR(pl.LightningModule):
 
     def get_img_patches(self, img_local):
         """Strip the CLS token when the backbone has one."""
-        return img_local[:, 1:] if self.has_cls else img_local
+        #h = self.vlm_encoder.vision_model.post_layernorm(img_local)        
+        h = img_local
+        return h[:, 1:] if self.has_cls else h
 
     def filip_tokens(self, img_local, text_local, t_mask, text_tokens):
         """Project + L2-normalise per-token features into the FILIP joint space.
@@ -286,145 +278,88 @@ class LaVPR(pl.LightningModule):
         img_all_layers = None
         if 'blip' in self.model_name:
             img_local = self.vlm_encoder.encode_image(img)
-            img_embeds = img_local[:, 0]
+            img_embeds = img_local[:,0]
         elif 'llm2clip' in self.model_name:
             img_output = self.vlm_encoder.vision_model(pixel_values=img.to(self.vlm_encoder.dtype), output_hidden_states=True)
             img_local = self.vlm_encoder.visual_projection(img_output.last_hidden_state)
             img_embeds = self.vlm_encoder.visual_projection(img_output.pooler_output)
             img_all_layers = img_output.hidden_states
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
-        elif 'clip' in self.model_name:
-            vision_outputs = self.vlm_encoder.vision_model(
-                pixel_values=img,
-                output_hidden_states=True
-            )
+        elif 'clip' in self.model_name:            
+            vision_outputs = self.vlm_encoder.vision_model(pixel_values=img, output_hidden_states=True)
             img_local = vision_outputs.last_hidden_state
             img_all_layers = vision_outputs.hidden_states
             pooled_output = vision_outputs.pooler_output
-            if hasattr(self.vlm_encoder, 'visual_projection'):
-                img_embeds = self.vlm_encoder.visual_projection(pooled_output)
-            else:
-                img_embeds = pooled_output
-            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)
-
+            img_embeds = self.vlm_encoder.visual_projection(pooled_output)
+            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)            
         elif 'siglip' in self.model_name:
-            vision_outputs = self.vlm_encoder.vision_model(
-                pixel_values=img,
-                output_hidden_states=True
-            )
-            img_local = vision_outputs.last_hidden_state
-            img_all_layers = vision_outputs.hidden_states
-            img_embeds = self.vlm_encoder.vision_model.head(vision_outputs.last_hidden_state)
-            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)
-
-        elif 'eva' in self.model_name:
-            img_local = self.vlm_encoder.visual.trunk.forward_features(img)
-            if isinstance(img_local, dict):
-                img_local = img_local['x']
-
-            img_embeds = img_local[:, 0, :]
-            if hasattr(self.vlm_encoder.visual.trunk, 'norm') and not isinstance(img_local, dict):
-                img_embeds = self.vlm_encoder.visual.trunk.norm(img_embeds)
-            img_embeds = self.vlm_encoder.visual.trunk.head(img_embeds)
-            img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
-
+            img_output = self.vlm_encoder.get_image_features(pixel_values=img)
+            img_local = img_output.last_hidden_state            
+            img_embeds = img_output.pooler_output
+        elif 'eva' in self.model_name:            
+            img_embeds = self.vlm_encoder.encode_image(img)
+            img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
         return img_embeds, img_local, img_all_layers
 
     def encode_text(self, text):
-        text_embeds = None
-        attention_mask = None
-        text_local = None
-        text_all_layers = None
-
-        if 'blip' in self.model_name:
-            text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-            text_tokens = text_inputs.input_ids.to(self.my_device)
-            attention_mask = text_inputs['attention_mask'].to(self.my_device)
-            text_local = self.vlm_encoder.encode_text(input_ids=text_tokens, attention_mask=attention_mask)
-            text_embeds = text_local[:, 0]
-        elif 'llm2clip' in self.model_name:
-            text_tokens = self.llm_encoder.encode(text, convert_to_tensor=True).to(self.device)
-            text_embeds = self.vlm_encoder.get_text_features(text_tokens.to(self.vlm_encoder.dtype)).float()
-            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-        elif 'clip' in self.model_name:
-            text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
-            text_tokens = text_inputs.input_ids.to(self.my_device)
-            attention_mask = None
-            if 'attention_mask' in text_inputs:
-                attention_mask = text_inputs['attention_mask'].to(self.my_device)
-
-            text_outputs = self.vlm_encoder.text_model(
-                input_ids=text_tokens,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            )
-            text_local = text_outputs.last_hidden_state
-            text_all_layers = text_outputs.hidden_states
-            pooled_text = text_outputs.pooler_output
-            if hasattr(self.vlm_encoder, 'text_projection'):
-                text_embeds = self.vlm_encoder.text_projection(pooled_text)
-            else:
-                text_embeds = pooled_text
-            text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
-
-        elif 'siglip' in self.model_name:
-            text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
-            text_tokens = text_inputs.input_ids.to(self.my_device)
-            attention_mask = None
-            if 'attention_mask' in text_inputs:
-                attention_mask = text_inputs['attention_mask'].to(self.my_device)
-
-            text_outputs = self.vlm_encoder.text_model(
-                input_ids=text_tokens,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            )
-            text_local = text_outputs.last_hidden_state
-            text_embeds = text_outputs.pooler_output
-            text_all_layers = text_outputs.hidden_states
-            text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
-
-        elif 'eva' in self.model_name:
-            text_tokens = self.tokenizer(text).to(self.my_device)
-            text_embeds = self.vlm_encoder.encode_text(text_tokens)
-
-            x = self.vlm_encoder.text.token_embedding(text_tokens)
-            x = x + self.vlm_encoder.text.positional_embedding
-
-            _, intermediates = self.vlm_encoder.text.transformer.forward_intermediates(
-                x=x,
-                attn_mask=self.vlm_encoder.text.attn_mask,
-                indices=[-1]
-            )
-
-            text_local = intermediates[-1]
-            # open_clip transformers are [Sequence, Batch, Dim]; normalise to
-            # [Batch, Sequence, Dim] so downstream losses see the same layout.
-            if text_local.shape[0] != text_tokens.shape[0] and text_local.shape[1] == text_tokens.shape[0]:
-                text_local = text_local.permute(1, 0, 2).contiguous()
-            text_local = self.vlm_encoder.text.ln_final(text_local)
-            text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
-
-        return text_embeds, text_local, attention_mask, text_tokens, text_all_layers
-
+           text_embeds = None
+           attention_mask = None
+           text_local = None
+           text_all_layers = None
+           text_attn_w = None
+   
+           if 'blip' in self.model_name:
+               text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+               text_tokens = text_inputs.input_ids.to(self.device)
+               attention_mask = text_inputs['attention_mask'].to(self.device)                
+               text_local = self.vlm_encoder.encode_text(input_ids=text_tokens, attention_mask=attention_mask)    
+               text_embeds= text_local[:, 0]        
+           elif 'llm2clip' in self.model_name:
+               text_tokens = self.llm_encoder.encode(text, convert_to_tensor=True).to(self.device)
+               text_embeds = self.vlm_encoder.get_text_features(text_tokens.to(self.vlm_encoder.dtype)).float()
+               text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+           elif 'clip' in self.model_name:        
+               text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
+               text_tokens = text_inputs.input_ids.to(self.device)
+               attention_mask = None
+               if 'attention_mask' in text_inputs:
+                   attention_mask = text_inputs['attention_mask'].to(self.device)                
+               text_outputs = self.vlm_encoder.text_model(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)                        
+               text_local = text_outputs.last_hidden_state
+               text_all_layers = text_outputs.hidden_states                         
+               pooled_text = text_outputs.pooler_output                                     
+               text_embeds = self.vlm_encoder.text_projection(pooled_text)
+               text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+               text_attn_w = eot_attention_weights(self.vlm_encoder.text_model, text_outputs.hidden_states, text_tokens, attention_mask)
+           elif 'siglip' in self.model_name:
+               text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
+               text_tokens = text_inputs.input_ids.to(self.device)
+               attention_mask = None
+               if 'attention_mask' in text_inputs:
+                   attention_mask = text_inputs['attention_mask'].to(self.device)                
+               text_output = self.vlm_encoder.get_text_features(input_ids=text_tokens, attention_mask=attention_mask)
+               text_local = text_output.last_hidden_state
+               text_embeds = text_output.pooler_output                
+           elif 'eva' in self.model_name:
+               text_tokens = self.tokenizer(text).to(self.device)            
+               text_embeds = self.vlm_encoder.encode_text(text_tokens)    
+               text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)        
+           
+           return text_embeds, text_local, attention_mask, text_tokens, text_all_layers, text_attn_w
+       
     # the forward pass of the lightning model
     def forward(self, img, text, flip_desc=None, color_change_desc=None, neg_attr_desc=None, concept_ids=None, labels=None):
         text_flip_embeds = None
         text_neg_attr_embeds = None
 
-        text_flip_local = None
-        text_neg_local = None
-        attention_mask_flip = None
-        attention_mask_neg = None
-
         img_embeds, img_local, img_all_layers = self.encode_image(img)
-        text_embeds, text_local, attention_mask, text_tokens, text_all_layers = self.encode_text(text)
+        text_embeds, text_local, attention_mask, text_tokens, text_all_layers, text_attn_w = self.encode_text(text)
         if self.pos_loss:
             if flip_desc is not None:
-                text_flip_embeds, text_flip_local, attention_mask_flip, text_flip_tokens, text_flip_all_layers = self.encode_text(flip_desc)
+                text_flip_embeds, text_flip_local, attention_mask_flip, text_flip_tokens, text_flip_all_layers, _ = self.encode_text(flip_desc)
         if self.neg_loss:
             if neg_attr_desc is not None:
-                text_neg_attr_embeds, text_neg_local, attention_mask_neg, text_neg_tokens, text_neg_all_layers = self.encode_text(neg_attr_desc)
+                text_neg_attr_embeds, text_neg_local, attention_mask_neg, text_neg_tokens, text_neg_all_layers, _ = self.encode_text(neg_attr_desc)
 
         tidf_loss = 0.0
         filip_loss = 0.0
@@ -435,13 +370,17 @@ class LaVPR(pl.LightningModule):
         if img_patches is not None:
             if self.idf_pooling == 'mean':
                 img_embeds_pooled = img_patches.mean(dim=1)
+            elif self.idf_pooling == 'max':
+                img_embeds_pooled = img_patches.max(dim=1).values
+            elif self.idf_pooling == 'cls':
+                img_embeds_pooled = img_local[:,0,:]
             else:
                 img_embeds_pooled = self.idf_pooling_layer(img_patches)
         else:
             img_embeds_pooled = None
 
         if self.tokens_idf_loss:
-            tidf_loss = self.tokens_idf_loss * self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, batch_text_ids=text_tokens)
+            tidf_loss = self.tokens_idf_loss * self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, ids=text_tokens, mask=attention_mask, attn_w=text_attn_w)
 
         if self.vocab_idf_loss and concept_ids is not None:
             img_features = img_embeds_pooled
@@ -501,18 +440,7 @@ class LaVPR(pl.LightningModule):
             self.batch_acc.append(0.0)
             self.log('filip', float(filip_loss), prog_bar=True, logger=True)
             self.log('b_acc', 0.0, prog_bar=True, logger=True)
-            return loss
-
-        if self.cross_modal == 5:
-            desc_all = torch.cat([img_embeds, text_embeds], dim=0)
-            labels_all = torch.cat([labels, labels], dim=0)
-            miner_outputs = self.miner(desc_all, labels_all)
-            loss = self.loss_fn(desc_all, labels_all, indices_tuple=miner_outputs)
-            nb_samples = desc_all.shape[0]
-            nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
-            batch_acc = 1.0 - (nb_mined / nb_samples)
-
-            loss = loss + self.filip * filip_loss
+            return loss       
 
         elif self.miner is not None:
             text_labels = labels.clone()
@@ -527,37 +455,22 @@ class LaVPR(pl.LightningModule):
                 text_labels = torch.cat([text_labels, labels + 10**8], dim=0)
 
             # T2I: text anchors, image refs
-            miner_outputs = self.miner(text_embeds_all, text_labels, ref_emb=img_embeds, ref_labels=labels)
-
-            if self.dynamic_gamma:
-                with torch.no_grad():
-                    sim_matrix = torch.matmul(img_embeds, text_embeds_all.T)
-                    pos_mask = (labels.unsqueeze(1) == text_labels.unsqueeze(0))
-                    pos_similarities = sim_matrix[pos_mask]
-
-                    if pos_similarities.numel() > 0:
-                        mean_pos_sim = pos_similarities.mean().item()
-                        self.loss_fn.base = max(0.35, min(mean_pos_sim, 0.45))
-                    else:
-                        self.loss_fn.base = 0.4
-
-            loss = self.loss_fn(text_embeds_all, text_labels, indices_tuple=miner_outputs,
-                                ref_emb=img_embeds, ref_labels=labels)
-
-            if self.latent_mixup > 0:
-                a1, p, a2, n = miner_outputs
-                if len(a2) > 0:
-                    BS = img_embeds.shape[0]
-                    # anchors (a2) index text_embeds_all, refs (n) index img_embeds
-                    Vt = text_embeds_all[a2]
-                    Vi_neg = img_embeds[n]
-                    Vi_pos = img_embeds[a2 % BS]
-                    alpha = torch.rand(len(a2), 1, device=img_embeds.device)
-                    V_prime = torch.nn.functional.normalize(alpha * Vi_pos + (1 - alpha) * Vi_neg, p=2, dim=-1)
-                    score1 = (Vt * V_prime).sum(dim=-1)
-                    score2 = alpha.squeeze(-1) * (Vt * Vi_pos).sum(dim=-1) + (1 - alpha.squeeze(-1)) * (Vt * Vi_neg).sum(dim=-1)
-                    mixup_loss = torch.nn.functional.mse_loss(score1, score2)
-                    loss = loss + self.latent_mixup * mixup_loss
+            if self.loss_direction==1:
+                miner_outputs = self.miner(text_embeds_all, text_labels, ref_emb=img_embeds, ref_labels=labels)
+                loss = self.loss_fn(text_embeds_all, text_labels, indices_tuple=miner_outputs, ref_emb=img_embeds, ref_labels=labels)
+                nb_samples = text_embeds_all.shape[0]
+            elif self.loss_direction==2:
+                miner_outputs = self.miner(text_embeds_all, text_labels, ref_emb=img_embeds, ref_labels=labels)
+                loss_t2i = self.loss_fn(text_embeds_all, text_labels, indices_tuple=miner_outputs, ref_emb=img_embeds, ref_labels=labels)
+                nb_samples = text_embeds_all.shape[0]                    
+                miner_outputs = self.miner(img_embeds, labels, ref_emb=text_embeds_all, ref_labels=text_labels)                      
+                loss_i2t = self.loss_fn(img_embeds, labels, indices_tuple=miner_outputs, ref_emb=text_embeds_all, ref_labels=text_labels)                      
+                nb_samples = img_embeds.shape[0]
+                loss = (loss_t2i + loss_i2t)/2
+            else:
+                miner_outputs = self.miner(img_embeds, labels, ref_emb=text_embeds_all, ref_labels=text_labels)                      
+                loss = self.loss_fn(img_embeds, labels, indices_tuple=miner_outputs, ref_emb=text_embeds_all, ref_labels=text_labels)                      
+                nb_samples = img_embeds.shape[0]
 
             if self.unimodal_loss > 0:
                 miner_outputs_txt = self.miner(text_embeds_all, text_labels)
@@ -565,8 +478,7 @@ class LaVPR(pl.LightningModule):
                 loss = loss + self.unimodal_loss * txt_loss
 
             loss = loss + tidf_loss + self.filip * filip_loss
-
-            nb_samples = text_embeds_all.shape[0]
+            
             nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
             batch_acc = 1.0 - (nb_mined / nb_samples)
 

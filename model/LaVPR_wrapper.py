@@ -60,7 +60,6 @@ class LaVPR_wrapper():
                     lora_all_linear=args.lora_all_linear,
                     lora_target_modules=args.lora_target_modules,
                     lora_r=args.lora_r,                  
-                    agg_type=args.agg_type,     
                     filip=args.reranker_filip or args.filip_retrieval   
                 )
 

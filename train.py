@@ -47,10 +47,7 @@ def parse_arguments():
     parser.add_argument("--lora_target_modules", nargs='+', default=["q_proj", "v_proj"], help="when not lora_all_linear, lora target modules")    
     #parser.add_argument("--lora_target_modules", nargs='+', default=["vision_model.encoder.layers.*.self_attn.q_proj", "vision_model.encoder.layers.*.self_attn.v_proj"], help="when not lora_all_linear, lora target modules")        
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
-    parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")
-    parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
-    parser.add_argument("--ot_loss", type=float, default="0", help="multplier for ot loss, 0=no ot loss, >0 use ot loss")
-    parser.add_argument("--latent_mixup", type=float, default="0", help="multplier for latent_mixup loss, 0=no latent_mixup loss, >0 use latent_mixup loss")
+    parser.add_argument("--img_per_place", type=int, default=4, help="number of images per place")    
     parser.add_argument("--unimodal_loss", type=float, default="0", help="multplier for unimodal loss, 0=no unimodal loss, >0 use unimodal loss")
     parser.add_argument("--pos_loss", type=int, default="0", help="multplier for positive loss, 0=no positive loss, >0 use positive loss")
     parser.add_argument("--neg_loss", type=int, default="0", help="multplier for negative loss, 0=no negative loss, >0 use negative loss")
@@ -58,23 +55,23 @@ def parse_arguments():
     parser.add_argument("--lr", type=float, default="0.00002", help="learning rate")
     parser.add_argument("--lr_mult", type=float, default="0.5", help="learning rate")    
     #parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6,8], help="milestones for lr scheduler seperated by space")
-    parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")
-    parser.add_argument("--dynamic_gamma", type=int, default="0", help="dynamic gamma or not")
+    parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
     parser.add_argument("--resume", type=str, default=None, help="resume training from path")
     parser.add_argument("--tokens_idf_loss", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
     #parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_token_idf_siglipv2.pt', help="path to tokens idf.pt")
     parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")
-    parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial")
+    parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial, max, cls")
+    parser.add_argument("--token_loss_type", type=str, default="idf", help="idf, uniform, attn, idf_attn")    
     parser.add_argument("--vocab_idf_loss", type=float, default="0", help="multplier for vocab idf loss, 0=no loss, >0 use loss")
     parser.add_argument("--vocab_grad_scale", type=float, default="0.05", help="idf grad scale")
     parser.add_argument("--vocab_path", type=str, default='datasets/gsv_cities_scene_graph_vocab_v3.json', help="path to vocab path")
     parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v3.pt', help="path to image_idf_path")
-    parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v3.json', help="path to mapping_path")
-    parser.add_argument("--cls_adapter", type=int, default="0", help="classification adapter in loss , use or not")
+    parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v3.json', help="path to mapping_path")    
     parser.add_argument("--filip", type=float, default="0", help="filip use or not")
     parser.add_argument("--filip_queue", type=int, default="0", help="filip dqueue size")
     parser.add_argument("--global_token", type=int, default="1", help="global_token use or not")
+    parser.add_argument("--loss_direction", type=int, default="0", help="0=i2t, 1=t2i, 2=both")    
     
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
@@ -147,13 +144,9 @@ if __name__ == '__main__':
         lora_all_linear=args.lora_all_linear,
         lora_target_modules=args.lora_target_modules,
         lora_r=args.lora_r,        
-        agg_type=args.agg_type,
-        ot_loss=args.ot_loss,
         unimodal_loss=args.unimodal_loss,
         pos_loss=args.pos_loss,
-        neg_loss=args.neg_loss,
-        latent_mixup=args.latent_mixup,
-        dynamic_gamma=args.dynamic_gamma,
+        neg_loss=args.neg_loss,                
         tokens_idf_loss=args.tokens_idf_loss,
         tokens_idf_file=args.tokens_idf_file,
         idf_grad_scale=args.idf_grad_scale,
@@ -162,9 +155,10 @@ if __name__ == '__main__':
         image_idf_path=args.image_idf_path,
         vocab_grad_scale=args.vocab_grad_scale,
         vocab_idf_loss=args.vocab_idf_loss,
-        cls_adapter=args.cls_adapter,
         filip=args.filip,
-        filip_queue=args.filip_queue
+        filip_queue=args.filip_queue,
+        loss_direction=args.loss_direction,
+        token_loss_type=args.token_loss_type
     )
     
     if args.resume is not None:
