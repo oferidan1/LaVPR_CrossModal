@@ -18,7 +18,8 @@ def parse_arguments():
     # parser.add_argument("--image_size", type=int, default="384", help="image size to vpr")
     # parser.add_argument("--embeds_dim", type=int, default=256, help="dimension of the embeddings")    
     # parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")            
-    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
+    #parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16")            
+    parser.add_argument("--model_name", type=str, default="creative-graphic-design/LongCLIP-B")            
     #parser.add_argument("--model_name", type=str, default="EVA02-B-16")            
     parser.add_argument("--image_size", type=int, default="224", help="image size to vpr")
     parser.add_argument("--embeds_dim", type=int, default=512, help="dimension of the embeddings")    
@@ -120,7 +121,7 @@ if __name__ == '__main__':
 
     model = LaVPR(
         #---- Encoder
-        model_name=args.model_name.lower(),        
+        model_name=args.model_name,        
         embeds_dim=args.embeds_dim,        
         #---- Train hyperparameters        
         lr=args.lr, # 0.0002 for adam, 0.05 or sgd (needs to change according to batch size)        

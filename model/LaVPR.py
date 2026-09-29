@@ -88,7 +88,7 @@ class LaVPR(pl.LightningModule):
                  ):
         super().__init__()
 
-        self.model_name = model_name
+        self.model_name = model_name.lower()
 
         self.lr = lr
         self.optimizer = optimizer
@@ -130,7 +130,7 @@ class LaVPR(pl.LightningModule):
         self.tokens_idf_loss = tokens_idf_loss
         self.tokens_idf_file = tokens_idf_file
         self.idf_pooling = idf_pooling
-        vocab_size = self.get_vocab_size(model_name)
+        vocab_size = self.get_vocab_size(self.model_name)
         self.vocab_path = vocab_path
         self.image_idf_path = image_idf_path
         self.vocab_idf_loss = vocab_idf_loss
@@ -142,7 +142,7 @@ class LaVPR(pl.LightningModule):
         # SigLIP's vision tower uses attention pooling and has NO CLS token,
         # every other backbone here prepends one at index 0.
         self.has_cls = 'siglip' not in model_name
-        v_dim, t_dim = get_local_dims(model_name)
+        v_dim, t_dim = get_local_dims(self.model_name)
 
         if self.tokens_idf_loss == 1:
             self.tokens_classification_loss = TokensClassificationLoss(vision_dim=v_dim, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
@@ -187,20 +187,24 @@ class LaVPR(pl.LightningModule):
             self.filip_loss.reset_parameters()
 
         # initialize vlm encoder
-        if 'blip' in model_name:
+        if 'blip' in self.model_name:
             self.vlm_encoder = BlipForImageTextRetrievalWrapper.from_pretrained(model_name)
             self.processor = BlipProcessor.from_pretrained(model_name)
-        elif 'llm2clip' in model_name:
+        elif 'llm2clip' in self.model_name:
             from llm2clip.llm2clip import load_llm2clip
             self.vlm_encoder, self.llm_encoder, self.processor = load_llm2clip()
             self.max_text_length = 512
-        elif 'clip' in model_name or 'siglip' in model_name:
+        elif 'clip' in self.model_name:
             self.max_text_length = 77
-            if 'siglip' in model_name:
-                self.max_text_length = 64
-            self.vlm_encoder = AutoModel.from_pretrained(model_name)
-            self.processor = AutoProcessor.from_pretrained(model_name)
-        elif 'eva' in model_name:
+            if 'LongCLIP' in model_name:
+                self.max_text_length = 248
+            self.vlm_encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        if 'siglip' in self.model_name:
+            self.max_text_length = 64
+            self.vlm_encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        elif 'eva' in self.model_name:
             self.vlm_encoder, _, self.processor = open_clip.create_model_and_transforms(model_name.upper(), pretrained='merged2b_s8b_b131k')
             self.tokenizer = open_clip.get_tokenizer(model_name)
 
@@ -223,7 +227,7 @@ class LaVPR(pl.LightningModule):
                 bias="none",
             )
 
-            if 'llm2clip' in model_name:
+            if 'llm2clip' in self.model_name:
                 self.llm_encoder = get_peft_model(self.llm_encoder, lora_config)
             else:
                 self.vlm_encoder = get_peft_model(self.vlm_encoder, lora_config)
@@ -293,8 +297,8 @@ class LaVPR(pl.LightningModule):
             img_all_layers = vision_outputs.hidden_states
             pooled_output = vision_outputs.pooler_output
             img_embeds = self.vlm_encoder.visual_projection(pooled_output)
-            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)            
-            img_attn_w = cls_attention_weights(self.vlm_encoder.vision_model, vision_outputs.hidden_states)
+            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)                        
+            #img_attn_w = cls_attention_weights(self.vlm_encoder.vision_model, vision_outputs.hidden_states)
         elif 'siglip' in self.model_name:
             img_output = self.vlm_encoder.get_image_features(pixel_values=img)
             img_local = img_output.last_hidden_state            
@@ -321,6 +325,30 @@ class LaVPR(pl.LightningModule):
                text_tokens = self.llm_encoder.encode(text, convert_to_tensor=True).to(self.device)
                text_embeds = self.vlm_encoder.get_text_features(text_tokens.to(self.vlm_encoder.dtype)).float()
                text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+           elif 'longclip' in self.model_name:        
+                text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
+                text_tokens = text_inputs['input_ids'].to(self.device)
+                attention_mask = None
+                if 'attention_mask' in text_inputs:
+                    attention_mask = text_inputs['attention_mask'].to(self.device)                
+                text_outputs = self.vlm_encoder.text_model(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)                        
+                text_local = text_outputs.last_hidden_state
+                text_all_layers = text_outputs.hidden_states                         
+                pooled_text = text_outputs.pooler_output                                     
+                text_embeds = self.vlm_encoder.text_projection(pooled_text)
+                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)                    
+           elif 'longclip' in self.model_name:        
+                text_inputs = self.processor(text=text, return_tensors="pt", padding="max_length", truncation=True, max_length=self.max_text_length)
+                text_tokens = text_inputs.input_ids.to(self.device)
+                attention_mask = None
+                if 'attention_mask' in text_inputs:
+                    attention_mask = text_inputs['attention_mask'].to(self.device)                
+                text_outputs = self.vlm_encoder.text_model(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)                        
+                text_local = text_outputs.last_hidden_state
+                text_all_layers = text_outputs.hidden_states                         
+                pooled_text = text_outputs.pooler_output                                     
+                text_embeds = self.vlm_encoder.text_projection(pooled_text)
+                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)                
            elif 'clip' in self.model_name:        
                text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
                text_tokens = text_inputs.input_ids.to(self.device)
