@@ -2,36 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-"""
-Attention-weighted token supervision - the training-side counterpart to the
-deletion probe.
-
-The probe established, on two checkpoints, that last-layer EOT attention
-identifies the tokens the retrieval score depends on significantly better than
-corpus TF-IDF (p = 0.0005 at k=10, Bonferroni-corrected). This replaces the
-TF-IDF weighting in the SuperCLIP-style token/vocab loss with exactly the same
-quantity the probe measured, so the thing that was validated is the thing that
-gets trained.
-
-Two design points that are not optional:
-
-  STOP-GRADIENT. The target comes from the text tower. Without detach the model
-  can minimise the loss by moving the target, and the objective collapses. The
-  gradient must flow only into the prediction head and the vision tower.
-
-  INSTANCE-LEVEL. The target is the attention of the pair's OWN text, never a
-  same-place text from another view. Place-level supervision is correct for the
-  global metric loss and wrong here: forcing an image to predict the salient
-  words of a description written from a different viewpoint is wrong-label
-  supervision at exactly the granularity this loss operates on.
-
-weight_mode gives the ablation ladder measured by the probe:
-    'uniform'  - presence only, no weighting          (floor)
-    'idf'      - corpus prior                         (current baseline)
-    'attn'     - EOT attention                        (the proposal)
-    'idf_attn' - product of the two, renormalised     (does IDF add anything?)
-"""
-
 class GradientScaleFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, scale):
@@ -41,50 +11,6 @@ class GradientScaleFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output * ctx.scale, None
-
-
-# ---------------------------------------------------------------------------
-# the attention target
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def eot_attention_weights(text_model, hidden_states, ids, mask,
-                          drop_specials=True):
-    """(B, L) last-layer EOT attention, head-averaged. Identical to what the
-    deletion probe scored, so the trained target is the measured quantity.
-
-    Computed from hidden_states rather than a second forward pass: the input to
-    the last encoder layer is hidden_states[-2], and `encode_text` already
-    requests output_hidden_states=True. Cost is one extra q/k matmul.
-
-    output_attentions=True is NOT used: transformers >= 4.36 defaults CLIP to
-    the SDPA path, whose fused kernel never materialises the attention matrix,
-    so that field silently comes back None.
-    """
-    layer = text_model.encoder.layers[-1]
-    x = layer.layer_norm1(hidden_states[-2])
-    attn = layer.self_attn
-    B, L, D = x.shape
-    nh = getattr(attn, 'num_heads', None) or text_model.config.num_attention_heads
-    hd = D // nh
-
-    q = attn.q_proj(x).view(B, L, nh, hd).transpose(1, 2)
-    k = attn.k_proj(x).view(B, L, nh, hd).transpose(1, 2)
-
-    b = torch.arange(B, device=ids.device)
-    eot = ids.argmax(dim=-1)                       # EOT = largest vocab id
-    logits = torch.einsum('bhd,bhld->bhl', q[b, :, eot], k) * (hd ** -0.5)
-
-    pos = torch.arange(L, device=ids.device).unsqueeze(0)
-    allow = (pos <= eot.unsqueeze(1)) & mask.bool()
-    if drop_specials:
-        # the EOT's attention to itself is an attention-sink artifact, and BOS
-        # carries no content. Both would otherwise dominate the target.
-        allow = allow & (pos != eot.unsqueeze(1)) & (pos != 0)
-
-    logits = logits.masked_fill(~allow.unsqueeze(1), float('-inf'))
-    w = torch.softmax(logits.float(), dim=-1).mean(dim=1)
-    return torch.nan_to_num(w, nan=0.0).detach()   # <- stop-gradient
 
 
 class TokensClassificationLoss(nn.Module):
@@ -198,63 +124,6 @@ class TokensClassificationLoss(nn.Module):
             # to match them before believing the ablation.
             self.last_target_entropy = -(tgt * (tgt + 1e-9).log()).sum(-1).mean()
         return loss
-
-
-# ---------------------------------------------------------------------------
-# optional: the other direction
-# ---------------------------------------------------------------------------
-
-class PatchAttentionLoss(nn.Module):
-    """Predict, from the pooled TEXT embedding, which image regions the vision
-    CLS attends to.
-
-    The bidirectional half of the proposal. Same stop-gradient and
-    instance-level rules. Note this one is more fragile than the vocab
-    direction: ViTs develop high-norm 'register' patches in background regions
-    that absorb CLS attention regardless of content (Darcet et al.), so the
-    target carries a systematic, not random, bias. Ablate it separately and do
-    not bundle it with the vocab term.
-    """
-
-    def __init__(self, text_dim=512, num_patches=196, grad_scale=0.05,
-                 warmup_steps=200):
-        super().__init__()
-        self.head = nn.Linear(text_dim, num_patches)
-        self.grad_scale = grad_scale
-        self.warmup_steps = warmup_steps
-        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
-        nn.init.normal_(self.head.weight, std=0.02)
-        nn.init.zeros_(self.head.bias)
-
-    @staticmethod
-    @torch.no_grad()
-    def cls_attention(vision_model, hidden_states, has_cls=True):
-        """(B, num_patches) vision CLS attention over patches, head-averaged."""
-        layer = vision_model.encoder.layers[-1]
-        x = layer.layer_norm1(hidden_states[-2])
-        attn = layer.self_attn
-        B, L, D = x.shape
-        nh = getattr(attn, 'num_heads', None) or vision_model.config.num_attention_heads
-        hd = D // nh
-        q = attn.q_proj(x).view(B, L, nh, hd).transpose(1, 2)
-        k = attn.k_proj(x).view(B, L, nh, hd).transpose(1, 2)
-        cls = 0 if has_cls else None
-        if cls is None:
-            raise ValueError("no CLS token; use mean pooling instead")
-        logits = torch.einsum('bhd,bhld->bhl', q[:, :, cls], k) * (hd ** -0.5)
-        logits = logits[..., 1:]                    # drop CLS self-attention
-        return torch.softmax(logits.float(), -1).mean(1).detach()
-
-    def forward(self, text_embeddings, patch_attn):
-        if self.training:
-            self._step += 1
-            if self._step.item() <= self.warmup_steps:
-                text_embeddings = text_embeddings.detach()
-            elif self.grad_scale < 1.0:
-                text_embeddings = GradientScaleFunction.apply(
-                    text_embeddings, self.grad_scale)
-        logp = F.log_softmax(self.head(text_embeddings).float(), dim=-1)
-        return -(patch_attn * logp).sum(-1).mean()
 
 
 class VocabClassificationLoss(nn.Module):
@@ -636,3 +505,220 @@ class FILIPLoss(nn.Module):
         if self.training and self.queue_size:
             self._enqueue(v, labels)
         return loss
+    
+    
+@torch.no_grad()
+def attention_stats(w):
+    """Sanity numbers for any attention target. Log these every epoch.
+ 
+    A target that collapses onto one patch/token, or flattens to uniform, is
+    teaching nothing - and both look identical in the loss curve.
+    """
+    n = w.shape[-1]
+    p = w.clamp(min=1e-9)
+    ent = -(p * p.log()).sum(-1).mean()
+    return {'entropy': float(ent),
+            'entropy_norm': float(ent / torch.log(torch.tensor(float(n)))),
+            'max_weight': float(w.max(-1).values.mean()),
+            'top5_mass': float(w.topk(min(5, n), dim=-1).values.sum(-1).mean())}
+
+
+"""
+Attention-weighted token supervision - the training-side counterpart to the
+deletion probe.
+
+The probe established, on two checkpoints, that last-layer EOT attention
+identifies the tokens the retrieval score depends on significantly better than
+corpus TF-IDF (p = 0.0005 at k=10, Bonferroni-corrected). This replaces the
+TF-IDF weighting in the SuperCLIP-style token/vocab loss with exactly the same
+quantity the probe measured, so the thing that was validated is the thing that
+gets trained.
+
+Two design points that are not optional:
+
+  STOP-GRADIENT. The target comes from the text tower. Without detach the model
+  can minimise the loss by moving the target, and the objective collapses. The
+  gradient must flow only into the prediction head and the vision tower.
+
+  INSTANCE-LEVEL. The target is the attention of the pair's OWN text, never a
+  same-place text from another view. Place-level supervision is correct for the
+  global metric loss and wrong here: forcing an image to predict the salient
+  words of a description written from a different viewpoint is wrong-label
+  supervision at exactly the granularity this loss operates on.
+
+weight_mode gives the ablation ladder measured by the probe:
+    'uniform'  - presence only, no weighting          (floor)
+    'idf'      - corpus prior                         (current baseline)
+    'attn'     - EOT attention                        (the proposal)
+    'idf_attn' - product of the two, renormalised     (does IDF add anything?)
+"""
+
+
+# ---------------------------------------------------------------------------
+# the attention target
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def eot_attention_weights(text_model, hidden_states, ids, mask=None, drop_specials=True):
+    """
+    Computes head-averaged attention weights from the EOT token to prior tokens
+    in the final layer of openai/clip-vit-base-patch16.
+    
+    Args:
+        text_model: model.text_model (CLIPTextTransformer)
+        hidden_states: tuple of hidden states from output_hidden_states=True
+        ids: LongTensor of token IDs (B, L)
+        mask: optional attention mask (B, L)
+        drop_specials: whether to zero-out attention to BOS and EOT itself
+    """
+    layer = text_model.encoder.layers[-1]
+    x = layer.layer_norm1(hidden_states[-2])
+    attn = layer.self_attn
+    
+    B, L, D = x.shape
+    nh = attn.num_heads if hasattr(attn, "num_heads") else text_model.config.num_attention_heads
+    hd = D // nh
+
+    # Project Q and K: (B, num_heads, L, head_dim)
+    q = attn.q_proj(x).view(B, L, nh, hd).transpose(1, 2)
+    k = attn.k_proj(x).view(B, L, nh, hd).transpose(1, 2)
+
+    # Locate EOT token (id=49407 for openai/clip-vit-base-patch16)
+    eos_id = getattr(text_model.config, "eos_token_id", 49407)
+    is_eos = (ids == eos_id)
+    if is_eos.any():
+        eot = is_eos.int().argmax(dim=-1)
+    elif mask is not None:
+        eot = (mask.long().sum(dim=-1) - 1).clamp(min=0)
+    else:
+        eot = ids.argmax(dim=-1)
+
+    # Extract EOT's queries: (B, num_heads, head_dim)
+    b = torch.arange(B, device=ids.device)
+    q_eot = q[b, :, eot]
+
+    # Attention logits: (B, num_heads, L)
+    logits = torch.einsum('bhd,bhld->bhl', q_eot, k) * (hd ** -0.5)
+
+    # Causal & padding mask (EOT only attends to pos <= eot)
+    pos = torch.arange(L, device=ids.device).unsqueeze(0)
+    allow = (pos <= eot.unsqueeze(1))
+    if mask is not None:
+        allow = allow & mask.bool()
+
+    if drop_specials:
+        # Exclude BOS (index 0) and self-attention (index == eot)
+        content_mask = allow & (pos != eot.unsqueeze(1)) & (pos != 0)
+        # Prevent completely empty masks on empty/short sentences like "<BOS> <EOS>"
+        has_content = content_mask.any(dim=-1, keepdim=True)
+        allow = torch.where(has_content, content_mask, allow)
+
+    logits = logits.masked_fill(~allow.unsqueeze(1), float('-inf'))
+    
+    # Softmax over sequence length, average across heads
+    w = torch.softmax(logits.float(), dim=-1).mean(dim=1)
+    return torch.nan_to_num(w, nan=0.0)
+
+@torch.no_grad()
+def cls_attention_weights(vision_model, hidden_states, has_cls=True, drop_cls=True, return_grid=False):
+    """(B, num_patches) last-layer CLS attention over patches, head-averaged."""
+    layer = vision_model.encoder.layers[-1]
+    x = layer.layer_norm1(hidden_states[-2])
+    attn = layer.self_attn
+    B, L, D = x.shape
+    nh = getattr(attn, 'num_heads', None) or vision_model.config.num_attention_heads
+    hd = D // nh
+
+    q = attn.q_proj(x).view(B, L, nh, hd).transpose(1, 2)      # (B, nh, L, hd)
+    k = attn.k_proj(x).view(B, L, nh, hd).transpose(1, 2)
+
+    q_row = q[:, :, 0] if has_cls else q.mean(dim=2)           # (B, nh, hd)
+    logits = torch.einsum('bhd,bhld->bhl', q_row, k) * (hd ** -0.5)
+
+    if has_cls and drop_cls:
+        # masking the CLS self-attention BEFORE the softmax means the remaining
+        # patch weights already sum to 1
+        logits[..., 0] = float('-inf')
+
+    w = torch.softmax(logits.float(), dim=-1).mean(dim=1)      # (B, L)
+    if has_cls:
+        w = w[:, 1:]                                           # patches only
+        if not drop_cls:
+            w = w / w.sum(-1, keepdim=True).clamp(min=1e-6)
+    w = torch.nan_to_num(w, nan=0.0).detach()                  # stop-gradient
+
+    if return_grid:
+        n = w.shape[-1]
+        side = int(round(n ** 0.5))
+        if side * side != n:
+            raise ValueError(f"{n} patches is not a square grid")
+        return w, w.view(-1, side, side)
+    return w
+    
+     
+class PatchAttentionLoss(nn.Module):
+    """From the pooled TEXT embedding, predict which image regions the vision
+    CLS attends to.
+ 
+    THE TRAP in the obvious version. The target is a spatial distribution over
+    patch positions, and most of its structure is a generic street-scene layout
+    prior - sky at the top, road at the bottom, facades in the middle band -
+    shared by every image in the dataset. A head predicting that prior gets the
+    direct cross-entropy most of the way down while learning nothing
+    text-specific. 'direct' mode is kept only as the ablation that demonstrates
+    this.
+ 
+    'contrastive' mode fixes it: the predicted map must match ITS OWN image's
+    map better than the other images' maps in the batch. Note this is invariant
+    to the shared prior by construction - subtracting any map m common to all
+    targets shifts every logit in a row by the same p_i . m, which the softmax
+    cancels. So the loss can only be reduced by predicting image-SPECIFIC
+    deviation, which is the only part the text could plausibly know.
+ 
+    Instance-level, not place-level: a different view of the same place has a
+    different layout, and the text has no way to know which view it is paired
+    with.
+    """
+ 
+    def __init__(self, text_dim=512, num_patches=196, mode='contrastive',
+                 temperature=0.07, grad_scale=0.05, warmup_steps=200):
+        super().__init__()
+        self.head = nn.Linear(text_dim, num_patches)
+        self.mode = mode
+        self.logit_scale = nn.Parameter(torch.tensor(1.0 / temperature).log())
+        self.grad_scale = grad_scale
+        self.warmup_steps = warmup_steps
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long))
+        nn.init.normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+ 
+    def forward(self, text_embeddings, patch_attn):
+        """text_embeddings (B, text_dim) | patch_attn (B, num_patches), detached"""
+        if self.training:
+            self._step += 1
+            if self._step.item() <= self.warmup_steps:
+                text_embeddings = text_embeddings.detach()
+            elif self.grad_scale < 1.0:
+                text_embeddings = GradientScaleFunction.apply(
+                    text_embeddings, self.grad_scale)
+ 
+        logp = F.log_softmax(self.head(text_embeddings).float(), dim=-1)
+ 
+        if self.mode == 'direct':
+            return -(patch_attn * logp).sum(-1).mean()
+ 
+        # S[i, j] = -CE(target map of image j, predicted map of text i)
+        S = logp @ patch_attn.float().t()                      # (B_text, B_img)
+        scale = self.logit_scale.exp().clamp(max=100.0)
+        tgt = torch.arange(S.shape[0], device=S.device)        # instance-level
+        return 0.5 * (F.cross_entropy(S * scale, tgt)
+                      + F.cross_entropy(S.t() * scale, tgt))
+ 
+    @torch.no_grad()
+    def match_acc(self, text_embeddings, patch_attn):
+        """Fraction of texts whose predicted map matches its own image best.
+        1/B is chance. If this sits at chance the head has learned the layout
+        prior and nothing else."""
+        logp = F.log_softmax(self.head(text_embeddings).float(), dim=-1)
+        S = logp @ patch_attn.float().t()
+        tgt = torch.arange(S.shape[0], device=S.device)
+        return (S.argmax(-1) == tgt).float().mean()

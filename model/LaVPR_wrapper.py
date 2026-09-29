@@ -105,7 +105,7 @@ class LaVPR_wrapper():
             if self.reranker:
                 score_matrix, features, text_features, img_local, text_local = self.single_encoder(images, texts, return_embeddings=True)
             else:
-                features, text_features, _, _, _, _, img_local, text_local, text_tokens, _  = self.single_encoder(images, texts)
+                features, text_features, _, _, _, _, img_local, text_local, text_tokens, _, _  = self.single_encoder(images, texts)
         return features, text_features, img_local, text_local, text_tokens
     
     def encode_image(self, images):

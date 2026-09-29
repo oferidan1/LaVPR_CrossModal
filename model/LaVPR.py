@@ -15,7 +15,7 @@ import open_clip
 from model.salad import SALAD, CosineSALAD
 from model.local_ot_loss import LocalOTLoss
 from model.weighted_ms_loss import WeightedMultiSimilarityLossCM
-from model.tokens_classify_loss import TokensClassificationLoss, eot_attention_weights, VocabClassificationLoss, FILIPLoss
+from model.tokens_classify_loss import TokensClassificationLoss, eot_attention_weights, cls_attention_weights, VocabClassificationLoss, FILIPLoss, PatchAttentionLoss
 from model.pooling_cm import TextGatedAttentionPooler, GeMPooling1D, AttentionGatedPatchPooler, SpatialLayoutPooler, MultiLayerAttentionTextPooler, ResidualTextPooler
 
 
@@ -83,7 +83,8 @@ class LaVPR(pl.LightningModule):
                 global_token=True,       # False + filip>0 -> FILIP-only retrieval
                 filip_db_chunk=256,      # gallery chunk size for val-time MaxSim
                 loss_direction=0,
-                token_loss_type=0
+                token_loss_type=0,
+                img_attn_loss=0
                  ):
         super().__init__()
 
@@ -136,17 +137,20 @@ class LaVPR(pl.LightningModule):
         self.vocab_grad_scale = vocab_grad_scale
         self.loss_direction = loss_direction
         self.token_loss_type = token_loss_type
+        self.img_attn_loss = img_attn_loss
 
         # SigLIP's vision tower uses attention pooling and has NO CLS token,
         # every other backbone here prepends one at index 0.
         self.has_cls = 'siglip' not in model_name
+        v_dim, t_dim = get_local_dims(model_name)
 
         if self.tokens_idf_loss == 1:
-            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=768, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
+            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=v_dim, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
        
         if self.vocab_idf_loss:
-            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=768, vocab_path=vocab_path, image_idf_path=image_idf_path, grad_scale=vocab_grad_scale)
+            self.vocab_classification_loss = VocabClassificationLoss(vision_dim=v_dim, vocab_path=vocab_path, image_idf_path=image_idf_path, grad_scale=vocab_grad_scale)
 
+        
         # ---- FILIP late interaction
         self.filip = filip
         self.global_token = global_token
@@ -154,8 +158,7 @@ class LaVPR(pl.LightningModule):
         # FILIP replaces the global vector entirely, as in the original paper:
         # token-wise MaxSim IS the retrieval similarity, over the full gallery.
         self.filip_retrieval = (not global_token) and filip > 0
-        if filip:
-            v_dim, t_dim = get_local_dims(model_name)
+        if filip:            
             self.filip_loss = FILIPLoss(
                 text_dim=t_dim,
                 vision_dim=v_dim,
@@ -167,17 +170,15 @@ class LaVPR(pl.LightningModule):
                 queue_size=filip_queue
             )
 
-        if cross_modal == 4:  # contrastive loss for cross modal retrieval
-            self.contrastive_logit_scale = nn.Parameter(0.07 * torch.ones([]))
-            self.contrastive_loss = utils.losses.contrastive_loss_cross_modal
-            self.miner = None
-
         if idf_pooling == 'gem':
             self.idf_pooling_layer = GeMPooling1D()
         elif idf_pooling == 'attention':
             self.idf_pooling_layer = AttentionGatedPatchPooler()
         elif idf_pooling == 'spatial':
             self.idf_pooling_layer = SpatialLayoutPooler()
+            
+        if img_attn_loss:
+            self.patch_attn_loss = PatchAttentionLoss(text_dim=t_dim)
 
         # init weight of linear layers but not the pretrained backbones
         self.apply(self._init_weights)
@@ -276,6 +277,7 @@ class LaVPR(pl.LightningModule):
         img_embeds = None
         img_local = None
         img_all_layers = None
+        img_attn_w = None
         if 'blip' in self.model_name:
             img_local = self.vlm_encoder.encode_image(img)
             img_embeds = img_local[:,0]
@@ -292,6 +294,7 @@ class LaVPR(pl.LightningModule):
             pooled_output = vision_outputs.pooler_output
             img_embeds = self.vlm_encoder.visual_projection(pooled_output)
             img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)            
+            img_attn_w = cls_attention_weights(self.vlm_encoder.vision_model, vision_outputs.hidden_states)
         elif 'siglip' in self.model_name:
             img_output = self.vlm_encoder.get_image_features(pixel_values=img)
             img_local = img_output.last_hidden_state            
@@ -299,7 +302,7 @@ class LaVPR(pl.LightningModule):
         elif 'eva' in self.model_name:            
             img_embeds = self.vlm_encoder.encode_image(img)
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)            
-        return img_embeds, img_local, img_all_layers
+        return img_embeds, img_local, img_all_layers, img_attn_w
 
     def encode_text(self, text):
            text_embeds = None
@@ -352,7 +355,7 @@ class LaVPR(pl.LightningModule):
         text_flip_embeds = None
         text_neg_attr_embeds = None
 
-        img_embeds, img_local, img_all_layers = self.encode_image(img)
+        img_embeds, img_local, img_all_layers, img_attn_w = self.encode_image(img)
         text_embeds, text_local, attention_mask, text_tokens, text_all_layers, text_attn_w = self.encode_text(text)
         if self.pos_loss:
             if flip_desc is not None:
@@ -363,6 +366,7 @@ class LaVPR(pl.LightningModule):
 
         tidf_loss = 0.0
         filip_loss = 0.0
+        img_attn_loss = 0.0
         t_mask_filip = None
 
         img_patches = self.get_img_patches(img_local) if img_local is not None else None
@@ -386,6 +390,9 @@ class LaVPR(pl.LightningModule):
             img_features = img_embeds_pooled
             vocab_idf_loss = self.vocab_classification_loss(vision_embeddings=img_features, batch_concept_ids=concept_ids)
             tidf_loss = tidf_loss + self.vocab_idf_loss * vocab_idf_loss
+            
+        if self.img_attn_loss:
+            img_attn_loss = self.img_attn_loss * self.patch_attn_loss(text_embeds, img_attn_w)
 
         # ---- FILIP token-wise maximum similarity
         # the mask is built whenever filip is on, so validation (labels=None)
@@ -397,7 +404,7 @@ class LaVPR(pl.LightningModule):
                                              text_tokens, labels)
 
         return (img_embeds, text_embeds, text_flip_embeds, text_neg_attr_embeds,
-                tidf_loss, filip_loss, img_local, text_local, text_tokens, t_mask_filip)
+                tidf_loss, filip_loss, img_local, text_local, text_tokens, t_mask_filip, img_attn_loss)
 
     # configure the optimizer
     def configure_optimizers(self):
@@ -432,7 +439,7 @@ class LaVPR(pl.LightningModule):
         self.trainer.strategy.optimizer_step(optimizer, optimizer_idx, optimizer_closure)
 
     def loss_function(self, img_embeds, labels, text_embeds, text_flip_embeds, text_neg_attr_embeds,
-                      tidf_loss=0.0, filip_loss=0.0):
+                      tidf_loss=0.0, filip_loss=0.0, img_attn_loss=0.0):
 
         # ---- FILIP-only: no global vector, so no metric loss on img/text embeds
         if self.filip_retrieval:
@@ -477,7 +484,7 @@ class LaVPR(pl.LightningModule):
                 txt_loss = self.loss_fn(text_embeds_all, text_labels, indices_tuple=miner_outputs_txt)
                 loss = loss + self.unimodal_loss * txt_loss
 
-            loss = loss + tidf_loss + self.filip * filip_loss
+            loss = loss + tidf_loss + self.filip * filip_loss + img_attn_loss
             
             nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
             batch_acc = 1.0 - (nb_mined / nb_samples)
@@ -523,12 +530,12 @@ class LaVPR(pl.LightningModule):
                 flat_color_change_descs.append(color_change_descs[j][i])
 
         (descriptors, text_embeds, text_flip_embeds, neg_attr_embeds,
-         tidf_loss, filip_loss, img_local, text_local, text_tokens, t_mask) = self(
+         tidf_loss, filip_loss, img_local, text_local, text_tokens, t_mask, img_attn_loss) = self(
             images, flat_texts, flat_flip_descs, flat_color_change_descs,
             flat_neg_attr_descs, concepts_ids, labels)
 
         loss = self.loss_function(descriptors, labels, text_embeds, text_flip_embeds,
-                                  neg_attr_embeds, tidf_loss, filip_loss)
+                                  neg_attr_embeds, tidf_loss, filip_loss, img_attn_loss)
 
         self.log('loss', loss.item(), logger=True)
 
@@ -540,7 +547,7 @@ class LaVPR(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         places, _, texts = batch
         (img_embeds, text_embeds, _, _, _, _,
-         img_local, text_local, text_tokens, t_mask) = self(places, texts)
+         img_local, text_local, text_tokens, t_mask, _) = self(places, texts)
 
         ret_dict = {'descriptors': img_embeds.detach().cpu(),
                     'text_embeds': text_embeds.detach().cpu()}

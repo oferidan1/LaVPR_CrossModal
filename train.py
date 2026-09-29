@@ -72,6 +72,7 @@ def parse_arguments():
     parser.add_argument("--filip_queue", type=int, default="0", help="filip dqueue size")
     parser.add_argument("--global_token", type=int, default="1", help="global_token use or not")
     parser.add_argument("--loss_direction", type=int, default="0", help="0=i2t, 1=t2i, 2=both")    
+    parser.add_argument("--img_attn_loss", type=float, default="0", help="multplier for img_attn_loss, 0=no loss, >0 use loss")
     
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
@@ -158,7 +159,8 @@ if __name__ == '__main__':
         filip=args.filip,
         filip_queue=args.filip_queue,
         loss_direction=args.loss_direction,
-        token_loss_type=args.token_loss_type
+        token_loss_type=args.token_loss_type,
+        img_attn_loss=args.img_attn_loss
     )
     
     if args.resume is not None:

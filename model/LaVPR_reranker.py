@@ -55,7 +55,7 @@ class CrossAttnClassifier(nn.Module):
             nn.Linear(embeds_dim, 256),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 1)
+            nn.Linear(256, 1)            
         )
         
         # Learnable scaling factor to automatically balance cross-attention with baseline scores
@@ -67,11 +67,11 @@ class CrossAttnClassifier(nn.Module):
         i_features = self.ln_img(self.img_proj(img_local))
         
         fused, _ = self.cross_attn(t_features, i_features, i_features)
-        attn_logits = self.ln_post(fused + t_features)
+        attn_logits = self.ln_post(fused + t_features) #why needed???
         
         # Max pool across the token sequence
-        pooled = torch.max(attn_logits, dim=1)[0] 
-        local_score = self.score_head(pooled).squeeze(-1)
+        pooled = torch.max(attn_logits, dim=1)[0] # why max ?? why not mean? why [0]
+        local_score = self.score_head(pooled).squeeze(-1) # why score? why not use vector with ms loss?
         
         # 2. Combined Score Blend
         if img_global is not None and text_global is not None:            
