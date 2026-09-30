@@ -18,7 +18,7 @@ import open_clip
 
 class LaVPR_wrapper():
     def __init__(self, args):
-        self.model_name = args.model_name
+        self.model_name = args.model_name.lower()
         self.device = args.device
         self.embeds_dim = args.embeds_dim
         self.encoder_dim = args.embeds_dim
@@ -54,7 +54,7 @@ class LaVPR_wrapper():
             else:  
                 self.single_encoder = LaVPR(   
                     #---- Encoder
-                    model_name=args.model_name.lower(),
+                    model_name=args.model_name,
                     train_vlm=args.train_vlm,
                     embeds_dim=args.embeds_dim,           
                     lora_all_linear=args.lora_all_linear,
