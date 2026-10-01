@@ -67,7 +67,8 @@ class LaVPR(pl.LightningModule):
                 unimodal_loss=0.0,
                 pos_loss=0,
                 neg_loss=0,                                
-                tokens_idf_loss=0.0,
+                tokens_idf_loss_v=0.0,
+                tokens_idf_loss_t=0.0,
                 tokens_idf_file=None,
                 idf_grad_scale=0.05,
                 idf_pooling='mean',
@@ -127,7 +128,8 @@ class LaVPR(pl.LightningModule):
         self.unimodal_loss = unimodal_loss
         self.pos_loss = pos_loss
         self.neg_loss = neg_loss                
-        self.tokens_idf_loss = tokens_idf_loss
+        self.tokens_idf_loss_v = tokens_idf_loss_v
+        self.tokens_idf_loss_t = tokens_idf_loss_t
         self.tokens_idf_file = tokens_idf_file
         self.idf_pooling = idf_pooling
         vocab_size = self.get_vocab_size(self.model_name)
@@ -144,8 +146,10 @@ class LaVPR(pl.LightningModule):
         self.has_cls = 'siglip' not in model_name
         v_dim, t_dim = get_local_dims(self.model_name)
 
-        if self.tokens_idf_loss == 1:
-            self.tokens_classification_loss = TokensClassificationLoss(vision_dim=v_dim, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
+        if self.tokens_idf_loss_v:
+            self.img_tokens_classification_loss = TokensClassificationLoss(vision_dim=v_dim, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
+        if self.tokens_idf_loss_t:
+            self.text_tokens_classification_loss = TokensClassificationLoss(vision_dim=t_dim, vocab_size=vocab_size, idf_path=self.tokens_idf_file, grad_scale=idf_grad_scale, weight_mode=token_loss_type)
        
         if self.vocab_idf_loss:
             self.vocab_classification_loss = VocabClassificationLoss(vision_dim=v_dim, vocab_path=vocab_path, image_idf_path=image_idf_path, grad_scale=vocab_grad_scale)
@@ -276,6 +280,33 @@ class LaVPR(pl.LightningModule):
         t = F.normalize(h.text_proj(te), dim=-1)
         w = h._weights(text_tokens, t_mask.to(t.dtype))
         return v, t, w
+    
+    def get_text_mean_pool(self, text_local, attention_mask):
+        """
+        Mean pool over content tokens only: exclude BOS (pos 0), EOT, and PAD.
+        text_local:      (B, L, D)
+        attention_mask:  (B, L)  1=real token, 0=pad
+        text_tokens:     (B, L)  token ids
+        Returns: (B, D)
+        """
+        B, L, D = text_local.shape
+        
+        # start with attention mask (excludes PAD)
+        content_mask = attention_mask.clone().float()  # (B, L)
+        
+        # exclude BOS (always position 0)
+        content_mask[:, 0] = 0.0
+        
+        # exclude EOT (last real token per sample)
+        eot_pos = attention_mask.sum(dim=-1) - 1  # (B,)
+        content_mask.scatter_(1, eot_pos.unsqueeze(1), 0.0)
+        
+        # mean pool over remaining content tokens
+        mask_expanded = content_mask.unsqueeze(-1)          # (B, L, 1)
+        text_mean = (text_local * mask_expanded).sum(dim=1) # (B, D)
+        text_mean = text_mean / content_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        
+        return text_mean  # (B, D)
 
     def encode_image(self, img):
         img_embeds = None
@@ -291,6 +322,13 @@ class LaVPR(pl.LightningModule):
             img_embeds = self.vlm_encoder.visual_projection(img_output.pooler_output)
             img_all_layers = img_output.hidden_states
             img_embeds = img_embeds / img_embeds.norm(dim=-1, keepdim=True)
+        elif 'longclip' in self.model_name:            
+            vision_outputs = self.vlm_encoder.vision_model(pixel_values=img, output_hidden_states=True)
+            img_local = vision_outputs.last_hidden_state
+            img_all_layers = vision_outputs.hidden_states
+            pooled_output = vision_outputs.pooler_output
+            img_embeds = self.vlm_encoder.visual_projection(pooled_output)
+            img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)                                    
         elif 'clip' in self.model_name:            
             vision_outputs = self.vlm_encoder.vision_model(pixel_values=img, output_hidden_states=True)
             img_local = vision_outputs.last_hidden_state
@@ -298,7 +336,7 @@ class LaVPR(pl.LightningModule):
             pooled_output = vision_outputs.pooler_output
             img_embeds = self.vlm_encoder.visual_projection(pooled_output)
             img_embeds = img_embeds / img_embeds.norm(p=2, dim=-1, keepdim=True)                        
-            #img_attn_w = cls_attention_weights(self.vlm_encoder.vision_model, vision_outputs.hidden_states)
+            img_attn_w = cls_attention_weights(self.vlm_encoder.vision_model, vision_outputs.hidden_states)
         elif 'siglip' in self.model_name:
             img_output = self.vlm_encoder.get_image_features(pixel_values=img)
             img_local = img_output.last_hidden_state            
@@ -324,9 +362,9 @@ class LaVPR(pl.LightningModule):
            elif 'llm2clip' in self.model_name:
                text_tokens = self.llm_encoder.encode(text, convert_to_tensor=True).to(self.device)
                text_embeds = self.vlm_encoder.get_text_features(text_tokens.to(self.vlm_encoder.dtype)).float()
-               text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+               text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)           
            elif 'longclip' in self.model_name:        
-                text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
+                text_inputs = self.processor(text=text, return_tensors="pt", padding="max_length", truncation=True, max_length=self.max_text_length)
                 text_tokens = text_inputs['input_ids'].to(self.device)
                 attention_mask = None
                 if 'attention_mask' in text_inputs:
@@ -336,19 +374,8 @@ class LaVPR(pl.LightningModule):
                 text_all_layers = text_outputs.hidden_states                         
                 pooled_text = text_outputs.pooler_output                                     
                 text_embeds = self.vlm_encoder.text_projection(pooled_text)
-                text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)                    
-           elif 'longclip' in self.model_name:        
-                text_inputs = self.processor(text=text, return_tensors="pt", padding="max_length", truncation=True, max_length=self.max_text_length)
-                text_tokens = text_inputs.input_ids.to(self.device)
-                attention_mask = None
-                if 'attention_mask' in text_inputs:
-                    attention_mask = text_inputs['attention_mask'].to(self.device)                
-                text_outputs = self.vlm_encoder.text_model(input_ids=text_tokens, attention_mask=attention_mask, output_hidden_states=True)                        
-                text_local = text_outputs.last_hidden_state
-                text_all_layers = text_outputs.hidden_states                         
-                pooled_text = text_outputs.pooler_output                                     
-                text_embeds = self.vlm_encoder.text_projection(pooled_text)
                 text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)                
+                text_attn_w = eot_attention_weights(self.vlm_encoder.text_model.text_model, text_outputs.hidden_states, text_tokens, attention_mask)
            elif 'clip' in self.model_name:        
                text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True, max_length=self.max_text_length)
                text_tokens = text_inputs.input_ids.to(self.device)
@@ -398,21 +425,24 @@ class LaVPR(pl.LightningModule):
         t_mask_filip = None
 
         img_patches = self.get_img_patches(img_local) if img_local is not None else None
-
-        if img_patches is not None:
-            if self.idf_pooling == 'mean':
-                img_embeds_pooled = img_patches.mean(dim=1)
-            elif self.idf_pooling == 'max':
-                img_embeds_pooled = img_patches.max(dim=1).values
-            elif self.idf_pooling == 'cls':
-                img_embeds_pooled = img_local[:,0,:]
-            else:
-                img_embeds_pooled = self.idf_pooling_layer(img_patches)
+        
+        if self.idf_pooling == 'mean':
+            img_embeds_pooled = img_patches.mean(dim=1)
+            text_embeds_pooled = self.get_text_mean_pool(text_local, attention_mask)
+        elif self.idf_pooling == 'max':
+            img_embeds_pooled = img_patches.max(dim=1).values
+            text_embeds_pooled = text_local.max(dim=1).values
+        elif self.idf_pooling == 'cls':
+            img_embeds_pooled = img_local[:,0,:]
+            text_embeds_pooled = text_embeds
         else:
-            img_embeds_pooled = None
+            img_embeds_pooled = self.idf_pooling_layer(img_patches)
+            text_embeds_pooled = self.idf_pooling_layer(text_local)        
 
-        if self.tokens_idf_loss:
-            tidf_loss = self.tokens_idf_loss * self.tokens_classification_loss(vision_embeddings=img_embeds_pooled, ids=text_tokens, mask=attention_mask, attn_w=text_attn_w)
+        if self.tokens_idf_loss_v:
+            tidf_loss = self.tokens_idf_loss_v * self.img_tokens_classification_loss(vision_embeddings=img_embeds_pooled, ids=text_tokens, mask=attention_mask, attn_w=text_attn_w)
+        if self.tokens_idf_loss_t:            
+            tidf_loss += self.tokens_idf_loss_t * self.text_tokens_classification_loss(vision_embeddings=text_embeds_pooled, ids=text_tokens, mask=attention_mask, attn_w=text_attn_w)
 
         if self.vocab_idf_loss and concept_ids is not None:
             img_features = img_embeds_pooled
@@ -483,7 +513,7 @@ class LaVPR(pl.LightningModule):
 
             if self.pos_loss:
                 text_embeds_all = torch.cat([text_embeds, text_flip_embeds], dim=0)
-                text_labels = torch.cat([text_labels, labels], dim=0)
+                text_labels = torch.cat([text_labels, text_labels], dim=0)
 
             if self.neg_loss:
                 text_embeds_all = torch.cat([text_embeds_all, text_neg_attr_embeds], dim=0)
@@ -507,7 +537,7 @@ class LaVPR(pl.LightningModule):
                 loss = self.loss_fn(img_embeds, labels, indices_tuple=miner_outputs, ref_emb=text_embeds_all, ref_labels=text_labels)                      
                 nb_samples = img_embeds.shape[0]
 
-            if self.unimodal_loss > 0:
+            if self.unimodal_loss:
                 miner_outputs_txt = self.miner(text_embeds_all, text_labels)
                 txt_loss = self.loss_fn(text_embeds_all, text_labels, indices_tuple=miner_outputs_txt)
                 loss = loss + self.unimodal_loss * txt_loss
@@ -517,12 +547,8 @@ class LaVPR(pl.LightningModule):
             nb_mined = len(set(miner_outputs[0].detach().cpu().numpy()))
             batch_acc = 1.0 - (nb_mined / nb_samples)
 
-        else:  # no online mining
-            if self.cross_modal == 4:
-                logit_scale = self.contrastive_logit_scale
-                loss = self.contrastive_loss(img_embeds, text_embeds, logit_scale)
-            else:
-                loss = self.loss_fn(img_embeds, labels)
+        else:  # no online mining            
+            loss = self.loss_fn(img_embeds, labels)
             batch_acc = 0.0
             if type(loss) == tuple:
                 loss, batch_acc = loss
@@ -703,27 +729,4 @@ class LaVPR(pl.LightningModule):
             ckpt_dir = os.path.dirname(ckpt_cb.dirpath)
             self.vlm_encoder.save_pretrained(ckpt_dir)
             print("Saved PEFT adapter to:", ckpt_dir)
-
-
-class SaliencyFilteringModule(nn.Module):
-    """
-    SFM: Uses attention weights to dynamically select discriminative,
-    geographically stable visual patches and filters out transient noise.
-    """
-    def __init__(self, embed_dim=768, selection_ratio=0.7):
-        super().__init__()
-        self.selection_ratio = selection_ratio
-        self.score_predictor = nn.Linear(embed_dim, 1)
-
-    def forward(self, patch_tokens):
-        B, N, C = patch_tokens.shape
-        num_to_select = int(N * self.selection_ratio)
-
-        scores = self.score_predictor(patch_tokens).squeeze(-1)
-        _, topk_indices = torch.topk(scores, k=num_to_select, dim=-1)
-
-        gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, C)
-        filtered_patches = torch.gather(patch_tokens, dim=1, index=gather_indices)
-
-        return filtered_patches
 

@@ -20,6 +20,7 @@ def parse_arguments():
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/pitts30k/images/test/queries")        
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/pitts30k/images/test")
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_test_descriptions.csv")
+    #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_test_descriptions_compressed.csv")
 
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/pitts30k/images/val/database")    
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/pitts30k/images/val/queries")    

@@ -37,8 +37,8 @@ def parse_arguments():
     parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
-    parser.add_argument("--is_freeze_text", type=int, default="1", help="freeze text encoder or not")
-    parser.add_argument("--train_vlm", type=int, default="0", help="train vlm encoder or not. 1=lora, 2=full train")
+    parser.add_argument("--is_freeze_text", type=int, default="0", help="freeze text encoder or not")
+    parser.add_argument("--train_vlm", type=int, default="2", help="train vlm encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
     #parser.add_argument("--loss_name", type=str, default="WeightedMultiSimilarityLoss", help="name of the loss function to use")    
@@ -57,11 +57,9 @@ def parse_arguments():
     parser.add_argument("--lr_mult", type=float, default="0.5", help="learning rate")    
     #parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6,8], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
-    parser.add_argument("--resume", type=str, default=None, help="resume training from path")
-    parser.add_argument("--tokens_idf_loss", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--resume", type=str, default=None, help="resume training from path")    
     parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
-    #parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_token_idf_siglipv2.pt', help="path to tokens idf.pt")
-    parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")
+    #parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_token_idf_siglipv2.pt', help="path to tokens idf.pt")    
     parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial, max, cls")
     parser.add_argument("--token_loss_type", type=str, default="idf", help="idf, uniform, attn, idf_attn")    
     parser.add_argument("--vocab_idf_loss", type=float, default="0", help="multplier for vocab idf loss, 0=no loss, >0 use loss")
@@ -74,6 +72,10 @@ def parse_arguments():
     parser.add_argument("--global_token", type=int, default="1", help="global_token use or not")
     parser.add_argument("--loss_direction", type=int, default="0", help="0=i2t, 1=t2i, 2=both")    
     parser.add_argument("--img_attn_loss", type=float, default="0", help="multplier for img_attn_loss, 0=no loss, >0 use loss")
+    parser.add_argument("--idf_grad_scale", type=float, default="0.05", help="idf grad scale")
+    parser.add_argument("--tokens_idf_loss_v", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    parser.add_argument("--tokens_idf_loss_t", type=float, default="0", help="multplier for tokens idf loss, 0=no loss, >0 use loss")
+    
     
     
     #parser.add_argument("--resume", type=str, default='LOGS/resnet50/lightning_logs/version_34/checkpoints/resnet50_epoch(09)_step(6260)_R1[0.4725]_R5[0.7750].ckpt', help="resume training from path") 
@@ -149,7 +151,8 @@ if __name__ == '__main__':
         unimodal_loss=args.unimodal_loss,
         pos_loss=args.pos_loss,
         neg_loss=args.neg_loss,                
-        tokens_idf_loss=args.tokens_idf_loss,
+        tokens_idf_loss_v=args.tokens_idf_loss_v,
+        tokens_idf_loss_t=args.tokens_idf_loss_t,
         tokens_idf_file=args.tokens_idf_file,
         idf_grad_scale=args.idf_grad_scale,
         idf_pooling=args.idf_pooling,

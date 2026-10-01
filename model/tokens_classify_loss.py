@@ -47,7 +47,7 @@ class TokensClassificationLoss(nn.Module):
         if idf_path is not None:
             try:
                 raw = torch.load(idf_path, weights_only=True).clamp(min=0.0)
-                raw = torch.log1p(raw)                # raw inverse frequency is
+                #raw = torch.log1p(raw)                # raw inverse frequency is
                 w = raw / raw.mean().clamp(min=1e-6)  # far too heavy-tailed
             except (FileNotFoundError, RuntimeError):
                 print(f"TokensClassificationLoss: {idf_path} missing, uniform IDF.")
@@ -64,7 +64,8 @@ class TokensClassificationLoss(nn.Module):
         if self.drop_specials:
             b = torch.arange(B, device=ids.device)
             keep[:, 0] = 0.0
-            keep[b, ids.argmax(-1)] = 0.0
+            eos_indices = (mask.sum(dim=-1).long() - 1).clamp(min=0)
+            keep[b, eos_indices] = 0.0
 
         if self.weight_mode == 'uniform':
             w = keep
@@ -189,84 +190,7 @@ class VocabClassificationLoss(nn.Module):
         classification_loss = -torch.sum(target_distribution * log_probs, dim=1)        
         
         return classification_loss.mean()
-    
-# class VocabClassificationLoss(nn.Module):
-#     def __init__(self, vision_dim, vocab_path="scene_graph_vocab.json", 
-#                  image_idf_path="gsv_cities_image_idf.pt", target_initial_loss=4.0, grad_scale=0.05):
-#         super().__init__()
-        
-#         # Load static global token Inverse Document Frequency trajectories
-#         img_idf = torch.load(image_idf_path, weights_only=True).clamp(min=0.0)
-#         self.register_buffer("idf_weights", img_idf)
-#         self.vocab_size = img_idf.size(0)
-        
-#         # Linear tracking classification head projects backbone features to vocab channels
-#         self.classification_head = nn.Linear(vision_dim, self.vocab_size)
-        
-#         # Balancing scale tracking constants
-#         initial_mean_loss = -torch.log(torch.tensor(0.5))
-#         self.loss_scale = target_initial_loss / initial_mean_loss
-#         self.loss_scale = 1
-#         self.grad_scale = grad_scale 
-
-#     def forward(self, vision_embeddings, batch_concept_ids):
-#         """
-#         Args:
-#             vision_embeddings (torch.Tensor): Raw model outputs 
-#             batch_concept_ids (torch.Tensor): LongTensor filled with word index targets. Shape: (N, Seq_Len)
-#         """
-#         if batch_concept_ids is None:
-#             return torch.tensor(0.0, device=vision_embeddings.device, requires_grad=True)
-        
-#         scaled_vision_features = GradientScaleFunction.apply(vision_embeddings, self.grad_scale)
-#         logits = self.classification_head(scaled_vision_features)
-            
-#         batch_size = logits.size(0)
-#         device = logits.device
-        
-#         # --- 1. FULLY VECTORIZED TERM FREQUENCY (TF) CALCULATION ---
-#         # Initialize flat allocation allocation tensor maps
-#         tf_matrix = torch.zeros(batch_size, self.vocab_size, device=device, dtype=torch.float32)
-#         ones = torch.ones_like(batch_concept_ids, dtype=torch.float32, device=device)
-        
-#         # Eliminate loop by accumulating word counts in parallel across the batch dim
-#         tf_matrix.scatter_add_(1, batch_concept_ids, ones)
-        
-#         # Force ignore <PAD> tokens at index 0
-#         tf_matrix[:, 0] = 0.0
-        
-#         # Extract individual row maxima to compute augmented structural frequencies
-#         max_tf = tf_matrix.max(dim=1, keepdim=True)[0]
-        
-#         # Vectorized augmented TF mapping: 0.5 + 0.5 * (count / max)
-#         tf_matrix = torch.where(
-#             tf_matrix > 0,
-#             0.5 + 0.5 * (tf_matrix / (max_tf + 1e-8)),
-#             torch.zeros_like(tf_matrix)
-#         )
-
-#         # --- 2. LOGIT-SAFE TARGET DISTRIBUTION SCALING ---
-#         # Multiply our vectorized batch TF matrix by our registered global buffer weights
-#         weighted_targets = tf_matrix * self.idf_weights.unsqueeze(0)
-        
-#         # CRITICAL REPAIR: Normalize by the max value per row instead of the sum.
-#         # This keeps prominent landmark class targets pinned at 1.0 so BCE functions normally.
-#         row_max = weighted_targets.max(dim=1, keepdim=True)[0]
-#         target_distribution = weighted_targets / (row_max + 1e-8)        
-        
-#         # --- 3. MULTI-LABEL BINARY CROSS-ENTROPY EVALUATION ---
-#         classification_loss = F.binary_cross_entropy_with_logits(
-#             logits, 
-#             target_distribution, 
-#             reduction="mean"
-#         )
-        
-#         return classification_loss * self.loss_scale
-
-
-# Replace the FILIPLoss class inside model/tokens_classify_loss.py with this.
-# GradientScaleFunction is already defined in that file.
-
+   
 
 class FILIPLoss(nn.Module):
     """FILIP token-wise maximum similarity (late interaction).
