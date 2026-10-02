@@ -68,11 +68,11 @@ def precompute_dataset_idf(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--csv_file", type=str, default="datasets/descriptions/gsv_cities_descriptions.csv")
-    parser.add_argument("--out_file", type=str, default="gsv_cities_image_idf.pt")
-    parser.add_argument("--max_len", type=int, default=248, help="Max text context length (248 for Long-CLIP)")
+    parser.add_argument("--csv_file", type=str, default="datasets/descriptions/gsv_cities_compressed.csv")
+    parser.add_argument("--out_file", type=str, default="gsv_cities_token_idf.pt")
+    parser.add_argument("--max_len", type=int, default=77, help="Max text context length (248 for Long-CLIP)")
     parser.add_argument("--batch_size", type=int, default=2048, help="Batch size for text processing")
-    parser.add_argument("--model_name", type=str, default="creative-graphic-design/LongCLIP-B", help="Model / tokenizer path")
+    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch16", help="Model / tokenizer path")
     parser.add_argument("--gpu", type=str, default="0", help="GPU device ID")
 
     args = parser.parse_args()

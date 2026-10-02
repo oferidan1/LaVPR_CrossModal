@@ -272,7 +272,7 @@ class FILIPLoss(nn.Module):
             try:
                 w = torch.load(idf_path, weights_only=True).clamp(min=0.0)
                 # temper: raw inverse frequency is unstable on large vocabularies
-                w = torch.log1p(w)
+                #w = torch.log1p(w)
                 w = w / w.mean().clamp(min=1e-6)
             except (FileNotFoundError, RuntimeError):
                 print(f"FILIPLoss: {idf_path} not found, uniform weights.")
