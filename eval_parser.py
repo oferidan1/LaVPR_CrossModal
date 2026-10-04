@@ -13,14 +13,15 @@ def parse_arguments():
     parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/amstertime/test/database")    
     parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/amstertime/test/queries")        
     parser.add_argument("--image_root", type=str, default="/home/shared/datasets/amstertime/test")
-    parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_compressed.csv")
-    #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions.csv")
+    parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_fixed_1.csv")
+    #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_compressed_bad.csv")    
+    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions.csv")
     #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/amstertime_descriptions_subset.csv")                
 
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/pitts30k/images/test/database")    
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/pitts30k/images/test/queries")        
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/pitts30k/images/test")
-    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_test_compressed.csv")
+    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_test_fixed_1.csv")
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/pitts30k_test_descriptions.csv")    
 
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/pitts30k/images/val/database")    
@@ -31,7 +32,7 @@ def parse_arguments():
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/msls/val/database")    
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/msls/val/query")   
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/msls/val/")    
-    # # # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions.csv")
+    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_fixed_1.csv")
     # # # #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_blur.csv")
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_weather.csv")
 

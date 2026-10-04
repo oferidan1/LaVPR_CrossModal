@@ -31,11 +31,11 @@ def parse_arguments():
     # parser.add_argument("--embeds_dim", type=int, default=768, help="dimension of the embeddings")   
     parser.add_argument("--gpu", type=str, default='0', help="gpu id(s) to use")    
     parser.add_argument("--epochs", type=int, default='20', help="number of epochs to train")    
-    parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_compressed.csv")    
+    parser.add_argument("--train_csv", type=str, default="datasets/descriptions/gsv_cities_fixed_3.csv")    
     parser.add_argument("--image_root", type=str, default="/home/shared/datasets/gsv_cities/", help="root directory for images")
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_descriptions.csv")    
     parser.add_argument("--is_val", type=int, default="1", help="run validation 0=no/1=yes")
-    parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
+    parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_compressed.csv")    
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
     parser.add_argument("--is_freeze_text", type=int, default="0", help="freeze text encoder or not")
     parser.add_argument("--train_vlm", type=int, default="2", help="train vlm encoder or not. 1=lora, 2=full train")
@@ -58,7 +58,7 @@ def parse_arguments():
     #parser.add_argument("--milestones", nargs="+", type=int, default=[2,4,6,8], help="milestones for lr scheduler seperated by space")
     parser.add_argument("--milestones", nargs="+", type=int, default=[10,16], help="milestones for lr scheduler seperated by space")    
     parser.add_argument("--resume", type=str, default=None, help="resume training from path")    
-    parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_clip_b32_idf.pt', help="path to tokens idf.pt")
+    parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_token_idf_v3.pt', help="path to tokens idf.pt")
     #parser.add_argument("--tokens_idf_file", type=str, default='datasets/gsv_cities_token_idf_siglipv2.pt', help="path to tokens idf.pt")    
     parser.add_argument("--idf_pooling", type=str, default="mean", help="idf pooling type: mean, gem, attention, spatial, max, cls")
     parser.add_argument("--token_loss_type", type=str, default="idf", help="idf, uniform, attn, idf_attn")    
@@ -68,7 +68,8 @@ def parse_arguments():
     parser.add_argument("--image_idf_path", type=str, default='datasets/gsv_cities_image_idf_v3.pt', help="path to image_idf_path")
     parser.add_argument("--mapping_path", type=str, default='datasets/gsv_cities_image_id_to_vocab_indices_v3.json', help="path to mapping_path")    
     parser.add_argument("--filip", type=float, default="0", help="filip use or not")
-    parser.add_argument("--filip_queue", type=int, default="0", help="filip dqueue size")
+    parser.add_argument("--filip_queue", type=int, default="1024", help="filip dqueue size")
+    parser.add_argument("--filip_idf", type=int, default="1", help="filip use idf")    
     parser.add_argument("--global_token", type=int, default="1", help="global_token use or not")
     parser.add_argument("--loss_direction", type=int, default="0", help="0=i2t, 1=t2i, 2=both")    
     parser.add_argument("--img_attn_loss", type=float, default="0", help="multplier for img_attn_loss, 0=no loss, >0 use loss")
@@ -162,6 +163,7 @@ if __name__ == '__main__':
         vocab_idf_loss=args.vocab_idf_loss,
         filip=args.filip,
         filip_queue=args.filip_queue,
+        filip_use_idf=args.filip_idf,
         loss_direction=args.loss_direction,
         token_loss_type=args.token_loss_type,
         img_attn_loss=args.img_attn_loss

@@ -80,7 +80,7 @@ class LaVPR(pl.LightningModule):
                 filip=0.0,
                 filip_queue=0,
                 filip_chunk=8,
-                filip_use_idf=True,
+                filip_use_idf=False,
                 global_token=True,       # False + filip>0 -> FILIP-only retrieval
                 filip_db_chunk=256,      # gallery chunk size for val-time MaxSim
                 loss_direction=0,
