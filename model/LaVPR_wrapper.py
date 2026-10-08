@@ -43,6 +43,9 @@ class LaVPR_wrapper():
                 self.vpr_encoder, _, self.processor = open_clip.create_model_and_transforms(self.model_name, pretrained='merged2b_s8b_b131k')#'EVA02-B-16'
                 self.tokenizer = open_clip.get_tokenizer(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)                
+            elif 'bge' in self.model_name:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)  
+                self.vlm_encoder = AutoModel.from_pretrained(self.model_name, attn_implementation="sdpa").to(args.device) 
         else:          
             if args.reranker:
                 self.single_encoder = LaVPR_reranker(   
@@ -60,7 +63,9 @@ class LaVPR_wrapper():
                     lora_all_linear=args.lora_all_linear,
                     lora_target_modules=args.lora_target_modules,
                     lora_r=args.lora_r,                  
-                    filip=args.reranker_filip or args.filip_retrieval   
+                    filip=args.reranker_filip or args.filip_retrieval,
+                    is_image=args.is_image,
+                    is_llp=args.is_llp                    
                 )
 
             if args.lora_path is not None:
@@ -105,8 +110,8 @@ class LaVPR_wrapper():
             if self.reranker:
                 score_matrix, features, text_features, img_local, text_local = self.single_encoder(images, texts, return_embeddings=True)
             else:
-                features, text_features, _, _, _, _, img_local, text_local, text_tokens, _, _  = self.single_encoder(images, texts)
-        return features, text_features, img_local, text_local, text_tokens
+                features, text_features, _, _, _, _, img_local, text_local, text_tokens, attention_mask, _  = self.single_encoder(images, texts)
+        return features, text_features, img_local, text_local, text_tokens, attention_mask
     
     def encode_image(self, images):
         if 'blip' in self.model_name:
@@ -160,7 +165,7 @@ class LaVPR_wrapper():
             with torch.no_grad():
                 text_features = self.vpr_encoder.encode_text(text_tokens)    
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        elif 'bge' in self.text_model_name:                    
+        elif 'bge' in self.model_name:                    
             text_tokens = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
             with torch.no_grad():      
                 model_output = self.vlm_encoder(**text_tokens)                        

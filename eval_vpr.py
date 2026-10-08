@@ -52,20 +52,22 @@ def encode_batch(model, args, images, texts, indices, all_descriptors,
         images = images.bfloat16()
 
     if args.cross_modal <= 1:
-        image_features = model.encode_text(texts)
-        vision_descriptors[indices.numpy(), :] = image_features.cpu().float().numpy()
-        text_features = model.encode_image(images.to(args.device))
+        if args.is_image:
+            image_features = model.encode_image(images.to(args.device))
+            vision_descriptors[indices.numpy(), :] = image_features.cpu().float().numpy()
+        text_features = model.encode_text(texts)
         text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
     else:
         # single vector of both image and text, plus per-token features
-        descriptors, text_features, img_local, text_local, text_tokens = \
+        descriptors, text_features, img_local, text_local, text_tokens, text_attention_mask = \
             model.encode_single(images.to(args.device), texts)
-        vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
-        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
-        # img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
+        if args.is_image:
+            vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
+            img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
+        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()        
         # text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()        
         # text_tokens_all[indices.numpy(), :] = text_tokens.cpu().long().numpy()
-        #text_attentions[indices.numpy(), :] = text_attention_mask.cpu().long().numpy()
+        # text_attentions[indices.numpy(), :] = text_attention_mask.cpu().long().numpy()
 
 
 def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors,
@@ -454,6 +456,102 @@ Respond ONLY with a JSON object: {{"score": <number 0-100>, "reason": "<brief ju
 
     return reranked_preds
 
+@torch.no_grad()
+def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
+                               vision_descriptors, text_descriptors,
+                               img_local_descs, text_local_desc,
+                               text_tokens_all=None, text_attentions=None,
+                               K=20, device="cuda"):
+    """Is FILIP's MaxSim a different signal from the global cosine, or the same
+    one computed expensively?
+
+    Both scores are evaluated on the SAME candidate set (the global top-K), so
+    they are directly comparable. `scores` from faiss on L2-normalised
+    descriptors are already cosines aligned with `predictions`.
+    """
+    head = getattr(model.single_encoder, "filip_loss", None)
+    if head is None:
+        logger.warning("No filip_loss head; skipping diagnostic.")
+        return
+    head.to(device).eval()
+
+    has_cls = getattr(model.single_encoder, "has_cls", True)
+    use_idf = getattr(head, "use_idf", False) and text_tokens_all is not None
+    dtype = next(head.parameters()).dtype
+    nd, nq = test_ds.num_database, test_ds.num_queries
+    K = min(K, predictions.shape[1])
+
+    img_l = torch.from_numpy(img_local_descs).to(device)
+    txt_l = torch.from_numpy(text_local_desc).to(device)
+
+    G = scores[:, :K].astype(np.float64)
+    Fm = np.zeros((nq, K), dtype=np.float64)
+
+    for q in tqdm(range(nq), desc="filip-vs-global"):
+        gi = nd + q
+        if text_attentions is not None:
+            m = torch.from_numpy(text_attentions[gi]).to(device).bool()
+        else:
+            m = txt_l[gi].abs().sum(-1) > 0
+        if m.sum() == 0:
+            continue
+
+        t = head.text_proj(_maybe(head, "t_norm", txt_l[gi][m].unsqueeze(0).to(dtype)))
+        t = F.normalize(t, dim=-1).squeeze(0)
+
+        if use_idf:
+            ids = torch.from_numpy(text_tokens_all[gi]).to(device)[m]
+            w = head.idf_weights[ids.clamp(0, head.idf_weights.numel() - 1)].to(t.dtype)
+        else:
+            w = torch.ones(t.shape[0], device=device, dtype=t.dtype)
+        w = w / w.sum().clamp(min=1e-6)
+
+        cand = predictions[q, :K]
+        v = img_l[cand]
+        if has_cls:
+            v = v[:, 1:]
+        v = F.normalize(head.vision_proj(_maybe(head, "v_norm", v.to(dtype))), dim=-1)
+
+        sim = torch.einsum('nd,kmd->knm', t, v)
+        Fm[q] = (sim.max(dim=-1).values * w.unsqueeze(0)).sum(-1).float().cpu().numpy()
+
+    # ---- agreement -------------------------------------------------------
+    def _rank(a):                       # ranks within each row
+        return np.argsort(np.argsort(a, axis=1), axis=1).astype(np.float64)
+
+    def _rowcorr(a, b):                 # mean WITHIN-query correlation
+        a = a - a.mean(1, keepdims=True)
+        b = b - b.mean(1, keepdims=True)
+        den = (np.sqrt((a ** 2).sum(1)) * np.sqrt((b ** 2).sum(1)))
+        ok = den > 1e-12
+        return ((a * b).sum(1)[ok] / den[ok]).mean()
+
+    logger.info("=" * 62)
+    logger.info(f"FILIP vs GLOBAL on the same top-{K} shortlist, {nq} queries")
+    logger.info(f"  pearson  (within-query) : {_rowcorr(Fm, G):+.4f}")
+    logger.info(f"  spearman (within-query) : {_rowcorr(_rank(Fm), _rank(G)):+.4f}")
+    logger.info(f"  relative spread  filip  : {(Fm.std(1) / np.abs(Fm.mean(1) + 1e-9)).mean():.4f}")
+    logger.info(f"  relative spread  global : {(G.std(1) / np.abs(G.mean(1) + 1e-9)).mean():.4f}")
+    logger.info(f"  top-1 agreement         : {(Fm.argmax(1) == 0).mean():.3f}")
+
+    # ---- does it help? ---------------------------------------------------
+    if getattr(test_ds, 'get_positives', None) is not None:
+        pos = [set(np.asarray(p).ravel().tolist()) for p in test_ds.get_positives()]
+        g_ok = np.array([predictions[q, 0] in pos[q] for q in range(nq)])
+        f_ok = np.array([predictions[q, int(Fm[q].argmax())] in pos[q] for q in range(nq)])
+        in_k = np.array([len(pos[q] & set(predictions[q, :K].tolist())) > 0
+                         for q in range(nq)])
+
+        repairable = (~g_ok) & in_k
+        logger.info(f"  R@1 global              : {100 * g_ok.mean():.2f}")
+        logger.info(f"  R@1 filip (reordered)   : {100 * f_ok.mean():.2f}")
+        logger.info(f"  R@1 ORACLE(global,filip): {100 * (g_ok | f_ok).mean():.2f}")
+        logger.info(f"  repaired  (of {repairable.sum():4d} fixable) : "
+                    f"{100 * (f_ok & repairable).sum() / max(repairable.sum(), 1):.2f}%")
+        logger.info(f"  damaged   (of {g_ok.sum():4d} correct) : "
+                    f"{100 * ((~f_ok) & g_ok).sum() / max(g_ok.sum(), 1):.2f}%")
+    logger.info("=" * 62)
+
 
 # ---------------------------------------------------------------------------
 
@@ -531,7 +629,7 @@ def main(args):
         text_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")
         all_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")        
         img_local_descs = np.zeros((len(test_ds), num_img_tokens, 768), dtype="float32")
-        text_local_desc = np.zeros((len(test_ds), num_text_tokens-1, model.encoder_dim), dtype="float32")
+        text_local_desc = np.zeros((len(test_ds), num_text_tokens, model.encoder_dim), dtype="float32")
         text_tokens_all = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)       
         text_attentions = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)       
 
@@ -558,7 +656,7 @@ def main(args):
                     f"(both must be non-zero)")
 
     if args.cross_modal:
-        if args.text_only:
+        if not args.is_image:
             database_descriptors = text_descriptors[: test_ds.num_database]
         else:
             database_descriptors = vision_descriptors[: test_ds.num_database]
@@ -577,12 +675,20 @@ def main(args):
             db_chunk=getattr(args, 'filip_db_chunk', 2048),
             alpha=getattr(args, 'filip_alpha', 0.0),
             db_on_gpu=getattr(args, 'filip_db_on_gpu', True),
-            device=args.device)
+            device=args.device)      
     else:
         scores, predictions = get_queries_predictions(
             model.encoder_dim, database_descriptors, all_descriptors,
             queries_descriptors, max_results)
 
+    if getattr(args, 'filip_diag', 0) and not args.filip_retrieval:
+                filip_vs_global_diagnostic(
+                    model, test_ds, predictions, scores,
+                    vision_descriptors, text_descriptors,
+                    img_local_descs, text_local_desc,
+                    text_tokens_all=text_tokens_all, text_attentions=text_attentions,
+                    K=min(args.max_rerank, max_results), device=args.device)
+    
     # ---- 2. Reranking ----------------------------------------------------
     if args.reranker:
         max_rerank_k = min(args.max_rerank, max_results)
