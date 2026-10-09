@@ -218,7 +218,7 @@ class LaVPR(pl.LightningModule):
         elif 'eva' in self.model_name:
             self.vlm_encoder, _, self.processor = open_clip.create_model_and_transforms(model_name.upper(), pretrained='merged2b_s8b_b131k')
             self.tokenizer = open_clip.get_tokenizer(model_name)
-        elif 'bge' in self.model_name:
+        elif 'bge' in self.model_name or 'all-minilm' in self.model_name:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)  
             self.vlm_encoder = AutoModel.from_pretrained(model_name, attn_implementation="sdpa")        
 
@@ -424,7 +424,7 @@ class LaVPR(pl.LightningModule):
                text_tokens = self.tokenizer(text).to(self.device)            
                text_embeds = self.vlm_encoder.encode_text(text_tokens)    
                text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)        
-           elif 'bge' in self.model_name:
+           elif 'bge' in self.model_name or 'all-minilm' in self.model_name:
                text_tokens = self.tokenizer(text, padding=True, truncation=True, return_tensors='pt').to(self.device)                
                model_output = self.vlm_encoder(**text_tokens, output_hidden_states=True, return_dict=True)                                     
                text_embeds_not_normilized = model_output[0][:, 0]

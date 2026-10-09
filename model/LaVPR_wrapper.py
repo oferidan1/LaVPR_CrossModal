@@ -43,7 +43,7 @@ class LaVPR_wrapper():
                 self.vpr_encoder, _, self.processor = open_clip.create_model_and_transforms(self.model_name, pretrained='merged2b_s8b_b131k')#'EVA02-B-16'
                 self.tokenizer = open_clip.get_tokenizer(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)                
-            elif 'bge' in self.model_name:
+            elif 'bge' in self.model_name or 'all-minilm' in self.model_name:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)  
                 self.vlm_encoder = AutoModel.from_pretrained(self.model_name, attn_implementation="sdpa").to(args.device) 
         else:          
@@ -165,7 +165,7 @@ class LaVPR_wrapper():
             with torch.no_grad():
                 text_features = self.vpr_encoder.encode_text(text_tokens)    
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        elif 'bge' in self.model_name:                    
+        elif 'bge' in self.model_name or 'all-minilm' in self.model_name:
             text_tokens = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
             with torch.no_grad():      
                 model_output = self.vlm_encoder(**text_tokens)                        
