@@ -41,7 +41,7 @@ def parse_arguments():
     parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_queries.csv")    
     #parser.add_argument("--val_csv", type=str, default="datasets/descriptions/pitts30k_val_800_compressed.csv")    
     parser.add_argument("--val_image_root", type=str, default="/home/shared/datasets/pitts30k/images/val", help="root directory for images")
-    parser.add_argument("--is_freeze_text", type=int, default="0", help="freeze text encoder or not")
+    parser.add_argument("--freeze_text", type=int, default="0", help="freeze text encoder or not")
     parser.add_argument("--train_vlm", type=int, default="2", help="train vlm encoder or not. 1=lora, 2=full train")
     parser.add_argument("--batch_size", type=int, default="20", help="batch size for training")
     parser.add_argument("--loss_name", type=str, default="MultiSimilarityLossCM", help="name of the loss function to use")
@@ -148,7 +148,7 @@ if __name__ == '__main__':
         miner_margin=0.1,
         faiss_gpu=False,        
         cross_modal=args.cross_modal,
-        is_freeze_text=args.is_freeze_text,
+        freeze_text=args.freeze_text,
         train_vlm=args.train_vlm,
         lora_all_linear=args.lora_all_linear,
         lora_target_modules=args.lora_target_modules,

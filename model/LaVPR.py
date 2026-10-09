@@ -58,7 +58,7 @@ class LaVPR(pl.LightningModule):
                 faiss_gpu=False,
                 model_name='Salesforce/blip-itm-base-coco',
                 embeds_dim=256,
-                is_freeze_text=True,
+                freeze_text=True,
                 train_vlm=False,
                 cross_modal=0,
                 lora_all_linear=False,
@@ -222,7 +222,7 @@ class LaVPR(pl.LightningModule):
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)  
             self.vlm_encoder = AutoModel.from_pretrained(model_name, attn_implementation="sdpa")        
 
-        if is_freeze_text:
+        if freeze_text:
             for param in self.vlm_encoder.parameters():
                 param.requires_grad = False
 
@@ -246,7 +246,7 @@ class LaVPR(pl.LightningModule):
             else:
                 self.vlm_encoder = get_peft_model(self.vlm_encoder, lora_config)
 
-        elif is_freeze_text:
+        elif freeze_text:
             self.vlm_encoder.eval()
 
     def _init_weights(self, module):
