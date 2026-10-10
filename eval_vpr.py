@@ -63,7 +63,7 @@ def encode_batch(model, args, images, texts, indices, all_descriptors,
             model.encode_single(images.to(args.device), texts)
         if args.is_image:
             vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
-            img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
+            #img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
         text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()        
         # text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()        
         # text_tokens_all[indices.numpy(), :] = text_tokens.cpu().long().numpy()
@@ -593,6 +593,38 @@ def main(args):
     # ViT-B/16 at 224: (224/16)^2 = 196 patches, +1 CLS. CLIP text is 77 tokens.
     num_img_tokens = 197
     num_text_tokens = 77
+    
+    if args.data in ['amster', 'amstertime']:
+        args.database_folder = "/home/shared/datasets/amstertime/test/database"
+        args.queries_folder = "/home/shared/datasets/amstertime/test/queries"
+        args.image_root = "/home/shared/datasets/amstertime/test"
+        args.queries_csv = "datasets/descriptions/amstertime_descriptions.csv"
+    elif args.data in ['pitts', 'pitts_test', 'pitts30k']:
+        args.database_folder = "/home/shared/datasets/pitts30k/images/test/database"
+        args.queries_folder = "/home/shared/datasets/pitts30k/images/test/queries"
+        args.image_root = "/home/shared/datasets/pitts30k/images/test"
+        args.queries_csv = "datasets/descriptions/pitts30k_test_descriptions.csv"
+    elif args.data in ['pitts_val', 'pitts30k_val']:
+        args.database_folder = "/home/shared/datasets/pitts30k/images/val/database"
+        args.queries_folder = "/home/shared/datasets/pitts30k/images/val/queries"
+        args.image_root = "/home/shared/datasets/pitts30k/images/val"
+        args.queries_csv = "datasets/descriptions/pitts30k_val_800_queries.csv"
+    elif args.data in ['msls', 'msls_val']:
+        args.database_folder = "/home/shared/datasets/msls/val/database"
+        args.queries_folder = "/home/shared/datasets/msls/val/query"
+        args.image_root = "/home/shared/datasets/msls/val/"
+        args.queries_csv = "datasets/descriptions/msls_val_descriptions.csv"
+    elif args.data == 'msls_challenge':
+        args.database_folder = "/home/shared/datasets/msls_challenge"
+        args.queries_folder = None
+        args.image_root = "/home/shared/datasets/msls_challenge/test"
+        args.queries_csv = "datasets/descriptions/msls_challenge_descriptions.csv"
+    elif args.data == 'nordland':
+        args.database_folder = "/home/shared/datasets/nordland/test/database"
+        args.queries_folder = "/home/shared/datasets/nordland/test/queries"
+        args.image_root = "/home/shared/datasets/nordland/test"
+        args.queries_csv = "datasets/descriptions/nordland_descriptions.csv"
+        
 
     if 'msls_challenge' in args.image_root:
         test_ds = MSLSTest(dataset_root=args.database_folder, image_root=args.image_root,

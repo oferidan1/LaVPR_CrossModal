@@ -92,6 +92,8 @@ def parse_arguments():
     )
     parser.add_argument("--gpu", type=str, default="0", help="which gpu to use")
     parser.add_argument("--model_name", type=str, default='openai/clip-vit-base-patch16')
+    parser.add_argument("--image_model_name", type=str, default='dinov2')
+    parser.add_argument("--text_model_name", type=str, default='checkpoints/bge-l-lora-ms-merged')
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--lora_path", type=str, default=None)        
     parser.add_argument("--is_normalize", type=int, default="0", help="is normalize features")    
@@ -102,7 +104,7 @@ def parse_arguments():
     parser.add_argument("--lora_r", type=int, default="64", help="lora_all_linear 0=no/1=yes")     
     parser.add_argument("--agg_type", type=int, default="0", help="0=None, 1=mlp, 2=cosine, 3=2xcosine")
     parser.add_argument("--embeds_dim", type=int, default="512", help="embeds dimension")    
-    parser.add_argument("--cross_modal", type=int, default="2", help="cross modal 0=no/1=blip orig/2=our model")        
+    parser.add_argument("--cross_modal", type=int, default="3", help="cross modal 0=no/1=clip/2=clip ft/3=lavpr_cross")        
     parser.add_argument("--reranker", type=int, default="0", help="reranker")        
     parser.add_argument("--reranker_mllm", type=int, default="0", help="reranker")        
     parser.add_argument("--reranker_filip", type=int, default="0", help="reranker")        
@@ -111,6 +113,7 @@ def parse_arguments():
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
     parser.add_argument("--is_image", type=int, default="1", help="is image support")    
     parser.add_argument("--is_llp", type=int, default="0", help="is llp support")    
+    parser.add_argument("--data", type=str, default="amster", help="amstertime/pitts/msls")        
 
     args = parser.parse_args()
     
