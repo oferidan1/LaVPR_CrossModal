@@ -174,14 +174,26 @@ class LaVPR_cross(pl.LightningModule):
                 p.requires_grad = False
 
         if train_image == 1:
-            self.image_encoder = self._init_lora(
-                self.image_encoder, lora_target_modules, lora_all_linear, lora_r)
+            if 'dinov2' in self.image_model_name:
+                self.image_encoder = self._init_lora(
+                    self.image_encoder, lora_target_modules, lora_all_linear, lora_r)
+            else:
+                # sela: LoRA unsupported — fall back to full fine-tune
+                for p in self.image_encoder.parameters():
+                    p.requires_grad = True
+        elif train_image == 2:
+            # explicit full fine-tune
+            for p in self.image_encoder.parameters():
+                p.requires_grad = True
         elif freeze_image:
             self.image_encoder.eval()
 
         if train_text == 1:
             self.text_encoder = self._init_lora(
                 self.text_encoder, lora_target_modules, lora_all_linear, lora_r)
+        elif train_text == 2:
+            for p in self.text_encoder.parameters():
+                p.requires_grad = True
         elif freeze_text:
             self.text_encoder.eval()
 
@@ -222,11 +234,16 @@ class LaVPR_cross(pl.LightningModule):
         """
         if 'dinov2' in self.image_model_name:
             out = self.image_encoder.forward_features(img)
-            img_local  = out['x_norm_patchtokens']   # (B, N, 768)
-            img_raw    = out['x_norm_clstoken']       # (B, 768)
+            img_local = out['x_norm_patchtokens']    # (B, N, 768)
+            img_raw   = out['x_norm_clstoken']       # (B, 768)
         elif 'sela' in self.image_model_name:
-            img_raw    = self.image_encoder(img)      # (B, 768)
-            img_local  = None
+            # SelaVPR is not a HF model — call base_model directly to bypass
+            # any PEFT wrapper that would inject transformer kwargs
+            encoder = (self.image_encoder.base_model
+                       if hasattr(self.image_encoder, 'base_model')
+                       else self.image_encoder)
+            img_raw   = encoder(img)                 # (B, 2048)
+            img_local = None
 
         img_embeds = F.normalize(self.image_proj(img_raw), p=2, dim=1)  # (B, embeds_dim)
         return img_embeds, img_local
@@ -444,7 +461,8 @@ class LaVPR_cross(pl.LightningModule):
             self.text_encoder.save_pretrained(save_path)
             print(f"Saved text LoRA adapter to: {save_path}")
 
-        if self.train_image == 1:
+        if self.train_image == 1 and 'dinov2' in self.image_model_name:
             save_path = os.path.join(ckpt_dir, 'image_lora')
             self.image_encoder.save_pretrained(save_path)
             print(f"Saved image LoRA adapter to: {save_path}")
+        # train_image == 2 (full fine-tune): weights saved in the PL checkpoint itself
