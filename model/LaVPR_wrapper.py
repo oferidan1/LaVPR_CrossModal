@@ -1,15 +1,14 @@
 import torch
 import numpy as np
 import os
-import sys
-from pathlib import Path
 import peft
 from model.LaVPR import LaVPR
 from model.LaVPR_cross import LaVPR_cross
+from model.LaVPR_text import LaVPR_text
 from model.LaVPR_reranker import LaVPR_reranker
 from transformers import AutoTokenizer, AutoModel, AutoProcessor
 from model.blip_model import BlipForImageTextRetrievalWrapper
-from transformers import BlipProcessor, BlipModel
+from transformers import BlipProcessor
 import open_clip
 
 
@@ -23,11 +22,20 @@ class LaVPR_wrapper():
         self.cross_modal = args.cross_modal
 
         if args.cross_modal == 3:
-            # ---- LaVPR_cross: load from checkpoint, put in eval mode
+            # ---- LaVPR_cross: image + text encoder, cross-modal retrieval
             self.vlm_encoder = LaVPR_cross.load_from_checkpoint(
                 args.model_path,
                 map_location=args.device,
                 strict=True,
+            )
+            self.vlm_encoder = self.vlm_encoder.eval().to(args.device)
+
+        elif args.cross_modal == 4:
+            # ---- LaVPR_text: frozen BGE + Conv adapter, text-only retrieval
+            self.vlm_encoder = LaVPR_text.load_from_checkpoint(
+                args.model_path,
+                map_location=args.device,
+                strict=False,   # backbone stripped from ckpt; reloaded from HF
             )
             self.vlm_encoder = self.vlm_encoder.eval().to(args.device)
 
@@ -109,10 +117,14 @@ class LaVPR_wrapper():
     # ------------------------------------------------------------------
 
     def encode_image(self, images):
-        if hasattr(self, 'vlm_encoder') and isinstance(self.vlm_encoder, LaVPR_cross):
+        if self.cross_modal == 3:
             with torch.no_grad():
                 img_embeds, _ = self.vlm_encoder.encode_image(images)
             return img_embeds
+
+        if self.cross_modal == 4:
+            # LaVPR_text has no image encoder — return None
+            return None
 
         if 'blip' in self.model_name:
             with torch.no_grad():
@@ -141,7 +153,12 @@ class LaVPR_wrapper():
     # ------------------------------------------------------------------
 
     def encode_text(self, texts):
-        if hasattr(self, 'vlm_encoder') and isinstance(self.vlm_encoder, LaVPR_cross):
+        if self.cross_modal == 3:
+            with torch.no_grad():
+                text_embeds, _, _, _ = self.vlm_encoder.encode_text(texts)
+            return text_embeds
+
+        if self.cross_modal == 4:
             with torch.no_grad():
                 text_embeds, _, _, _ = self.vlm_encoder.encode_text(texts)
             return text_embeds
@@ -158,9 +175,9 @@ class LaVPR_wrapper():
                 text_features.to(self.vpr_encoder.dtype)).float()
             return text_features / text_features.norm(dim=-1, keepdim=True)
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
-            text_inputs  = self.processor(text=texts, return_tensors="pt", padding=True,
-                                          truncation=True, max_length=self.max_text_length)
-            text_tokens  = text_inputs.input_ids.to(self.device)
+            text_inputs    = self.processor(text=texts, return_tensors="pt", padding=True,
+                                            truncation=True, max_length=self.max_text_length)
+            text_tokens    = text_inputs.input_ids.to(self.device)
             attention_mask = text_inputs.get('attention_mask')
             if attention_mask is not None:
                 attention_mask = attention_mask.to(self.device)
@@ -196,7 +213,7 @@ class LaVPR_wrapper():
         return image_features, text_features
 
     # ------------------------------------------------------------------
-    # Encode single  (unimodal LaVPR path, or LaVPR_cross when cross_modal==3)
+    # Encode single
     # ------------------------------------------------------------------
 
     def encode_single(self, images, texts):
@@ -205,6 +222,13 @@ class LaVPR_wrapper():
                 (img_embeds, text_embeds, _,
                  img_local, text_local, attention_mask, text_tokens) = self.vlm_encoder(images, texts)
             return img_embeds, text_embeds, img_local, text_local, text_tokens, attention_mask
+
+        if self.cross_modal == 4:
+            # Text-only: no image forward pass
+            with torch.no_grad():
+                text_embeds, text_local, attention_mask, text_tokens = \
+                    self.vlm_encoder.encode_text(texts)
+            return None, text_embeds, None, text_local, text_tokens, attention_mask
 
         img_local, text_local, text_tokens, attention_mask = None, None, None, None
         with torch.no_grad():
