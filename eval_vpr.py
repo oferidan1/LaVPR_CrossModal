@@ -254,6 +254,111 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
 
     return reranked_predictions
 
+def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
+                  match_weight=0.6, device="cuda"):
+    from huggingface_hub import snapshot_download
+    from PIL import Image
+
+    logger.info(f"Reranking top-{max_rerank_k} candidates using JEV (clef-flash)...")
+
+    # ── Load model ONCE ───────────────────────────────────────
+    path = snapshot_download("Cloudflare/clef-flash")
+    sys.path.insert(0, path)
+    from joint_schema_model import collate_records, encode_record, load_release_model  # type: ignore
+
+    jev_model, jev_processor = load_release_model(path, device=device)
+    jev_model.eval()
+
+    QUESTION_SCHEMA = {
+        "place_match": {
+            "type": "choice",
+            "instructions": "Does the image show the same place as the query description?",
+            "criteria": {
+                "match":     "Same location — same buildings, layout, and landmarks.",
+                "no_match":  "Different location.",
+                "uncertain": "Cannot determine due to viewpoint or occlusion.",
+            },
+        },
+        "confidence": {
+            "type": "noul",
+            "instructions": "The image and query description refer to the exact same geographic location.",
+        },
+    }
+
+    db_paths  = np.array(test_ds.images_paths[:test_ds.num_database])
+    q_texts   = test_ds.descriptions[test_ds.num_database:]
+    n_cand    = min(max_rerank_k, predictions.shape[1])
+    reranked  = predictions.copy()
+
+    # ── Build ALL (query, image) pairs upfront ────────────────
+    all_pairs = []
+    for q_idx in range(test_ds.num_queries):
+        cand_indices = predictions[q_idx, :n_cand]
+        for rank, db_idx in enumerate(cand_indices):
+            all_pairs.append((q_idx, rank, q_texts[q_idx], db_paths[db_idx]))
+
+    logger.info(f"Total pairs to score: {len(all_pairs)} "
+                f"({test_ds.num_queries} queries × {n_cand} candidates)")
+
+    # ── Score all pairs in flat batches ───────────────────────
+    all_scores = {}  # (q_idx, rank) → score
+
+    for start in tqdm(range(0, len(all_pairs), batch_size), desc="JEV rerank"):
+        chunk = all_pairs[start: start + batch_size]
+
+        records, keys = [], []
+
+        for q_idx, rank, query_text, img_path in chunk:
+            try:
+                image = Image.open(img_path).convert("RGB")
+                record = {
+                    "state":     {"query": query_text},
+                    "images":    [image],
+                    "questions": QUESTION_SCHEMA,
+                }
+                encoded = encode_record(
+                    jev_processor.tokenizer, record, processor=jev_processor
+                )
+                records.append(encoded)
+                keys.append((q_idx, rank))
+            except Exception as e:
+                logger.warning(f"JEV: failed {img_path}: {e}")
+                all_scores[(q_idx, rank)] = 0.0
+
+        if not records:
+            continue
+
+        batch = collate_records(
+            records,
+            jev_processor.tokenizer.pad_token_id,
+            torch.device(device),
+        )
+
+        with torch.inference_mode():
+            batch_logits = jev_model(batch)
+
+        for (q_idx, rank), encoded, logits in zip(keys, records, batch_logits):
+            results = {}
+            for question, q_logits in zip(encoded.questions, logits):
+                probs = q_logits.float().softmax(-1).tolist()
+                results[question.question_id] = dict(
+                    zip(question.option_ids, probs)
+                )
+            match_prob    = results["place_match"].get("match", 0.0)
+            location_prob = list(results["confidence"].values())[0]
+            all_scores[(q_idx, rank)] = (
+                match_weight * match_prob + (1 - match_weight) * location_prob
+            )
+
+    # ── Rerank each query using collected scores ───────────────
+    for q_idx in range(test_ds.num_queries):
+        cand_indices = predictions[q_idx, :n_cand]
+        scores = np.array([all_scores.get((q_idx, r), 0.0) for r in range(n_cand)])
+        order  = np.argsort(-scores)
+        reranked[q_idx, :n_cand] = cand_indices[order]
+
+    logger.info("JEV reranking complete.")
+    return reranked
 
 def rerank_by_filip(model, test_ds, predictions, vision_descriptors, text_descriptors,
                     img_local_descs, text_local_desc, text_tokens_all=None,
@@ -744,6 +849,17 @@ def main(args):
         for i in range(len(q_texts)):
             print(f"Sending query {i} to LLM")
             predictions[i] = rerank_by_mllm(db_images[i], q_texts[i], predictions[i])
+            
+      # ── JEV reranker ──────────────────────────────────────────────────────
+    if args.reranker_jev:
+        max_rerank_k = min(args.max_rerank, max_results)
+        predictions = rerank_by_jev(
+            test_ds, predictions,
+            max_rerank_k=max_rerank_k,
+            batch_size=getattr(args, "jev_batch_size", 32),
+            match_weight=getattr(args, "jev_match_weight", 0.6),
+            device=args.device,
+        )
 
     # ---- 3. Metrics ------------------------------------------------------
     if is_msls_challenge:

@@ -35,7 +35,7 @@ def parse_arguments():
     a("--val_csv",       type=str,   default="datasets/descriptions/pitts30k_val_800_queries.csv",   help="validation CSV")
     a("--val_image_root",type=str,   default="/home/shared/datasets/pitts30k/images/val",            help="validation image root")
     # Loss
-    a("--loss_name",     type=str,   default="MultiSimilarityLoss",                                  help="loss function name")
+    a("--loss_name",     type=str,   default="MultiSimilarityLossCM",                                help="loss function name")
     # Misc
     a("--resume",        type=str,   default=None,                                                   help="checkpoint path to resume from")
 

@@ -108,12 +108,13 @@ def parse_arguments():
     parser.add_argument("--reranker", type=int, default="0", help="reranker")        
     parser.add_argument("--reranker_mllm", type=int, default="0", help="reranker")        
     parser.add_argument("--reranker_filip", type=int, default="0", help="reranker")        
+    parser.add_argument("--reranker_jev", type=int, default="0", help="reranker")        
     parser.add_argument("--filip_alpha", type=float, default="1", help="reranker")      
     parser.add_argument("--filip_retrieval", type=int, default="0", help="reranker")                  
     parser.add_argument("--bfloat16", type=int, default="0", help="bfloat16 or not")    
     parser.add_argument("--is_image", type=int, default="1", help="is image support")    
-    parser.add_argument("--is_llp", type=int, default="0", help="is llp support")    
-    parser.add_argument("--data", type=str, default="amster", help="amstertime/pitts/msls")        
+    parser.add_argument("--is_llp", type=int, default="0", help="is llp support")        
+    parser.add_argument("--data", type=str, default=None, help="amstertime/pitts/msls")        
 
     args = parser.parse_args()
     

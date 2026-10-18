@@ -142,7 +142,7 @@ def rerank(args):
     # ---- Short-circuit: load precomputed reranked results and just print recalls
     if args.load_reranked:
         print(f"Loading precomputed reranked results from {args.load_reranked}")
-        saved    = torch.load(args.load_reranked)
+        saved    = torch.load(args.load_reranked, weights_only=False)
         reranked = saved['reranked_indices']
         topk_idx = saved['topk_indices']
         positives = test_ds.get_positives()
@@ -158,61 +158,63 @@ def rerank(args):
         print(sep)
         return
 
-    # ---- Load chunks + descriptions from chunked CSV
-    print("Loading chunks from CSV...")
-    chunks_map, desc_map = {}, {}
-    df = pd.read_csv(args.csv, engine='python', encoding='utf-8',
-                     on_bad_lines='skip', quotechar='"', skipinitialspace=True)
-    for row in df.itertuples():
-        abs_path = posixpath.join(args.image_root, row.image_path)
-        raw = row.chunks
-        if isinstance(raw, str):
-            try:
-                chunks = json.loads(raw)
-            except json.JSONDecodeError:
-                chunks = ast.literal_eval(raw)
-        else:
-            chunks = [row.description]
-        chunks_map[abs_path] = chunks
-        desc_map[abs_path]   = row.description
-
-    # ---- Load encoder
-    print(f"Loading encoder from {args.model_name}...")
-    tokenizer, model = load_encoder(args.model_name, device)
-
-    # ---- Global descriptors — order matches TestDataset: [db..., queries...]
-    if args.global_feats_path:
-        print(f"Loading global features from {args.global_feats_path}")
-        saved = torch.load(args.global_feats_path)
-        if 'db_feats' in saved and 'q_feats' in saved:
-            db_global = saved['db_feats']       # (N_db, D)
-            q_global  = saved['q_feats']        # (N_q,  D)
-        else:
-            # combined tensor ordered [db..., queries...] as in eval pipeline
-            all_feats = saved['descriptors']
-            db_global = all_feats[:N_db]
-            q_global  = all_feats[N_db:]
-    else:
-        print("Computing global descriptors from full descriptions...")
-        db_global = encode_texts([desc_map[p] for p in db_paths],
-                                 tokenizer, model, device, args.batch_size)
-        q_global  = encode_texts([desc_map[p] for p in q_paths],
-                                 tokenizer, model, device, args.batch_size)
-
-    # ---- Initial top-K shortlist
-    print(f"Building top-{args.topk} shortlist...")
-    sim_matrix      = torch.mm(q_global, db_global.T)       # (N_q, N_db)
-    _, topk_indices = sim_matrix.topk(args.topk, dim=1)     # (N_q, topk)
-
-    # ---- Encode only chunks needed: all queries + topk db candidates
-    topk_db_indices = set(topk_indices.numpy().flatten().tolist())
-
+    # ---- Load chunk embeddings from cache (no encoding needed)
     if args.chunk_feats_path and os.path.exists(args.chunk_feats_path):
         print(f"Loading cached chunk embeddings from {args.chunk_feats_path}")
-        chunk_cache     = torch.load(args.chunk_feats_path)
-        chunk_emb_map   = chunk_cache['chunk_emb_map']   # {abs_path: (n_chunks, D) tensor}
+        chunk_cache   = torch.load(args.chunk_feats_path, weights_only=False)
+        chunk_emb_map = chunk_cache['chunk_emb_map']    # {abs_path: (n_chunks, D)}
+        db_global     = chunk_cache['db_global']        # (N_db, D)
+        q_global      = chunk_cache['q_global']         # (N_q,  D)
+        topk_indices  = chunk_cache['topk_indices']     # (N_q, topk)
+
     else:
-        print("Collecting unique chunks for queries and topk candidates...")
+        # ---- Load chunks + descriptions from chunked CSV
+        print("Loading chunks from CSV...")
+        chunks_map, desc_map = {}, {}
+        df = pd.read_csv(args.csv, engine='python', encoding='utf-8',
+                         on_bad_lines='skip', quotechar='"', skipinitialspace=True)
+        for row in df.itertuples():
+            abs_path = posixpath.join(args.image_root, row.image_path)
+            raw = row.chunks
+            if isinstance(raw, str):
+                try:
+                    chunks = json.loads(raw)
+                except json.JSONDecodeError:
+                    chunks = ast.literal_eval(raw)
+            else:
+                chunks = [row.description]
+            chunks_map[abs_path] = chunks
+            desc_map[abs_path]   = row.description
+
+        # ---- Load encoder
+        print(f"Loading encoder from {args.model_name}...")
+        tokenizer, model = load_encoder(args.model_name, device)
+
+        # ---- Global descriptors
+        if args.global_feats_path:
+            print(f"Loading global features from {args.global_feats_path}")
+            saved = torch.load(args.global_feats_path, weights_only=False)
+            if 'db_feats' in saved and 'q_feats' in saved:
+                db_global = saved['db_feats']
+                q_global  = saved['q_feats']
+            else:
+                all_feats = saved['descriptors']
+                db_global = all_feats[:N_db]
+                q_global  = all_feats[N_db:]
+        else:
+            print("Computing global descriptors from full descriptions...")
+            db_global = encode_texts([desc_map[p] for p in db_paths],
+                                     tokenizer, model, device, args.batch_size)
+            q_global  = encode_texts([desc_map[p] for p in q_paths],
+                                     tokenizer, model, device, args.batch_size)
+
+        # ---- Initial top-K shortlist
+        print(f"Building top-{args.topk} shortlist...")
+        sim_matrix      = torch.mm(q_global, db_global.T)
+        _, topk_indices = sim_matrix.topk(args.topk, dim=1)
+
+        # ---- Encode only chunks for queries + topk db candidates
+        topk_db_indices = set(topk_indices.numpy().flatten().tolist())
         paths_to_encode = q_paths + [db_paths[i] for i in topk_db_indices]
 
         all_chunk_texts, chunk_idx = [], {}
@@ -227,7 +229,6 @@ def rerank(args):
         all_chunk_embeds = encode_texts(all_chunk_texts, tokenizer, model,
                                         device, args.batch_size)
 
-        # Build per-path embedding map
         chunk_emb_map = {}
         for path in paths_to_encode:
             chunks = chunks_map.get(path, [desc_map[path]])
@@ -235,7 +236,12 @@ def rerank(args):
 
         if args.chunk_feats_path:
             print(f"Saving chunk embeddings to {args.chunk_feats_path}")
-            torch.save({'chunk_emb_map': chunk_emb_map}, args.chunk_feats_path)
+            torch.save({
+                'chunk_emb_map': chunk_emb_map,
+                'db_global':     db_global,
+                'q_global':      q_global,
+                'topk_indices':  topk_indices,
+            }, args.chunk_feats_path)
 
     def get_chunk_emb(path):
         return chunk_emb_map[path].numpy()
@@ -301,10 +307,10 @@ def rerank(args):
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     a = p.add_argument
-    a("--csv",                      type=str,   default="datasets/descriptions/pitts30k_test_chunked.csv",          help="CSV with db+query rows, description and chunks columns")
-    a("--image_root",               type=str,   default="/home/shared/datasets/pitts30k/images/test",              help="root directory prepended to image_path column")
-    a("--db_folder",                type=str,   default="/home/shared/datasets/pitts30k/images/test/database",     help="database folder path (passed to TestDataset)")
-    a("--query_folder",             type=str,   default="/home/shared/datasets/pitts30k/images/test/queries",      help="queries folder path (passed to TestDataset)")
+    a("--csv",                      type=str,   default="datasets/descriptions/amstertime_chunked_3.csv",          help="CSV with db+query rows, description and chunks columns")
+    a("--image_root",               type=str,   default="/home/shared/datasets/amstertime/test",              help="root directory prepended to image_path column")
+    a("--db_folder",                type=str,   default="/home/shared/datasets/amstertime/test/database",     help="database folder path (passed to TestDataset)")
+    a("--query_folder",             type=str,   default="/home/shared/datasets/amstertime/test/queries",      help="queries folder path (passed to TestDataset)")
     a("--positive_dist_threshold",  type=int,   default=25,                                                    help="UTM radius in meters for positive match")
     a("--model_name",               type=str,   default="checkpoints/bge-l-lora-ms-merged",                   help="merged BGE model path or HF name")
     a("--global_feats_path",        type=str,   default=None,                                                  help=".pt with db_feats+q_feats or combined descriptors[db..q]")
@@ -314,6 +320,7 @@ if __name__ == '__main__':
     a("--topk_out",                 type=int,   default=5,                                                     help="k for final recall reporting")
     a("--output",                   type=str,   default="reranked.pt",                                        help="output file")
     a("--load_reranked",            type=str,   default=None,                                                  help="load precomputed reranked .pt and print recalls (skips all encoding)")
+    a("--force",                    action="store_true",                                                       help="force rerun even if output .pt already exists")
     a("--batch_size",               type=int,   default=256,                                                   help="encoding batch size")
     args = p.parse_args()
     rerank(args)
