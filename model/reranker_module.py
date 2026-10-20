@@ -193,7 +193,9 @@ class CrossModalReranker(nn.Module):
         # Scalar relevance score head — used at inference
         self.score_head = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Linear(d_model, 1, bias=True),
+            nn.Linear(d_model, d_model // 2, bias=True),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1, bias=True),
         )
 
         self._init_weights()
@@ -202,10 +204,11 @@ class CrossModalReranker(nn.Module):
         nn.init.kaiming_uniform_(self.img_proj.weight, mode='fan_in', nonlinearity='relu')
         nn.init.kaiming_uniform_(self.txt_proj.weight, mode='fan_in', nonlinearity='relu')
         nn.init.kaiming_uniform_(self.out_proj[1].weight, mode='fan_in', nonlinearity='relu')
-        # score_head: init to near-zero so early scores are near-uniform
-        # avoids large noisy gradients at start of training
-        nn.init.zeros_(self.score_head[1].weight)
-        nn.init.zeros_(self.score_head[1].bias)
+        # score_head: init first layer normally, last layer to near-zero
+        # so early scores are near-uniform — avoids large noisy gradients
+        nn.init.kaiming_uniform_(self.score_head[1].weight, nonlinearity='relu')
+        nn.init.zeros_(self.score_head[3].weight)
+        nn.init.zeros_(self.score_head[3].bias)
 
     def forward(
         self,
@@ -281,6 +284,9 @@ class CrossModalRerankModule(pl.LightningModule):
         rerank_k:        int   = 20,    # shortlist size at val/inference
         faiss_gpu:       bool  = False,
 
+        # ---- Loss
+        margin:          float = 0.3,
+
         # ---- Optimiser
         lr:           float = 1e-4,
         weight_decay: float = 1e-3,
@@ -323,6 +329,7 @@ class CrossModalRerankModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.epochs       = epochs
+        self.margin       = margin
 
     # ------------------------------------------------------------------
     # Setup
@@ -381,11 +388,19 @@ class CrossModalRerankModule(pl.LightningModule):
         scores:         torch.Tensor,   # (B, K)  scalar relevance scores
         place_ids:      torch.Tensor,   # (B, K)  place IDs, -1 = padding
         query_place_id: torch.Tensor,   # (B,)    true place ID of each query
+        margin:         float = 0.3,
     ) -> torch.Tensor:
         """
-        Per-query softmax cross-entropy over shortlist scalar scores.
-        Targets = uniform distribution over positives.
-        Loss = KL( targets || softmax(scores) )
+        Margin ranking loss: best positive must score at least `margin`
+        above every negative. Directly optimises R@1.
+
+        loss = mean( max(0, margin - best_pos_score + neg_score) )
+
+        Advantages over listwise cross-entropy:
+        - Directly optimises the positive-negative score gap
+        - Ignores easy negatives (already below margin) — focuses on hard ones
+        - Multiple positives handled naturally — best one drives the gradient
+        - No softmax saturation issues
         """
         query_pid = query_place_id.unsqueeze(1)     # (B, 1)
         is_pos    = place_ids.eq(query_pid)         # (B, K)
@@ -395,19 +410,19 @@ class CrossModalRerankModule(pl.LightningModule):
         valid      = 0
 
         for b in range(scores.shape[0]):
-            pos_mask = is_pos[b]  & is_valid[b]
+            pos_mask = is_pos[b] & is_valid[b]
             neg_mask = ~is_pos[b] & is_valid[b]
 
             if not pos_mask.any() or not neg_mask.any():
                 continue
 
-            valid_mask_b = pos_mask | neg_mask
-            scores_b     = scores[b][valid_mask_b]          # (P+N,)
-            is_pos_valid = pos_mask[valid_mask_b].float()   # (P+N,)
+            pos_scores = scores[b][pos_mask]        # (P,)
+            neg_scores = scores[b][neg_mask]        # (N,)
 
-            targets    = is_pos_valid / is_pos_valid.sum().clamp(min=1)
-            log_probs  = F.log_softmax(scores_b, dim=0)
-            total_loss = total_loss + -(targets * log_probs).sum()
+            # Use the best positive — directly optimises R@1
+            best_pos   = pos_scores.max()
+            losses     = F.relu(margin - best_pos + neg_scores)  # (N,)
+            total_loss = total_loss + losses.mean()
             valid     += 1
 
         return total_loss / max(valid, 1)
@@ -462,7 +477,7 @@ class CrossModalRerankModule(pl.LightningModule):
 
         scores = torch.cat(scores_list, dim=0)                   # (B, K)
 
-        loss = self._listwise_loss(scores, place_ids, query_place_id)
+        loss = self._listwise_loss(scores, place_ids, query_place_id, self.margin)
         self.log('train/loss', loss, prog_bar=True, logger=True)
         return loss
 

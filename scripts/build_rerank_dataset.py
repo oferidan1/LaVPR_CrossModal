@@ -77,17 +77,21 @@ def parse_args():
       default='/home/shared/datasets/gsv_cities/',
       help='Prepended to image_path column to get the full path')
     a('--image_size',     type=int, default=224)
-    a('--top_k_train',   type=int, default=100,
+    a('--top_k_train',   type=int, default=50,
       help='Shortlist size — how many stage-1 candidates to retrieve per query')
-    a('--cache_dir',     type=str, default='cache/')
+    a('--cache_dir',     type=str, default='cache1/')
     a('--batch_size',    type=int, default=256)
     a('--num_workers',   type=int, default=4)
     a('--gpu',           type=str, default='0')
     a('--faiss_gpu',          action='store_true')
+    a('--max_text_len',       type=int, default=128,
+      help='Cap text token length saved to HDF5 — reduces cross-attn memory')
     a('--skip_local_tokens',  action='store_true',
       help='Skip local token extraction (if you only want to re-mine)')
     a('--force_remine',       action='store_true',
       help='Force re-run FAISS mining even if gsv_triplets.json exists')
+    a('--hard_only',          action='store_true',
+      help='Only keep queries where stage-1 top-1 is wrong — reduces training set')
 
     return p.parse_args()
 
@@ -238,44 +242,45 @@ def extract_local_tokens(
     device:      torch.device,
 ):
     """
-    Pass 2: extract and save local tokens only for images that appear
-    in the mined shortlists — not the full dataset.
+    Pass 2: extract local tokens for all shortlist images and store them
+    in a single HDF5 file for fast random access during training.
 
-    Saves per-index .pt files under cache_dir/local_tokens/:
-        img_{idx}.pt   : (N_patches, D_img)  float16
-        text_{idx}.pt  : (L, D_txt)          float16
-        mask_{idx}.pt  : (L,)                bool
+    HDF5 layout  (cache_dir/local_tokens.h5):
+        /img/{idx}   : (N_patches, D_img)  float16
+        /text/{idx}  : (L, D_txt)          float16
+        /mask/{idx}  : (L,)                uint8
 
-    Using float16 halves disk usage with negligible precision loss
-    for downstream cosine similarity.
+    Random access in HDF5 is O(1) — no per-file Python overhead,
+    no filesystem metadata lookups. This is the main training bottleneck fix.
     """
-    token_dir = os.path.join(cache_dir, 'local_tokens')
-    os.makedirs(token_dir, exist_ok=True)
+    import h5py
+    h5_path = os.path.join(cache_dir, 'local_tokens.h5')
 
-    # Collect unique indices needed — queries + all shortlist images
+    # Collect unique indices needed
     needed = set()
     for t in triplets:
         needed.add(t['query_idx'])
         needed.update(t['shortlist'])
     needed = sorted(needed)
+    print(f"  Unique indices to extract: {len(needed):,}")
 
-    print(f"  Unique indices to extract: {len(needed):,}  "
-          f"(out of {len(dataset):,} total)")
+    # Check which are already in the HDF5
+    existing = set()
+    if os.path.exists(h5_path):
+        with h5py.File(h5_path, 'r') as f:
+            if 'img' in f:
+                existing = set(int(k) for k in f['img'].keys())
 
-    # Check which are already cached
-    todo = [i for i in needed
-            if not os.path.exists(os.path.join(token_dir, f'img_{i}.pt'))]
-    print(f"  Already cached: {len(needed) - len(todo):,}  "
-          f"To extract: {len(todo):,}")
+    todo = [i for i in needed if i not in existing]
+    print(f"  Already cached: {len(existing):,}  To extract: {len(todo):,}")
 
     if not todo:
-        print("  All tokens already cached — skipping extraction.")
+        print(f"  All tokens cached in {h5_path} — skipping extraction.")
         return
 
-    # Use a Subset loader over only the needed indices
     from torch.utils.data import Subset
-    subset  = Subset(dataset, todo)
-    loader  = DataLoader(
+    subset = Subset(dataset, todo)
+    loader = DataLoader(
         subset,
         batch_size  = batch_size,
         shuffle     = False,
@@ -287,28 +292,35 @@ def extract_local_tokens(
     backbone.eval()
     saved = 0
 
-    for batch in tqdm(loader, desc='Extracting local tokens'):
-        images    = batch['image'].to(device)   # (B, C, H, W)
-        texts     = batch['text']               # List[str]
-        idxs      = batch['idx']               # (B,)  original dataset indices
+    # Open HDF5 in append mode so partial runs are resumable
+    with h5py.File(h5_path, 'a') as f:
+        img_grp  = f.require_group('img')
+        text_grp = f.require_group('text')
+        mask_grp = f.require_group('mask')
 
-        _, img_local               = backbone.encode_image(images)
-        _, text_local, mask, _     = backbone.encode_text(texts)
-        # img_local  : (B, N, D_img)
-        # text_local : (B, L, D_txt)
-        # mask       : (B, L)
+        for batch in tqdm(loader, desc='Extracting local tokens'):
+            images = batch['image'].to(device)
+            texts  = batch['text']
+            idxs   = batch['idx']
 
-        for b in range(len(idxs)):
-            idx = int(idxs[b])
-            torch.save(img_local [b].half().cpu(),
-                       os.path.join(token_dir, f'img_{idx}.pt'))
-            torch.save(text_local[b].half().cpu(),
-                       os.path.join(token_dir, f'text_{idx}.pt'))
-            torch.save(mask      [b].cpu(),
-                       os.path.join(token_dir, f'mask_{idx}.pt'))
-            saved += 1
+            _, img_local           = backbone.encode_image(images)
+            _, text_local, mask, _ = backbone.encode_text(texts)
 
-    print(f"  Saved {saved:,} token files → {token_dir}")
+            # Cap text length to reduce cross-attention memory at training time.
+            # VPR descriptions are short — 128 tokens captures everything.
+            max_text_len = args.max_text_len
+            text_local = text_local[:, :max_text_len, :]
+            mask       = mask      [:, :max_text_len]
+
+            for b in range(len(idxs)):
+                idx = str(int(idxs[b]))
+                img_grp .create_dataset(idx, data=img_local [b].half().cpu().numpy())
+                text_grp.create_dataset(idx, data=text_local[b].half().cpu().numpy())
+                mask_grp.create_dataset(idx, data=mask      [b].cpu().numpy().astype('uint8'))
+                saved += 1
+
+    print(f"  Saved {saved:,} entries → {h5_path}  "
+          f"({os.path.getsize(h5_path)/1e9:.2f} GB)")
 
 
 # ---------------------------------------------------------------------------
@@ -355,12 +367,15 @@ def mine_triplets(
         neg = [i for i in retrieved if int(place_ids[i]) != q_place]
 
         if pos and neg:
+            # top-1 is hard if the first retrieved image is not a positive
+            top1_is_wrong = retrieved[0] not in set(pos)
             triplets.append({
-                'query_idx' : q_idx,
-                'place_id'  : q_place,
-                'shortlist' : retrieved[:top_k_train],
-                'pos_idxs'  : pos,
-                'neg_idxs'  : neg,
+                'query_idx'    : q_idx,
+                'place_id'     : q_place,
+                'shortlist'    : retrieved[:top_k_train],
+                'pos_idxs'     : pos,
+                'neg_idxs'     : neg,
+                'top1_is_wrong': top1_is_wrong,
             })
         else:
             no_pos += 1
@@ -499,8 +514,14 @@ if __name__ == '__main__':
             json.dump(triplets, f)
         print(f"Saved → {triplet_path}")
 
+    if args.hard_only:
+        before   = len(triplets)
+        triplets = [t for t in triplets if t.get('top1_is_wrong', False)]
+        print(f"  Hard-only filter: {before:,} → {len(triplets):,} queries "
+              f"({len(triplets)/before*100:.1f}% kept)")
+
     triplet_mb = os.path.getsize(triplet_path) / 1e6
-    print(f"Saved → {triplet_path}  ({triplet_mb:.0f} MB)")
+    print(f"Triplets → {triplet_path}  ({triplet_mb:.0f} MB)")
 
     # ------------------------------------------------------------------
     # 5. Extract local tokens for all shortlist images

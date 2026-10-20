@@ -44,7 +44,9 @@ def parse_args():
     a = p.add_argument
 
     # Backbone (frozen)
-    a('--backbone_ckpt',    type=str, required=True)
+    a('--backbone_ckpt',    type=str,
+      default='checkpoints/dinov2-bge-ft-lora-ms/checkpoints/'
+              'lavpr_epoch(19)_step(15640)_R1[0.5663]_R5[0.8237].ckpt')
 
     # Pre-mined data
     a('--triplets_json',    type=str, default='cache/gsv_triplets.json')
@@ -87,6 +89,10 @@ def parse_args():
       help='Must match backbone embeds_dim')
 
 
+
+    # Loss
+    a('--margin',           type=float, default=0.3,
+      help='Margin for ranking loss: pos must score margin above all negatives')
 
     # Optimiser
     a('--lr',               type=float, default=1e-4)
@@ -207,6 +213,7 @@ if __name__ == '__main__':
             out_dim         = args.out_dim,
             rerank_k        = args.rerank_k,
             faiss_gpu       = args.faiss_gpu,
+            margin          = args.margin,
             lr              = args.lr,
             weight_decay    = args.weight_decay,
             warmup_steps    = args.warmup_steps,
