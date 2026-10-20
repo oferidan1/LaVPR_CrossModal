@@ -86,6 +86,8 @@ def parse_args():
     a('--faiss_gpu',          action='store_true')
     a('--skip_local_tokens',  action='store_true',
       help='Skip local token extraction (if you only want to re-mine)')
+    a('--force_remine',       action='store_true',
+      help='Force re-run FAISS mining even if gsv_triplets.json exists')
 
     return p.parse_args()
 
@@ -474,21 +476,28 @@ if __name__ == '__main__':
           f"place_ids {place_ids.shape}")
 
     # ------------------------------------------------------------------
-    # 4. Mine
+    # 4. Mine (or load from cache)
     # ------------------------------------------------------------------
-    print(f"\n[4/4] Mining hard negatives  top_k_train={args.top_k_train}")
-    triplets = mine_triplets(
-        img_feats   = img_feats,
-        text_feats  = text_feats,
-        place_ids   = place_ids,
-        top_k_train = args.top_k_train,
-        faiss_gpu   = args.faiss_gpu,
-    )
+    if os.path.exists(triplet_path) and not args.force_remine:
+        print(f"\n[4/4] Loading cached triplets  {triplet_path}")
+        with open(triplet_path) as f:
+            triplets = json.load(f)
+        print(f"      {len(triplets):,} triplets loaded — skipping FAISS mining.")
+    else:
+        print(f"\n[4/4] Mining hard negatives  top_k_train={args.top_k_train}")
+        triplets = mine_triplets(
+            img_feats   = img_feats,
+            text_feats  = text_feats,
+            place_ids   = place_ids,
+            top_k_train = args.top_k_train,
+            faiss_gpu   = args.faiss_gpu,
+        )
 
-    sanity_check(triplets, place_ids)
+        sanity_check(triplets, place_ids)
 
-    with open(triplet_path, 'w') as f:
-        json.dump(triplets, f)
+        with open(triplet_path, 'w') as f:
+            json.dump(triplets, f)
+        print(f"Saved → {triplet_path}")
 
     triplet_mb = os.path.getsize(triplet_path) / 1e6
     print(f"Saved → {triplet_path}  ({triplet_mb:.0f} MB)")

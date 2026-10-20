@@ -11,28 +11,27 @@ Pipeline
 
     Stage-2 (this module — only CrossModalReranker trains)
         → cross-attention over local patch / text tokens
-        → refined L2-normalised embedding per (query, candidate) pair
-        → MS Loss over batch + hard-negative queue
-        → at inference: re-sort the top-K by refined similarity
+        → scalar relevance score per (query, candidate) pair via score_head
+        → listwise cross-entropy loss (no miner needed — all negatives are hard)
+        → at inference: re-sort the top-K by scalar score
 
 Architecture
 ------------
-    text_local  (B*K, L, D_txt)  ─→  txt_proj  ─→  (B*K, L, d)
-                                                          │
-                                                    CrossAttnBlock × n_layers
-                                                    (text queries image patches)
-                                                          │
-    img_local   (B*K, N, D_img)  ─→  img_proj  ─→  (B*K, N, d)
+    text_local  (K, L, D_txt)  ─→  txt_proj  ─→  (K, L, d)
+                                                        │
+                                                  CrossAttnBlock × n_layers
+                                                  (text queries image patches)
+                                                        │
+    img_local   (K, N, D_img)  ─→  img_proj  ─→  (K, N, d)
 
-    CLS token of attended text  →  out_proj  →  L2-norm  →  (B*K, out_dim)
+    CLS of attended text  →  score_head  →  scalar score  (K,)
 
 Training data (GSV)
 -------------------
     - 4 GT positives per place
-    - Stage-1 top-100 shortlist as training candidates (richer mining)
-    - Stage-1 top-20  shortlist at inference (latency constraint)
-    - Hard-negative queue (4 096 entries) accumulates confusing cases
-      across batches so MS Loss sees sufficient pair diversity
+    - Stage-1 top-100 shortlist mined offline
+    - Precomputed local tokens stored in HDF5 or .pt files
+    - Backbone never runs at training time
 """
 
 import os
@@ -123,10 +122,10 @@ class CrossAttnBlock(nn.Module):
     ) -> torch.Tensor:                  # (B, L, d)
 
         # 1. Cross-attention
-        q  = self.norm_q(query)
-        k  = self.norm_kv(kv)
-        ca, _ = self.cross_attn(q, k, k)           # image has no padding
-        query = query + self.drop_cross(ca)
+        q       = self.norm_q(query)
+        kv_norm = self.norm_kv(kv)
+        ca, _   = self.cross_attn(q, kv_norm, kv_norm)    # image has no padding
+        query   = query + self.drop_cross(ca)
 
         # 2. Self-attention  (mask: MHA expects True = ignore)
         q2 = self.norm_self(query)
@@ -191,12 +190,22 @@ class CrossModalReranker(nn.Module):
             nn.Linear(d_model, out_dim, bias=False),
         )
 
+        # Scalar relevance score head — used at inference
+        self.score_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 1, bias=True),
+        )
+
         self._init_weights()
 
     def _init_weights(self):
         nn.init.kaiming_uniform_(self.img_proj.weight, mode='fan_in', nonlinearity='relu')
         nn.init.kaiming_uniform_(self.txt_proj.weight, mode='fan_in', nonlinearity='relu')
         nn.init.kaiming_uniform_(self.out_proj[1].weight, mode='fan_in', nonlinearity='relu')
+        # score_head: init to near-zero so early scores are near-uniform
+        # avoids large noisy gradients at start of training
+        nn.init.zeros_(self.score_head[1].weight)
+        nn.init.zeros_(self.score_head[1].bias)
 
     def forward(
         self,
@@ -209,8 +218,9 @@ class CrossModalReranker(nn.Module):
         text_mask follows HuggingFace convention: 1 = keep, 0 = pad.
         Internally converted to True=ignore for nn.MultiheadAttention.
         """
-        img_tokens  = self.img_proj(img_local)    # (B, N, d)
-        text_tokens = self.txt_proj(text_local)   # (B, L, d)
+        dtype       = self.img_proj.weight.dtype
+        img_tokens  = self.img_proj(img_local.to(dtype))    # (B, N, d)
+        text_tokens = self.txt_proj(text_local.to(dtype))   # (B, L, d)
 
         # Convert HF mask (1=keep) → MHA pad mask (True=ignore)
         pad_mask = None
@@ -221,9 +231,12 @@ class CrossModalReranker(nn.Module):
         for block in self.blocks:
             x = block(query=x, kv=img_tokens, query_pad_mask=pad_mask)
 
-        cls = x[:, 0]                             # attended CLS  (B, d)
-        out = self.out_proj(cls)                  # (B, out_dim)
-        return F.normalize(out, p=2, dim=1)
+        cls   = x[:, 0]                           # attended CLS  (B, d)
+        score = self.score_head(cls).squeeze(-1)  # (B,)  scalar relevance
+        # out_proj only needed at inference (embedding for FAISS-style retrieval)
+        out   = self.out_proj(cls) if not self.training else None
+        emb   = F.normalize(out, p=2, dim=1) if out is not None else None
+        return emb, score
 
 
 
@@ -355,8 +368,8 @@ class CrossModalRerankModule(pl.LightningModule):
         img_local:  torch.Tensor,   # (M, N, D_img)
         text_local: torch.Tensor,   # (M, L, D_txt)
         text_mask:  torch.Tensor,   # (M, L)
-    ) -> torch.Tensor:              # (M, out_dim)  L2-normed
-        """Run reranker forward on M (image, text) pairs."""
+    ):
+        """Returns (embeddings (M, out_dim), scores (M,))"""
         return self.reranker(img_local, text_local, text_mask)
 
     # ------------------------------------------------------------------
@@ -365,58 +378,37 @@ class CrossModalRerankModule(pl.LightningModule):
 
     def _listwise_loss(
         self,
-        refined:   torch.Tensor,   # (B*K, out_dim)  L2-normed refined embeds
-        place_ids: torch.Tensor,   # (B, K)           place IDs, -1 = padding
+        scores:         torch.Tensor,   # (B, K)  scalar relevance scores
+        place_ids:      torch.Tensor,   # (B, K)  place IDs, -1 = padding
+        query_place_id: torch.Tensor,   # (B,)    true place ID of each query
     ) -> torch.Tensor:
         """
-        Per-query softmax cross-entropy over the shortlist.
-
-        For each query:
-          - scores  = cosine sim of each candidate to the mean positive anchor
-          - targets = uniform distribution over positives (soft label)
-          - loss    = KL( targets || softmax(scores) )
-
-        O(B*K) — no pairwise matrix, no miner.
-        This is correct here because every negative in the shortlist is already
-        a hard negative (pre-mined from stage-1), so mining is redundant.
+        Per-query softmax cross-entropy over shortlist scalar scores.
+        Targets = uniform distribution over positives.
+        Loss = KL( targets || softmax(scores) )
         """
-        B, K   = place_ids.shape
-        refined_bk = refined.view(B, K, -1)          # (B, K, out_dim)
+        query_pid = query_place_id.unsqueeze(1)     # (B, 1)
+        is_pos    = place_ids.eq(query_pid)         # (B, K)
+        is_valid  = place_ids >= 0                  # (B, K)
 
-        # Identify positives per query using place_id of first entry
-        # (first entry is always a positive — guaranteed by RerankDataset)
-        query_pid = place_ids[:, 0].unsqueeze(1)     # (B, 1)
-        is_pos    = place_ids.eq(query_pid)          # (B, K)
-        is_valid  = place_ids >= 0                   # (B, K)  exclude padding
-
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
         valid      = 0
 
-        for b in range(B):
-            pos_mask = is_pos[b]  & is_valid[b]      # (K,)
+        for b in range(scores.shape[0]):
+            pos_mask = is_pos[b]  & is_valid[b]
             neg_mask = ~is_pos[b] & is_valid[b]
 
             if not pos_mask.any() or not neg_mask.any():
                 continue
 
-            cand_embs = refined_bk[b]                # (K, out_dim)
+            valid_mask_b = pos_mask | neg_mask
+            scores_b     = scores[b][valid_mask_b]          # (P+N,)
+            is_pos_valid = pos_mask[valid_mask_b].float()   # (P+N,)
 
-            # Anchor = mean of positive embeddings (detached — not a learned param)
-            pos_anchor = F.normalize(
-                cand_embs[pos_mask].mean(dim=0, keepdim=True).detach(),
-                p=2, dim=1)                          # (1, out_dim)
-
-            # Scores for all valid candidates
-            valid_mask_b = pos_mask | neg_mask       # (K,)
-            scores  = (cand_embs[valid_mask_b] * pos_anchor).sum(dim=1)  # (P+N,)
-            is_pos_valid = pos_mask[valid_mask_b]    # (P+N,) bool
-
-            # Soft targets: uniform over positives
-            targets   = is_pos_valid.float()
-            targets   = targets / targets.sum().clamp(min=1)
-            log_probs = F.log_softmax(scores, dim=0)
-            total_loss += -(targets * log_probs).sum()
-            valid += 1
+            targets    = is_pos_valid / is_pos_valid.sum().clamp(min=1)
+            log_probs  = F.log_softmax(scores_b, dim=0)
+            total_loss = total_loss + -(targets * log_probs).sum()
+            valid     += 1
 
         return total_loss / max(valid, 1)
 
@@ -426,42 +418,52 @@ class CrossModalRerankModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         """
-        Batch keys
-        ----------
-        query_texts : List[str]          length B
-        images      : (B, K, C, H, W)   K candidates (train: up to 100, val: 20)
-        labels      : (B, K)  long      place IDs — same ID = positive pair
-        is_positive : (B, K)  float     1.0 for GT positives (for logging)
+        Backbone never runs here — tokens are precomputed.
+        Peak memory = B * K * token_tensors (tiny vs raw images).
+        Batch size can now be large (64+) without OOM.
+
+        Batch keys (from RerankDataset):
+            query_text_local : (B, L, D_txt)
+            query_mask       : (B, L)
+            cand_img_locals  : (B, K, N, D_img)
+            labels           : (B, K)  long
         """
-        query_texts = batch['query_texts']              # List[str]
-        images      = batch['images'].to(self.device)  # (B, K, C, H, W)
-        place_ids   = batch['labels'].to(self.device)  # (B, K)  long
+        # Keep in bf16/fp16 to halve GPU memory — projections handle precision
+        text_local      = batch['query_text_local'].to(self.device, dtype=torch.bfloat16)
+        text_mask       = batch['query_mask'].to(self.device)
+        img_locals      = batch['cand_img_locals'].to(self.device, dtype=torch.bfloat16)
+        place_ids       = batch['labels'].to(self.device)
+        query_place_id  = batch['query_place_id'].to(self.device)
 
-        B, K, C, H, W = images.shape
+        B, K, N, D_img = img_locals.shape
+        L              = text_local.shape[1]
 
-        # ---- 1. Extract local tokens from frozen backbone ----
-        # Flatten candidates into a single batch of M = B*K images
-        imgs_flat = images.view(B * K, C, H, W)
+        # Chunked: process chunk_size queries at a time.
+        # - Larger than 1 → GPU sees real workload, no per-kernel-launch overhead
+        # - Smaller than B → activation memory stays bounded
+        # chunk_size=4: 4×50=200 pairs per forward → tiny memory, 16x fewer kernel launches vs loop
+        chunk_size = B   # process all queries at once — tune down if OOM
+        scores_list = []
 
-        # Text: repeat each query K times to pair with each candidate
-        texts_rep = [t for t in query_texts for _ in range(K)]  # length B*K
+        for start in range(0, B, chunk_size):
+            end      = min(start + chunk_size, B)
+            c        = end - start                           # actual chunk size
 
-        img_local, text_local, text_mask = self._extract_local(imgs_flat, texts_rep)
-        # img_local  : (B*K, N, D_img)
-        # text_local : (B*K, L, D_txt)
-        # text_mask  : (B*K, L)
+            img_c    = img_locals[start:end].reshape(c * K, N, D_img)
+            txt_c    = text_local[start:end].unsqueeze(1)\
+                                            .expand(-1, K, -1, -1)\
+                                            .reshape(c * K, L, -1).contiguous()
+            msk_c    = text_mask[start:end].unsqueeze(1)\
+                                           .expand(-1, K, -1)\
+                                           .reshape(c * K, -1).contiguous()
 
-        # ---- 2. Refined embeddings (reranker — grad flows here) ----
-        refined = self._score_pairs(img_local, text_local, text_mask)  # (B*K, out_dim)
+            _, s_c   = self._score_pairs(img_c, txt_c, msk_c)   # (c*K,)
+            scores_list.append(s_c.view(c, K))
 
-        flat_labels = place_ids.view(-1)   # (B*K,)
+        scores = torch.cat(scores_list, dim=0)                   # (B, K)
 
-        # ---- 3. Listwise loss per query ----
-        loss = self._listwise_loss(refined, place_ids)
-
-        # ---- Logging ----
+        loss = self._listwise_loss(scores, place_ids, query_place_id)
         self.log('train/loss', loss, prog_bar=True, logger=True)
-
         return loss
 
     # ------------------------------------------------------------------
@@ -470,18 +472,20 @@ class CrossModalRerankModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         """
-        Collect global embeddings from the frozen backbone.
-        Mirrors LaVPR_cross.validation_step exactly.
+        Collect global embeddings + local tokens from frozen backbone.
+        Store local tokens (not raw images) to avoid holding 14GB of images in RAM.
         """
         places, _, texts = batch
         with torch.no_grad():
-            img_embeds,  _ = self.backbone.encode_image(places)
-            text_embeds, _, _, _ = self.backbone.encode_text(texts)
+            img_embeds,  img_local           = self.backbone.encode_image(
+                places.to(self.device))
+            text_embeds, text_local, mask, _ = self.backbone.encode_text(texts)
         return {
-            'descriptors': img_embeds.detach().cpu(),   # global image embed
-            'text_embeds': text_embeds.detach().cpu(),  # global text  embed
-            'images'     : places.cpu(),                # raw images for reranker
-            'texts'      : list(texts),                 # raw texts  for reranker
+            'descriptors' : img_embeds .detach().cpu(),          # (B, D)
+            'text_embeds' : text_embeds.detach().cpu(),          # (B, D)
+            'img_local'   : img_local  .detach().cpu().half(),   # (B, N, D_img) fp16
+            'text_local'  : text_local .detach().cpu().half(),   # (B, L, D_txt) fp16
+            'text_mask'   : mask       .detach().cpu(),          # (B, L)
         }
 
     def validation_epoch_end(self, val_step_outputs):
@@ -500,7 +504,7 @@ class CrossModalRerankModule(pl.LightningModule):
         dm       = self.trainer.datamodule
         val_dm   = getattr(dm, 'val_datamodule', dm)   # fallback to dm itself
         k_values = [1, 5, 10, 15, 20, 50, 100]
-        rerank_k = self.hparams.get('rerank_k', 20)
+        rerank_k = self.hparams.rerank_k
 
         if len(val_dm.val_datasets) == 1:
             val_step_outputs = [val_step_outputs]
@@ -508,11 +512,24 @@ class CrossModalRerankModule(pl.LightningModule):
         for val_set_name, val_dataset, step_outputs in zip(
                 val_dm.val_set_names, val_dm.val_datasets, val_step_outputs):
 
-            # ---- Collect embeddings ----
-            img_feats   = torch.cat([o['descriptors'] for o in step_outputs], dim=0)
-            text_feats  = torch.cat([o['text_embeds']  for o in step_outputs], dim=0)
-            all_images  = torch.cat([o['images']        for o in step_outputs], dim=0)
-            all_texts   = [t for o in step_outputs for t in o['texts']]
+            # ---- Collect embeddings and local tokens ----
+            img_feats  = torch.cat([o['descriptors'] for o in step_outputs], dim=0)
+            text_feats = torch.cat([o['text_embeds'] for o in step_outputs], dim=0)
+            all_img_loc = torch.cat([o['img_local']  for o in step_outputs], dim=0)
+
+            # Text local tokens have variable L — pad to max length in epoch
+            all_txt_loc_list = [tl for o in step_outputs for tl in o['text_local']]
+            all_txt_msk_list = [tm for o in step_outputs for tm in o['text_mask']]
+            max_L   = max(t.shape[0] for t in all_txt_loc_list)
+            D_txt   = all_txt_loc_list[0].shape[1]
+            N_total = len(all_txt_loc_list)
+
+            all_txt_loc = torch.zeros(N_total, max_L, D_txt, dtype=torch.float16)
+            all_txt_msk = torch.zeros(N_total, max_L, dtype=torch.bool)
+            for i, (tl, tm) in enumerate(zip(all_txt_loc_list, all_txt_msk_list)):
+                L = tl.shape[0]
+                all_txt_loc[i, :L] = tl
+                all_txt_msk[i, :L] = tm
 
             if 'pitts' in val_set_name:
                 num_references = val_dataset.num_db
@@ -525,11 +542,11 @@ class CrossModalRerankModule(pl.LightningModule):
                     f'Add validation logic for {val_set_name}')
 
             # Split DB (image gallery) and queries (text)
-            r_feats = img_feats[:num_references]    # (N_db, D)  image gallery
-            q_feats = text_feats[num_references:]   # (N_q,  D)  text queries
-            q_images_all = all_images[num_references:]  # (N_q, C, H, W)
-            q_texts_all  = all_texts[num_references:]   # List[str] len N_q
-            db_images_all = all_images[:num_references] # (N_db, C, H, W)
+            r_feats      = img_feats   [:num_references]   # (N_db, D)
+            q_feats      = text_feats  [num_references:]   # (N_q,  D)
+            db_img_loc   = all_img_loc [:num_references]   # (N_db, N_p, D_img)
+            q_txt_loc    = all_txt_loc [num_references:]   # (N_q,  L,  D_txt)
+            q_txt_msk    = all_txt_msk [num_references:]   # (N_q,  L)
 
             N_db = r_feats.shape[0]
             N_q  = q_feats.shape[0]
@@ -551,7 +568,7 @@ class CrossModalRerankModule(pl.LightningModule):
                 gt            = positives,
                 print_results = True,
                 dataset_name  = f'{val_set_name}_stage1',
-                faiss_gpu     = self.hparams.get('faiss_gpu', False),
+                faiss_gpu     = self.hparams.faiss_gpu,
             )
 
             # ---- Stage-2: reranker on top-rerank_k shortlist ----
@@ -560,43 +577,46 @@ class CrossModalRerankModule(pl.LightningModule):
 
             # Build reranked index: for each query, re-score top-rerank_k images
             # Process queries in mini-batches to avoid OOM
-            rerank_batch = 8
+            rerank_batch = getattr(self.hparams, 'val_rerank_batch', 8)
             I_reranked   = I_stage1[:, :rerank_k].copy()   # (N_q, rerank_k)
 
             for q_start in range(0, N_q, rerank_batch):
                 q_end   = min(q_start + rerank_batch, N_q)
                 bsz     = q_end - q_start
 
-                # Gather shortlist images for this query batch
+                # Gather precomputed local tokens for shortlist
                 cand_indices = I_stage1[q_start:q_end, :rerank_k]  # (bsz, K)
-                cand_images  = torch.stack([
-                    db_images_all[cand_indices[b]]   # (K, C, H, W)
-                    for b in range(bsz)
-                ]).to(self.device)                   # (bsz, K, C, H, W)
-
-                batch_texts = q_texts_all[q_start:q_end]  # List[str] len bsz
 
                 with torch.no_grad():
-                    K   = rerank_k
-                    C, H, W = cand_images.shape[2:]
-                    imgs_flat  = cand_images.view(bsz * K, C, H, W)
-                    texts_rep  = [t for t in batch_texts for _ in range(K)]
+                    # Gather all candidate image tokens: (bsz, K, N_p, D_img)
+                    img_loc_bsz = torch.stack([
+                        db_img_loc[cand_indices[b]] for b in range(bsz)
+                    ]).to(self.device).float()                       # (bsz, K, N_p, D_img)
 
-                    img_local, text_local, text_mask = self._extract_local(
-                        imgs_flat, texts_rep)
-                    refined = self._score_pairs(
-                        img_local, text_local, text_mask)   # (bsz*K, out_dim)
-                    refined_bk = refined.view(bsz, K, -1)   # (bsz, K, out_dim)
+                    # Query text tokens: (bsz, L, D_txt) → expand to (bsz*K, L, D_txt)
+                    txt_loc_bsz = q_txt_loc[q_start:q_end]\
+                        .to(self.device).float()                     # (bsz, L, D_txt)
+                    txt_msk_bsz = q_txt_msk[q_start:q_end]\
+                        .to(self.device)                             # (bsz, L)
 
-                    # Text anchor: encode query once, project to out_dim
-                    _, text_local_q, mask_q, _ = self.backbone.encode_text(batch_texts)
-                    txt_tokens = self.reranker.txt_proj(text_local_q)  # (bsz, L, d)
-                    txt_cls    = txt_tokens[:, 0]                      # (bsz, d)
-                    txt_anchor = F.normalize(
-                        self.reranker.out_proj(txt_cls), p=2, dim=1)   # (bsz, out_dim)
+                    bsz_K   = bsz * rerank_k
+                    N_p     = img_loc_bsz.shape[2]
+                    L_      = txt_loc_bsz.shape[1]
+                    D_txt_  = txt_loc_bsz.shape[2]
 
-                    sim     = (refined_bk * txt_anchor.unsqueeze(1)).sum(dim=-1)  # (bsz, K)
-                    ranking = sim.argsort(dim=1, descending=True).cpu().numpy()   # (bsz, K)
+                    imgs_flat = img_loc_bsz.view(bsz_K, N_p, -1)    # (bsz*K, N_p, D_img)
+                    txt_flat  = txt_loc_bsz.unsqueeze(1)\
+                                           .expand(-1, rerank_k, -1, -1)\
+                                           .reshape(bsz_K, L_, D_txt_)\
+                                           .contiguous()             # (bsz*K, L, D_txt)
+                    msk_flat  = txt_msk_bsz.unsqueeze(1)\
+                                           .expand(-1, rerank_k, -1)\
+                                           .reshape(bsz_K, L_)\
+                                           .contiguous()             # (bsz*K, L)
+
+                    _, scores_flat = self._score_pairs(imgs_flat, txt_flat, msk_flat)
+                    scores  = scores_flat.view(bsz, rerank_k).cpu()  # (bsz, K)
+                    ranking = scores.argsort(dim=1, descending=True).numpy()
 
                 # Reorder shortlist indices by reranker scores
                 for b in range(bsz):
@@ -609,26 +629,26 @@ class CrossModalRerankModule(pl.LightningModule):
                 I_reranked, I_stage1, positives, k_values, rerank_k)
 
             # ---- Log and print ----
-            print(f"\n{'':=<60}")
+            print(f"\n{'':=<65}")
             print(f"  {val_set_name}  —  Stage-1 vs Reranked")
-            print(f"{'':=<60}")
-            for k in [1, 5, 10]:
+            print(f"{'':=<65}")
+            print(f"  {'':5s}  {'Stage-1':>10s}  {'Reranked':>10s}  {'Gain':>8s}")
+            for k in [1, 5, 10, 20]:
                 b = recalls_before.get(k, 0.0)
                 a = recalls_after.get(k, 0.0)
-                print(f"  R@{k:<3d}  before={b:.4f}  after={a:.4f}  "
-                      f"gain={a - b:+.4f}")
-            print(f"{'':=<60}\n")
+                print(f"  R@{k:<3d}  {b:>10.4f}  {a:>10.4f}  {a-b:>+8.4f}")
+            print(f"{'':=<65}\n")
 
+            # Log all k values — single call per metric, logger=True for all
+            prog_bar_ks = {1, 5}   # show R@1 and R@5 on progress bar
             for k in k_values:
                 self.log(f'{val_set_name}/R{k}_stage1',
-                         recalls_before.get(k, 0.0), prog_bar=False, logger=True)
+                         recalls_before.get(k, 0.0),
+                         prog_bar=(k in prog_bar_ks), logger=True)
                 self.log(f'{val_set_name}/R{k}_reranked',
-                         recalls_after.get(k, 0.0),  prog_bar=False, logger=True)
+                         recalls_after.get(k, 0.0),
+                         prog_bar=(k in prog_bar_ks), logger=True)
 
-            self.log(f'{val_set_name}/R1_stage1',
-                     recalls_before.get(1, 0.0), prog_bar=True, logger=True)
-            self.log(f'{val_set_name}/R1_reranked',
-                     recalls_after.get(1, 0.0),  prog_bar=True, logger=True)
             self.log(f'{val_set_name}/R1_gain',
                      recalls_after.get(1, 0.0) - recalls_before.get(1, 0.0),
                      prog_bar=True, logger=True)
@@ -655,17 +675,21 @@ class CrossModalRerankModule(pl.LightningModule):
         recalls = {}
 
         # Build full reranked ranking: reranked head + stage-1 tail
-        if I_stage1.shape[1] >= max_k:
-            tail     = I_stage1[:, rerank_k:max_k]          # (N_q, max_k - rerank_k)
-            I_full   = np.concatenate([I_reranked, tail], axis=1)  # (N_q, max_k)
+        # The tail is everything stage-1 ranked beyond rerank_k (untouched by reranker)
+        if I_stage1.shape[1] > rerank_k:
+            tail   = I_stage1[:, rerank_k:]                 # (N_q, stage1_k - rerank_k)
+            I_full = np.concatenate([I_reranked, tail], axis=1)  # (N_q, rerank_k + tail)
         else:
-            I_full   = I_reranked
+            # Stage-1 only retrieved rerank_k or fewer — no tail
+            I_full = I_reranked
 
+        n_cols = I_full.shape[1]
         for k in k_values:
-            hits = 0
+            k_eff = min(k, n_cols)   # guard against I_full having fewer cols than k
+            hits  = 0
             for q_idx in range(N_q):
-                gt      = set(positives[q_idx])
-                top_k   = set(I_full[q_idx, :k].tolist())
+                gt    = set(positives[q_idx])
+                top_k = set(I_full[q_idx, :k_eff].tolist())
                 if gt & top_k:
                     hits += 1
             recalls[k] = hits / N_q
@@ -702,53 +726,33 @@ class CrossModalRerankModule(pl.LightningModule):
     def rerank(
         self,
         query_texts:      list,            # List[str]  length B
-        candidate_images: torch.Tensor,    # (B, K, C, H, W)   K = top-20 from stage-1
+        candidate_images: torch.Tensor,    # (B, K, C, H, W)
     ) -> torch.Tensor:                     # (B, K)  indices sorted best → worst
         """
-        Re-score and re-sort stage-1 candidates.
-
-        Returns argsort indices so callers can reorder their candidate lists:
-            sorted_images = candidate_images[b, ranking[b]]
+        Re-score and re-sort stage-1 candidates using score_head.
+        Process one query at a time to match training memory pattern.
         """
         self.backbone.eval()
         self.reranker.eval()
 
         B, K, C, H, W = candidate_images.shape
+        scores_list = []
 
-        imgs_flat = candidate_images.view(B * K, C, H, W).to(self.device)
-        texts_rep = [t for t in query_texts for _ in range(K)]
+        for b in range(B):
+            imgs_b = candidate_images[b].to(self.device)    # (K, C, H, W)
+            texts_b = [query_texts[b]] * K
 
-        img_local, text_local, text_mask = self._extract_local(imgs_flat, texts_rep)
-        refined = self._score_pairs(img_local, text_local, text_mask)   # (B*K, out_dim)
-        refined_bk = refined.view(B, K, -1)                             # (B, K, out_dim)
+            img_local, text_local, text_mask = self._extract_local(imgs_b, texts_b)
+            _, score_b = self._score_pairs(img_local, text_local, text_mask)  # (K,)
+            scores_list.append(score_b.cpu())
 
-        # Score each candidate against a shared text anchor.
-        # Re-encode text once (without repeating K times) for efficiency.
-        _, text_local_q, mask_q, _ = self.backbone.encode_text(query_texts)
-        # Text anchor: project through txt_proj → take CLS → out_proj
-        txt_tokens  = self.reranker.txt_proj(text_local_q)       # (B, L, d)
-        txt_cls     = txt_tokens[:, 0]                           # (B, d)   CLS before blocks
-        txt_anchor  = F.normalize(
-            self.reranker.out_proj(txt_cls), p=2, dim=1)         # (B, out_dim)
-
-        # Cosine similarity between refined candidate embeds and text anchor
-        sim = (refined_bk * txt_anchor.unsqueeze(1)).sum(dim=-1)  # (B, K)
-        ranking = sim.argsort(dim=1, descending=True)             # (B, K)
-
+        scores  = torch.stack(scores_list, dim=0)            # (B, K)
+        ranking = scores.argsort(dim=1, descending=True)     # (B, K)
         return ranking
 
     # ------------------------------------------------------------------
-    # Checkpoint
+    # Checkpoint — handled entirely by ModelCheckpoint callback.
+    # Load reranker weights from .ckpt with:
+    #   model = CrossModalRerankModule.load_from_checkpoint('path/to.ckpt')
+    #   reranker_weights = model.reranker.state_dict()
     # ------------------------------------------------------------------
-
-    def on_save_checkpoint(self, checkpoint):
-        """Save reranker weights separately for easy standalone loading."""
-        ckpt_cb = next(
-            (cb for cb in self.trainer.checkpoint_callbacks
-             if isinstance(cb, pl.callbacks.ModelCheckpoint)), None)
-        if ckpt_cb is None:
-            return
-        save_dir = os.path.dirname(ckpt_cb.dirpath)
-        save_path = os.path.join(save_dir, 'reranker_weights.pt')
-        torch.save(self.reranker.state_dict(), save_path)
-        print(f"Saved reranker weights to: {save_path}")

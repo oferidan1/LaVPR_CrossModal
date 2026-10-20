@@ -30,8 +30,8 @@ import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
 from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule, IMAGENET_MEAN_STD
 
-from rerank_dataloader import RerankDataModule
-from reranker_module    import CrossModalRerankModule
+from dataloaders.rerank_dataloader import RerankDataModule
+from model.reranker_module         import CrossModalRerankModule
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +48,9 @@ def parse_args():
 
     # Pre-mined data
     a('--triplets_json',    type=str, default='cache/gsv_triplets.json')
-    a('--embeddings_npz',   type=str, default='cache/gsv_embeddings.npz')
+
+    a('--token_path',       type=str, default='cache/local_tokens',
+      help='Path to local_tokens.h5 or local_tokens/ directory of .pt files')
 
     # GSV train dataset (same as train.py)
     a('--image_root',       type=str,
@@ -68,14 +70,17 @@ def parse_args():
     a('--val_set_names',    type=str, default=['pitts30k_val'], nargs='+')
 
     # Shortlist
-    a('--top_k_train',      type=int, default=100)
+    a('--top_k_train',      type=int, default=100,
+      help='Mined shortlist size (in gsv_triplets.json)')
+    a('--max_cands',        type=int, default=50,
+      help='Candidates actually loaded per step — tune to fit VRAM')
     a('--rerank_k',         type=int, default=20,
       help='Shortlist size for reranker at val / inference')
     a('--max_pos',          type=int, default=4)
 
     # Reranker architecture
-    a('--d_model',          type=int,   default=256)
-    a('--n_heads',          type=int,   default=8)
+    a('--d_model',          type=int,   default=128)
+    a('--n_heads',          type=int,   default=4)
     a('--n_layers',         type=int,   default=2)
     a('--dropout',          type=float, default=0.1)
     a('--out_dim',          type=int,   default=768,
@@ -89,7 +94,9 @@ def parse_args():
     a('--warmup_steps',     type=int,   default=200)
     a('--epochs',           type=int,   default=10)
     a('--batch_size',       type=int,   default=8,
-      help='Queries per batch. Memory: batch_size × top_k_train images/step')
+      help='Queries per batch — keep small to fit VRAM')
+    a('--grad_accum',       type=int,   default=1,
+      help='Gradient accumulation steps — effective batch = batch_size × grad_accum')
 
     # Hardware
     a('--gpu',              type=str,   default='0')
@@ -138,26 +145,21 @@ if __name__ == '__main__':
     args = parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-    print(f"\nMemory estimate: {args.batch_size} queries × "
-          f"{args.top_k_train} candidates = "
-          f"{args.batch_size * args.top_k_train} images/step")
+    print(f"\nPeak memory per step: {args.max_cands} candidates × 1 query "
+          f"(loop over {args.batch_size} queries, K={args.max_cands} tokens each)")
 
     # ------------------------------------------------------------------
-    # Train DataModule  (GSV triplets)
+    # Train DataModule — loads precomputed tokens, backbone never runs
     # ------------------------------------------------------------------
     train_datamodule = RerankDataModule(
         triplets_json  = args.triplets_json,
-        embeddings_npz = args.embeddings_npz,
-        image_root     = args.image_root,
+        token_path     = args.token_path,
         train_csv      = args.train_csv,
-        mapping_path   = args.mapping_path,
-        image_size     = args.image_size,
-        img_per_place  = args.img_per_place,
         top_k_train    = args.top_k_train,
+        max_cands      = args.max_cands,
         max_pos        = args.max_pos,
         batch_size     = args.batch_size,
         num_workers    = args.num_workers,
-        augment_train  = True,
     )
 
     # ------------------------------------------------------------------
@@ -216,9 +218,12 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     checkpoint_cb = ModelCheckpoint(
         monitor                 = 'pitts30k_val/R1_reranked',
-        filename                = 'reranker_epoch({epoch:02d})_'
-                                  'R1[{pitts30k_val/R1_stage1:.4f}]_'
+        filename                = 'reranker_'
+                                  'ep({epoch:02d})_'
+                                  'R1s1[{pitts30k_val/R1_stage1:.4f}]_'
                                   'R1rr[{pitts30k_val/R1_reranked:.4f}]_'
+                                  'R5rr[{pitts30k_val/R5_reranked:.4f}]_'
+                                  'R10rr[{pitts30k_val/R10_reranked:.4f}]_'
                                   'gain[{pitts30k_val/R1_gain:.4f}]',
         auto_insert_metric_name = False,
         save_weights_only       = True,
@@ -254,6 +259,7 @@ if __name__ == '__main__':
         check_val_every_n_epoch           = 1,
         callbacks                         = callbacks,
         reload_dataloaders_every_n_epochs = 1,
+        accumulate_grad_batches           = args.grad_accum,
         log_every_n_steps                 = 20,
         gradient_clip_val                 = 1.0,
         gradient_clip_algorithm           = 'norm',
