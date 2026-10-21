@@ -22,20 +22,51 @@ class LaVPR_wrapper():
         self.cross_modal = args.cross_modal
 
         if args.cross_modal == 3:
-            # ---- LaVPR_cross: image + text encoder, cross-modal retrieval
-            self.vlm_encoder = LaVPR_cross.load_from_checkpoint(
-                args.model_path,
-                map_location=args.device,
-                strict=True,
-            )
-            self.vlm_encoder = self.vlm_encoder.eval().to(args.device)
+            # ---- LaVPR_cross or CrossModalRerankModule checkpoint ----
+            # If --reranker_lavpr is set, model_path points to the reranker ckpt
+            # which contains the frozen backbone inside it. Load the backbone
+            # from there. Otherwise load LaVPR_cross directly.
+            if getattr(args, 'reranker', False):
+                from model.reranker_module import CrossModalRerankModule
+                # Detect score head depth from state dict before loading
+                # score_head.1.weight shape: (1, d)=shallow  (d/2, d)=deep
+                _ckpt = torch.load(args.model_path, map_location='cpu',
+                                   weights_only=False)
+                _sd   = _ckpt.get('state_dict', {})
+                _sh_w = _sd.get('reranker.score_head.1.weight')
+                _deep = (_sh_w is not None and _sh_w.shape[0] > 1)
+                _reranker_module = CrossModalRerankModule.load_from_checkpoint(
+                    args.model_path,
+                    map_location    = args.device,
+                    deep_score_head = _deep,
+                )
+                self.vlm_encoder = _reranker_module.backbone.eval().to(args.device)
+                # Keep reranker network for later use in rerank_by_lavpr
+                self.reranker_network = _reranker_module.reranker.eval().to(args.device)
+                del _reranker_module
+            else:
+                self.vlm_encoder = LaVPR_cross.load_from_checkpoint(
+                    args.model_path,
+                    map_location=args.device,
+                    strict=True,
+                )
+                self.vlm_encoder = self.vlm_encoder.eval().to(args.device)
+                self.reranker_network = None
+
+            # Expose local token dims for eval buffer allocation
+            from model.LaVPR_cross import _IMAGE_ENCODER_DIM, _text_hidden_dim
+            img_key               = self.vlm_encoder.image_model_name
+            self.img_local_dim    = _IMAGE_ENCODER_DIM.get(img_key, 768)
+            self.img_local_tokens = 256   # DINOv2-B at 224px (14x14 patches)
+            self.txt_local_dim    = _text_hidden_dim(self.vlm_encoder.text_model_name)
+            self.txt_local_tokens = 512   # BGE max sequence length
 
         elif args.cross_modal == 4:
-            # ---- LaVPR_text: frozen BGE + Conv adapter, text-only retrieval
+            # ---- LaVPR_text: frozen BGE + Conv adapter, text-only retrieval ----
             self.vlm_encoder = LaVPR_text.load_from_checkpoint(
                 args.model_path,
                 map_location=args.device,
-                strict=False,   # backbone stripped from ckpt; reloaded from HF
+                strict=False,
             )
             self.vlm_encoder = self.vlm_encoder.eval().to(args.device)
 
@@ -48,12 +79,16 @@ class LaVPR_wrapper():
             elif 'llm2clip' in self.model_name:
                 from llm2clip.llm2clip import load_llm2clip
                 self.vpr_encoder, self.vlm_encoder, self.processor = load_llm2clip()
-            elif 'clip' in self.model_name or 'siglip' in self.model_name:
+            elif 'siglip' in self.model_name:
+                # siglip must come before the clip/siglip branch to set correct max length
+                self.max_text_length = 64
                 self.vpr_encoder = AutoModel.from_pretrained(self.model_name)
                 self.processor   = AutoProcessor.from_pretrained(self.model_name)
                 self.vpr_encoder = self.vpr_encoder.eval().to(args.device)
-            elif 'siglip' in self.model_name:
-                self.max_text_length = 64
+            elif 'clip' in self.model_name:
+                self.vpr_encoder = AutoModel.from_pretrained(self.model_name)
+                self.processor   = AutoProcessor.from_pretrained(self.model_name)
+                self.vpr_encoder = self.vpr_encoder.eval().to(args.device)
             elif 'eva' in self.model_name.lower():
                 self.vpr_encoder, _, self.processor = open_clip.create_model_and_transforms(
                     self.model_name, pretrained='merged2b_s8b_b131k')
@@ -107,9 +142,10 @@ class LaVPR_wrapper():
 
     def mean_pooling(self, model_output, attention_mask):
         token_embeddings    = model_output[0]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        sum_embeddings      = torch.sum(token_embeddings * input_mask_expanded, 1)
-        sum_mask            = torch.clamp(attention_mask.sum(1), min=1e-9).unsqueeze(1)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(
+            token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask       = torch.clamp(attention_mask.sum(1), min=1e-9).unsqueeze(1)
         return sum_embeddings / sum_mask
 
     # ------------------------------------------------------------------
@@ -123,7 +159,6 @@ class LaVPR_wrapper():
             return img_embeds
 
         if self.cross_modal == 4:
-            # LaVPR_text has no image encoder — return None
             return None
 
         if 'blip' in self.model_name:
@@ -170,13 +205,15 @@ class LaVPR_wrapper():
             with torch.no_grad():
                 return self.vpr_encoder.encode_text(text_inputs)[:, 0]
         elif 'llm2clip' in self.model_name:
-            text_features = self.vlm_encoder.encode(texts, convert_to_tensor=True).to(self.device)
+            text_features = self.vlm_encoder.encode(
+                texts, convert_to_tensor=True).to(self.device)
             text_features = self.vpr_encoder.get_text_features(
                 text_features.to(self.vpr_encoder.dtype)).float()
             return text_features / text_features.norm(dim=-1, keepdim=True)
         elif 'clip' in self.model_name or 'siglip' in self.model_name:
-            text_inputs    = self.processor(text=texts, return_tensors="pt", padding=True,
-                                            truncation=True, max_length=self.max_text_length)
+            text_inputs    = self.processor(
+                text=texts, return_tensors="pt", padding=True,
+                truncation=True, max_length=self.max_text_length)
             text_tokens    = text_inputs.input_ids.to(self.device)
             attention_mask = text_inputs.get('attention_mask')
             if attention_mask is not None:
@@ -185,7 +222,8 @@ class LaVPR_wrapper():
                 text_features = self.vpr_encoder.text_model(
                     input_ids=text_tokens, attention_mask=attention_mask,
                     output_hidden_states=True)
-            text_features = self.vpr_encoder.text_projection(text_features.pooler_output)
+            text_features = self.vpr_encoder.text_projection(
+                text_features.pooler_output)
             return text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         elif 'eva' in self.model_name.lower():
             text_tokens = self.tokenizer(texts).to(self.device)
@@ -194,7 +232,8 @@ class LaVPR_wrapper():
             return text_features / text_features.norm(dim=-1, keepdim=True)
         elif 'bge' in self.model_name or 'all-minilm' in self.model_name:
             text_tokens = self.tokenizer(
-                texts, padding=True, truncation=True, return_tensors='pt').to(self.device)
+                texts, padding=True, truncation=True,
+                return_tensors='pt').to(self.device)
             with torch.no_grad():
                 model_output  = self.vlm_encoder(**text_tokens)
                 text_features = model_output[0][:, 0]
@@ -213,18 +252,20 @@ class LaVPR_wrapper():
         return image_features, text_features
 
     # ------------------------------------------------------------------
-    # Encode single
+    # Encode single — returns global embeds + local tokens
     # ------------------------------------------------------------------
 
     def encode_single(self, images, texts):
         if self.cross_modal == 3:
             with torch.no_grad():
                 (img_embeds, text_embeds, _,
-                 img_local, text_local, attention_mask, text_tokens) = self.vlm_encoder(images, texts)
-            return img_embeds, text_embeds, img_local, text_local, text_tokens, attention_mask
+                 img_local, text_local,
+                 attention_mask, text_tokens) = self.vlm_encoder(images, texts)
+            return (img_embeds, text_embeds,
+                    img_local, text_local,
+                    text_tokens, attention_mask)
 
         if self.cross_modal == 4:
-            # Text-only: no image forward pass
             with torch.no_grad():
                 text_embeds, text_local, attention_mask, text_tokens = \
                     self.vlm_encoder.encode_text(texts)
@@ -238,4 +279,6 @@ class LaVPR_wrapper():
             else:
                 img_embeds, text_embeds, _, _, _, _, img_local, text_local, \
                     text_tokens, attention_mask, _ = self.single_encoder(images, texts)
-        return img_embeds, text_embeds, img_local, text_local, text_tokens, attention_mask
+        return (img_embeds, text_embeds,
+                img_local, text_local,
+                text_tokens, attention_mask)

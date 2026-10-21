@@ -165,13 +165,14 @@ class CrossModalReranker(nn.Module):
 
     def __init__(
         self,
-        img_dim:  int   = 768,
-        txt_dim:  int   = 1024,
-        d_model:  int   = 256,
-        n_heads:  int   = 8,
-        n_layers: int   = 2,
-        dropout:  float = 0.1,
-        out_dim:  int   = 512,
+        img_dim:         int   = 768,
+        txt_dim:         int   = 1024,
+        d_model:         int   = 256,
+        n_heads:         int   = 8,
+        n_layers:        int   = 2,
+        dropout:         float = 0.1,
+        out_dim:         int   = 512,
+        deep_score_head: bool  = True,
     ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
@@ -191,12 +192,20 @@ class CrossModalReranker(nn.Module):
         )
 
         # Scalar relevance score head — used at inference
-        self.score_head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model // 2, bias=True),
-            nn.GELU(),
-            nn.Linear(d_model // 2, 1, bias=True),
-        )
+        # deep_score_head=False: Linear(d→1)       — shallow, fewer params
+        # deep_score_head=True:  Linear(d→d/2)+GELU+Linear(d/2→1) — non-linear
+        if deep_score_head:
+            self.score_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model // 2, bias=True),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 1, bias=True),
+            )
+        else:
+            self.score_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, 1, bias=True),
+            )
 
         self._init_weights()
 
@@ -204,11 +213,10 @@ class CrossModalReranker(nn.Module):
         nn.init.kaiming_uniform_(self.img_proj.weight, mode='fan_in', nonlinearity='relu')
         nn.init.kaiming_uniform_(self.txt_proj.weight, mode='fan_in', nonlinearity='relu')
         nn.init.kaiming_uniform_(self.out_proj[1].weight, mode='fan_in', nonlinearity='relu')
-        # score_head: init first layer normally, last layer to near-zero
-        # so early scores are near-uniform — avoids large noisy gradients
-        nn.init.kaiming_uniform_(self.score_head[1].weight, nonlinearity='relu')
-        nn.init.zeros_(self.score_head[3].weight)
-        nn.init.zeros_(self.score_head[3].bias)
+        # score_head: last linear init to near-zero for stable early training
+        last = self.score_head[-1]   # Linear layer regardless of depth
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
     def forward(
         self,
@@ -280,12 +288,16 @@ class CrossModalRerankModule(pl.LightningModule):
         dropout:   float = 0.1,
         out_dim:   int   = 512,     # should match backbone embeds_dim
 
+        # ---- Score head
+        deep_score_head: bool  = False,  # False=Linear(d→1)  True=Linear(d→d/2)+GELU+Linear
+
         # ---- Validation
-        rerank_k:        int   = 20,    # shortlist size at val/inference
+        rerank_k:        int   = 20,
         faiss_gpu:       bool  = False,
 
         # ---- Loss
-        margin:          float = 0.3,
+        loss_name:       str   = 'margin',   # 'margin' | 'bce'
+        margin:          float = 0.3,        # used by margin loss only
 
         # ---- Optimiser
         lr:           float = 1e-4,
@@ -311,13 +323,14 @@ class CrossModalRerankModule(pl.LightningModule):
         # Trainable reranker
         # ----------------------------------------------------------------
         self.reranker = CrossModalReranker(
-            img_dim  = img_dim,
-            txt_dim  = txt_dim,
-            d_model  = d_model,
-            n_heads  = n_heads,
-            n_layers = n_layers,
-            dropout  = dropout,
-            out_dim  = out_dim,
+            img_dim          = img_dim,
+            txt_dim          = txt_dim,
+            d_model          = d_model,
+            n_heads          = n_heads,
+            n_layers         = n_layers,
+            dropout          = dropout,
+            out_dim          = out_dim,
+            deep_score_head  = deep_score_head,
         )
 
 
@@ -329,7 +342,10 @@ class CrossModalRerankModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.epochs       = epochs
+        self.loss_name    = loss_name
         self.margin       = margin
+        print(f"Loss: {loss_name}"
+              + (f"  margin={margin}" if loss_name == 'margin' else ""))
 
     # ------------------------------------------------------------------
     # Setup
@@ -383,28 +399,40 @@ class CrossModalRerankModule(pl.LightningModule):
     # Loss
     # ------------------------------------------------------------------
 
-    def _listwise_loss(
+    def _compute_loss(
         self,
-        scores:         torch.Tensor,   # (B, K)  scalar relevance scores
-        place_ids:      torch.Tensor,   # (B, K)  place IDs, -1 = padding
-        query_place_id: torch.Tensor,   # (B,)    true place ID of each query
-        margin:         float = 0.3,
+        scores:         torch.Tensor,   # (B, K)
+        place_ids:      torch.Tensor,   # (B, K)
+        query_place_id: torch.Tensor,   # (B,)
+    ) -> torch.Tensor:
+        """Dispatch to the configured loss function."""
+        if self.loss_name == 'margin':
+            return self._margin_loss(scores, place_ids, query_place_id)
+        elif self.loss_name == 'bce':
+            return self._bce_loss(scores, place_ids, query_place_id)
+        else:
+            raise ValueError(f"Unknown loss_name '{self.loss_name}'. "
+                             f"Choose 'margin' or 'bce'.")
+
+    def _margin_loss(
+        self,
+        scores:         torch.Tensor,   # (B, K)
+        place_ids:      torch.Tensor,   # (B, K)
+        query_place_id: torch.Tensor,   # (B,)
     ) -> torch.Tensor:
         """
         Margin ranking loss: best positive must score at least `margin`
         above every negative. Directly optimises R@1.
 
-        loss = mean( max(0, margin - best_pos_score + neg_score) )
+        loss = mean( max(0, margin - best_pos + neg_score) ) over all negatives.
 
-        Advantages over listwise cross-entropy:
-        - Directly optimises the positive-negative score gap
-        - Ignores easy negatives (already below margin) — focuses on hard ones
-        - Multiple positives handled naturally — best one drives the gradient
-        - No softmax saturation issues
+        Pros: focuses on hard negatives, directly targets R@1, no softmax saturation.
+        Cons: only uses the best positive — other views contribute nothing if
+              best_pos already clears the margin.
         """
-        query_pid = query_place_id.unsqueeze(1)     # (B, 1)
-        is_pos    = place_ids.eq(query_pid)         # (B, K)
-        is_valid  = place_ids >= 0                  # (B, K)
+        query_pid  = query_place_id.unsqueeze(1)
+        is_pos     = place_ids.eq(query_pid)
+        is_valid   = place_ids >= 0
 
         total_loss = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
         valid      = 0
@@ -416,16 +444,49 @@ class CrossModalRerankModule(pl.LightningModule):
             if not pos_mask.any() or not neg_mask.any():
                 continue
 
-            pos_scores = scores[b][pos_mask]        # (P,)
-            neg_scores = scores[b][neg_mask]        # (N,)
+            pos_scores = scores[b][pos_mask]             # (P,)
+            neg_scores = scores[b][neg_mask]             # (N,)
 
-            # Use the best positive — directly optimises R@1
             best_pos   = pos_scores.max()
-            losses     = F.relu(margin - best_pos + neg_scores)  # (N,)
+            losses     = F.relu(self.margin - best_pos + neg_scores)  # (N,)
             total_loss = total_loss + losses.mean()
             valid     += 1
 
         return total_loss / max(valid, 1)
+
+    def _bce_loss(
+        self,
+        scores:         torch.Tensor,   # (B, K)
+        place_ids:      torch.Tensor,   # (B, K)
+        query_place_id: torch.Tensor,   # (B,)
+    ) -> torch.Tensor:
+        """
+        Binary cross-entropy loss: treat each candidate independently.
+        Positive → label 1, negative → label 0.
+
+        loss = -mean( y·log(σ(s)) + (1-y)·log(1-σ(s)) ) over valid candidates.
+
+        Pros: all positives (all 4 GSV views) contribute gradient equally,
+              stable training, well-understood.
+        Cons: treats candidates independently — does not model ranking directly.
+              A negative at 0.49 and positive at 0.51 both get low loss even
+              though the gap is dangerously small.
+        """
+        query_pid = query_place_id.unsqueeze(1)
+        is_pos    = place_ids.eq(query_pid)
+        is_valid  = place_ids >= 0
+
+        # Build labels: 1.0 for positives, 0.0 for negatives, ignore padding
+        labels = is_pos.float()                          # (B, K)
+
+        # Mask out padding entries
+        valid_mask = is_valid.float()                    # (B, K)
+
+        # BCE per element, then mean over valid only
+        bce = F.binary_cross_entropy_with_logits(
+            scores, labels, reduction='none')            # (B, K)
+        loss = (bce * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+        return loss
 
     # ------------------------------------------------------------------
     # Training step
@@ -477,7 +538,7 @@ class CrossModalRerankModule(pl.LightningModule):
 
         scores = torch.cat(scores_list, dim=0)                   # (B, K)
 
-        loss = self._listwise_loss(scores, place_ids, query_place_id, self.margin)
+        loss = self._compute_loss(scores, place_ids, query_place_id)
         self.log('train/loss', loss, prog_bar=True, logger=True)
         return loss
 

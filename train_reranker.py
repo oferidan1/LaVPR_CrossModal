@@ -85,14 +85,19 @@ def parse_args():
     a('--n_heads',          type=int,   default=4)
     a('--n_layers',         type=int,   default=2)
     a('--dropout',          type=float, default=0.1)
+    a('--deep_score_head',  action='store_true',
+      help='Use 2-layer score head Linear(d→d/2)+GELU+Linear instead of Linear(d→1)')
     a('--out_dim',          type=int,   default=768,
       help='Must match backbone embeds_dim')
 
 
 
     # Loss
+    a('--loss_name',        type=str,   default='margin',
+      choices=['margin', 'bce'],
+      help='Loss function: margin=ranking loss (R@1 focused), bce=binary cross-entropy')
     a('--margin',           type=float, default=0.3,
-      help='Margin for ranking loss: pos must score margin above all negatives')
+      help='Margin for ranking loss (only used when --loss_name margin)')
 
     # Optimiser
     a('--lr',               type=float, default=1e-4)
@@ -211,8 +216,10 @@ if __name__ == '__main__':
             n_layers        = args.n_layers,
             dropout         = args.dropout,
             out_dim         = args.out_dim,
+            deep_score_head = args.deep_score_head,
             rerank_k        = args.rerank_k,
             faiss_gpu       = args.faiss_gpu,
+            loss_name       = args.loss_name,
             margin          = args.margin,
             lr              = args.lr,
             weight_decay    = args.weight_decay,

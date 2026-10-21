@@ -32,11 +32,6 @@ def normlize_features(x):
 
 
 def _maybe(mod, name, x):
-    """Apply mod.<name> if it exists, otherwise pass through.
-
-    Keeps the eval path compatible with FILIP heads trained before the
-    LayerNorms were added.
-    """
     layer = getattr(mod, name, None)
     return layer(x) if layer is not None else x
 
@@ -58,24 +53,34 @@ def encode_batch(model, args, images, texts, indices, all_descriptors,
         text_features = model.encode_text(texts)
         text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
     else:
-        # single vector of both image and text, plus per-token features
+        # cross_modal >= 2: single vector of both image and text, plus per-token features
         descriptors, text_features, img_local, text_local, text_tokens, text_attention_mask = \
             model.encode_single(images.to(args.device), texts)
-        if args.is_image:
+
+        if args.is_image and descriptors is not None:
             vision_descriptors[indices.numpy(), :] = descriptors.cpu().float().numpy()
-            #img_local_descs[indices.numpy(), :] = img_local.cpu().float().numpy()
-        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()        
-        # text_local_descs[indices.numpy(), :] = text_local.cpu().float().numpy()        
-        # text_tokens_all[indices.numpy(), :] = text_tokens.cpu().long().numpy()
-        # text_attentions[indices.numpy(), :] = text_attention_mask.cpu().long().numpy()
+
+        text_descriptors[indices.numpy(), :] = text_features.cpu().float().numpy()
+
+        # Store local tokens for reranking (cross_modal=3 / LaVPR_cross)
+        if img_local is not None:
+            N = min(img_local.shape[1], img_local_descs.shape[1])
+            img_local_descs[indices.numpy(), :N, :] = img_local.cpu().float().numpy()[:, :N, :]
+
+        if text_local is not None:
+            L = min(text_local.shape[1], text_local_descs.shape[1])
+            text_local_descs[indices.numpy(), :L, :] = text_local.cpu().float().numpy()[:, :L, :]
+
+        if text_attention_mask is not None:
+            L = min(text_attention_mask.shape[1], text_attentions.shape[1])
+            text_attentions[indices.numpy(), :L] = text_attention_mask.cpu().long().numpy()[:, :L]
 
 
 def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors,
                             queries_descriptors, max_results):
-    # Use a kNN to find predictions
     faiss_index = faiss.IndexFlatIP(encoder_dim)
-    database_descriptors = normlize_features(database_descriptors)
-    queries_descriptors = normlize_features(queries_descriptors)
+    database_descriptors  = normlize_features(database_descriptors)
+    queries_descriptors   = normlize_features(queries_descriptors)
     faiss_index.add(database_descriptors)
     del database_descriptors, all_descriptors
 
@@ -85,7 +90,7 @@ def get_queries_predictions(encoder_dim, database_descriptors, all_descriptors,
 
 
 # ---------------------------------------------------------------------------
-# FILIP: full-gallery retrieval (as in the original paper)
+# FILIP: full-gallery retrieval
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -93,16 +98,6 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
                          img_local_descs, text_local_desc, text_tokens_all,
                          max_results=100, db_chunk=2048, alpha=0.0,
                          db_on_gpu=True, device="cuda"):
-    """Token-wise MaxSim over the WHOLE gallery.
-
-        s(t->i) = sum_i w_i * max_j (t_i . v_j)
-
-    No faiss: MaxSim is not an inner product, so it cannot be indexed.
-    The database is projected once up front; each query then streams over it
-    in chunks. alpha > 0 additionally fuses the z-normalised global cosine.
-
-    Returns (scores, predictions), matching get_queries_predictions().
-    """
     head = getattr(model.single_encoder, "filip_loss", None)
     if head is None:
         raise RuntimeError("Model has no filip_loss head - cannot run FILIP retrieval.")
@@ -114,10 +109,9 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
     num_db, num_q = test_ds.num_database, test_ds.num_queries
     logger.info(f"FILIP full-gallery retrieval over {num_db} database images")
 
-    # ---- project the whole database once ---------------------------------
     parts = []
     for s in tqdm(range(0, num_db, db_chunk), desc="projecting database"):
-        e = min(s + db_chunk, num_db)                     # <-- clamp
+        e = min(s + db_chunk, num_db)
         v = torch.from_numpy(img_local_descs[s:e]).to(device)
         if has_cls:
             v = v[:, 1:]
@@ -131,27 +125,26 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
                 f"{db_v.numel() * 2 / 1e9:.2f} GB on {'gpu' if db_on_gpu else 'cpu'}")
 
     db_g = F.normalize(torch.from_numpy(vision_descriptors[:num_db]).to(device).float(), dim=-1)
-    q_g = F.normalize(torch.from_numpy(text_descriptors[num_db:]).to(device).float(), dim=-1)
+    q_g  = F.normalize(torch.from_numpy(text_descriptors[num_db:]).to(device).float(), dim=-1)
 
     topk = min(max_results, num_db)
     predictions = np.zeros((num_q, topk), dtype=np.int64)
-    out_scores = np.zeros((num_q, topk), dtype=np.float32)
+    out_scores  = np.zeros((num_q, topk), dtype=np.float32)
 
     for q in tqdm(range(num_q), desc="FILIP retrieval"):
-        gi = num_db + q
-
+        gi  = num_db + q
         raw = torch.from_numpy(text_local_desc[gi]).to(device)
         mask = raw.abs().sum(-1) > 0
         if mask.sum() == 0:
             predictions[q] = np.arange(topk)
             continue
         raw = raw[mask].unsqueeze(0)
-        t = head.text_proj(_maybe(head, "t_norm", raw.to(hdt)))
-        t = F.normalize(t, dim=-1).squeeze(0).half()
+        t   = head.text_proj(_maybe(head, "t_norm", raw.to(hdt)))
+        t   = F.normalize(t, dim=-1).squeeze(0).half()
 
         if use_idf:
             ids = torch.from_numpy(text_tokens_all[gi]).to(device)[mask]
-            w = head.idf_weights[ids.clamp(0, head.idf_weights.numel() - 1)].half()
+            w   = head.idf_weights[ids.clamp(0, head.idf_weights.numel() - 1)].half()
         else:
             w = torch.ones(t.shape[0], device=device, dtype=torch.half)
         w = w / w.sum().clamp(min=1e-6)
@@ -167,12 +160,12 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
 
         s_final = sc.float()
         if alpha > 0:
-            g = (q_g[q].unsqueeze(0) * db_g).sum(-1)
+            g       = (q_g[q].unsqueeze(0) * db_g).sum(-1)
             s_final = alpha * _z(g) + (1.0 - alpha) * _z(s_final)
 
         vals, idx = torch.topk(s_final, topk)
         predictions[q] = idx.cpu().numpy()
-        out_scores[q] = vals.cpu().numpy()
+        out_scores[q]  = vals.cpu().numpy()
 
     del db_v
     torch.cuda.empty_cache()
@@ -182,6 +175,7 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
 # ---------------------------------------------------------------------------
 # Rerankers
 # ---------------------------------------------------------------------------
+
 def rerank_predictions(model, test_ds, predictions, vision_descriptors,
                        text_descriptors, img_local_descs, text_local_desc,
                        text_attentions=None, max_rerank_k=25, device="cuda"):
@@ -193,11 +187,12 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
 
     reranked_predictions = predictions.copy()
 
-    img_local_descs_tensor = torch.from_numpy(img_local_descs).to(device)
-    text_local_desc_tensor = torch.from_numpy(text_local_desc).to(device)
+    img_local_descs_tensor    = torch.from_numpy(img_local_descs).to(device)
+    text_local_desc_tensor    = torch.from_numpy(text_local_desc).to(device)
     vision_descriptors_tensor = torch.from_numpy(vision_descriptors).to(device)
-    text_descriptors_tensor = torch.from_numpy(text_descriptors).to(device)
-    text_attn_tensor = (torch.from_numpy(text_attentions).to(device) if text_attentions is not None else None)
+    text_descriptors_tensor   = torch.from_numpy(text_descriptors).to(device)
+    text_attn_tensor = (torch.from_numpy(text_attentions).to(device)
+                        if text_attentions is not None else None)
     if text_attn_tensor is None:
         logger.warning("rerank_predictions: no attention mask supplied, "
                        "falling back to non-zero-row detection.")
@@ -209,40 +204,34 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
             actual_q_ds_idx = test_ds.num_database + q_idx
 
             query_text_global = text_descriptors_tensor[actual_q_ds_idx].unsqueeze(0)
-            raw_text_local = text_local_desc_tensor[actual_q_ds_idx]        # (Lt, D)
+            raw_text_local    = text_local_desc_tensor[actual_q_ds_idx]
 
             if text_attn_tensor is not None:
-                mask_row = text_attn_tensor[actual_q_ds_idx]                # (Lt,)
+                mask_row = text_attn_tensor[actual_q_ds_idx]
             else:
                 mask_row = raw_text_local.any(dim=-1).long()
             if mask_row.sum() == 0:
                 mask_row = torch.ones_like(mask_row)
 
-            # Trim to the longest real position, keeping tokens and mask ALIGNED.
-            # Slicing by a count (the old `true_len`) silently reorders whenever
-            # the real positions are not a contiguous prefix.
-            true_len = int(mask_row.nonzero()[-1].item()) + 1
-            query_text_local = raw_text_local[:true_len].unsqueeze(0)       # (1, L, D)
-            query_mask = mask_row[:true_len].unsqueeze(0)                   # (1, L)
+            true_len         = int(mask_row.nonzero()[-1].item()) + 1
+            query_text_local = raw_text_local[:true_len].unsqueeze(0)
+            query_mask       = mask_row[:true_len].unsqueeze(0)
 
             candidate_db_indices = predictions[q_idx, :n_cand]
-            B = len(candidate_db_indices)
-            candidate_img_local = img_local_descs_tensor[candidate_db_indices]
+            B                    = len(candidate_db_indices)
+            candidate_img_local  = img_local_descs_tensor[candidate_db_indices]
             candidate_img_global = vision_descriptors_tensor[candidate_db_indices]
 
             L, D_dim = query_text_local.shape[1], query_text_local.shape[2]
-            text_local_expanded = query_text_local.expand(B, L, D_dim)
+            text_local_expanded  = query_text_local.expand(B, L, D_dim)
             text_global_expanded = query_text_global.expand(B, -1)
-            text_mask_expanded = query_mask.expand(B, L)
+            text_mask_expanded   = query_mask.expand(B, L)
 
             if next(rerank_model.parameters()).dtype == torch.bfloat16:
-                candidate_img_local = candidate_img_local.bfloat16()
-                text_local_expanded = text_local_expanded.bfloat16()
+                candidate_img_local  = candidate_img_local.bfloat16()
+                text_local_expanded  = text_local_expanded.bfloat16()
                 candidate_img_global = candidate_img_global.bfloat16()
                 text_global_expanded = text_global_expanded.bfloat16()
-                # the mask stays integer: casting it to bf16 and then comparing
-                # or multiplying inside the attention module is how masks turn
-                # into 0.99609375 and stop masking
 
             scores = rerank_model.cross_attn_classifier(
                 candidate_img_local, text_local_expanded,
@@ -254,6 +243,149 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
 
     return reranked_predictions
 
+
+@torch.no_grad()
+def rerank_by_lavpr(
+    model,
+    test_ds,
+    predictions:      np.ndarray,
+    img_local_descs:  np.ndarray,
+    text_local_desc:  np.ndarray,
+    text_attentions:  np.ndarray,
+    vision_descs:     np.ndarray = None,   # (N_total, D)  global image embeddings
+    text_descs:       np.ndarray = None,   # (N_total, D)  global text  embeddings
+    max_rerank_k:     int   = 20,
+    rerank_batch:     int   = 64,
+    alpha:            float = 0.0,         # 0=local only, 1=global only, 0.5=equal mix
+    device:           str   = 'cuda',
+) -> np.ndarray:
+    """
+    Rerank stage-1 predictions using the trained CrossModalRerankModule.
+    Uses precomputed local tokens — backbone never runs at inference time.
+    The reranker network is already loaded in model.reranker_network.
+
+    final_score = alpha * z(global_cosine) + (1-alpha) * z(reranker_score)
+
+    z() = z-normalisation within the shortlist, makes both scores
+    comparable regardless of scale.
+
+    Parameters
+    ----------
+    model           : LaVPR_wrapper (reranker_network must be set)
+    test_ds         : TestDataset (.num_database, .num_queries)
+    predictions     : (N_q, K) stage-1 predictions
+    img_local_descs : (N_total, N_patches, D_img)  DB images [:num_database]
+    text_local_desc : (N_total, L, D_txt)           queries [num_database:]
+    text_attentions : (N_total, L)  HF attention mask 1=real, 0=pad
+    vision_descs    : (N_total, D)  global image embeddings (needed if alpha>0)
+    text_descs      : (N_total, D)  global text  embeddings (needed if alpha>0)
+    max_rerank_k    : candidates to rerank
+    rerank_batch    : queries per GPU step
+    alpha           : fusion weight  0=reranker only  1=global only  0.5=equal
+    device          : torch device string
+    """
+    reranker = model.reranker_network
+    if reranker is None:
+        raise RuntimeError(
+            "reranker_network is None — load the reranker ckpt via --model_path "
+            "with --reranker_lavpr set.")
+    reranker.eval()
+    w_dtype = next(reranker.parameters()).dtype
+
+    num_db = test_ds.num_database
+    num_q  = test_ds.num_queries
+    n_cand = min(max_rerank_k, predictions.shape[1])
+
+    logger.info(f"Reranking top-{n_cand} for {num_q} queries  "
+                f"(batch={rerank_batch}  dtype={w_dtype})")
+
+    reranked = predictions.copy()
+
+    for q_start in tqdm(range(0, num_q, rerank_batch), desc="LaVPR rerank"):
+        q_end = min(q_start + rerank_batch, num_q)
+        bsz   = q_end - q_start
+
+        # ---- Query text local tokens — pad to batch max L ----
+        q_ds_idxs  = [num_db + q for q in range(q_start, q_end)]
+
+        # Trim each text to its real token length (attention mask > 0)
+        # The buffer is padded to 512 with zeros — trim to avoid processing padding
+        txt_locals, txt_masks = [], []
+        for i in q_ds_idxs:
+            full_mask = text_attentions[i]          # (num_text_tokens,) 1=real 0=pad
+            real_len  = int(full_mask.sum())        # number of real tokens
+            real_len  = max(real_len, 1)            # guard against all-zero mask
+            txt_locals.append(text_local_desc[i][:real_len])   # (real_len, D_txt)
+            txt_masks .append(full_mask         [:real_len])    # (real_len,)
+
+        max_L = max(t.shape[0] for t in txt_locals)
+        D_txt = txt_locals[0].shape[1]
+
+        txt_np = np.zeros((bsz, max_L, D_txt), dtype=np.float32)
+        msk_np = np.zeros((bsz, max_L),        dtype=np.float32)
+        for b, (tl, tm) in enumerate(zip(txt_locals, txt_masks)):
+            L = tl.shape[0]
+            txt_np[b, :L] = tl
+            msk_np[b, :L] = tm
+
+        txt_t = torch.from_numpy(txt_np).to(device)
+        msk_t = torch.from_numpy(msk_np).bool().to(device)
+
+        # ---- Candidate image local tokens ----
+        cand_idx = predictions[q_start:q_end, :n_cand]     # (bsz, K)
+        img_np   = np.stack([
+            img_local_descs[cand_idx[b]] for b in range(bsz)
+        ], axis=0)                                          # (bsz, K, N_p, D_img)
+
+        img_t = torch.from_numpy(img_np).to(device)
+
+        K, N_p, D_img = n_cand, img_t.shape[2], img_t.shape[3]
+        L_   = txt_t.shape[1]
+        D_t_ = txt_t.shape[2]
+
+        # ---- Single batched forward pass ----
+        imgs_flat = img_t.reshape(bsz * K, N_p, D_img).to(w_dtype)
+        txt_flat  = txt_t.unsqueeze(1)\
+                         .expand(-1, K, -1, -1)\
+                         .reshape(bsz * K, L_, D_t_)\
+                         .contiguous().to(w_dtype)
+        msk_flat  = msk_t.unsqueeze(1)\
+                         .expand(-1, K, -1)\
+                         .reshape(bsz * K, L_)\
+                         .contiguous()
+
+        _, scores_flat = reranker(imgs_flat, txt_flat, msk_flat)
+        local_scores = scores_flat.float().view(bsz, K).cpu().numpy()  # (bsz, K)
+
+        # ---- Fuse with global cosine similarity ----
+        if alpha > 0.0 and vision_descs is not None and text_descs is not None:            
+            for b in range(bsz):
+                q_ds_idx   = num_db + q_start + b
+                q_global   = text_descs  [q_ds_idx]          # (D,)
+                db_globals  = vision_descs[cand_idx[b]]       # (K, D)
+
+                # L2-normalise and compute cosine similarity
+                q_norm  = q_global  / (np.linalg.norm(q_global)   + 1e-8)
+                db_norm = db_globals / (np.linalg.norm(db_globals, axis=1, keepdims=True) + 1e-8)
+                global_sim = db_norm @ q_norm                 # (K,)
+
+                # Z-normalise both scores within the shortlist for scale alignment
+                def _z(x):
+                    std = x.std()
+                    return (x - x.mean()) / (std + 1e-8) if std > 1e-8 else x
+
+                final = alpha * _z(global_sim) + (1.0 - alpha) * _z(local_scores[b])
+                local_scores[b] = final
+
+        # ---- Reorder shortlist ----
+        for b in range(bsz):
+            order = np.argsort(-local_scores[b])
+            reranked[q_start + b, :n_cand] = cand_idx[b][order]
+
+    logger.info("LaVPR reranking complete.")
+    return reranked
+
+
 def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
                   match_weight=0.6, device="cuda"):
     from huggingface_hub import snapshot_download
@@ -261,10 +393,9 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
 
     logger.info(f"Reranking top-{max_rerank_k} candidates using JEV (clef-flash)...")
 
-    # ── Load model ONCE ───────────────────────────────────────
     path = snapshot_download("Cloudflare/clef-flash")
     sys.path.insert(0, path)
-    from joint_schema_model import collate_records, encode_record, load_release_model  # type: ignore
+    from joint_schema_model import collate_records, encode_record, load_release_model
 
     jev_model, jev_processor = load_release_model(path, device=device)
     jev_model.eval()
@@ -285,12 +416,11 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
         },
     }
 
-    db_paths  = np.array(test_ds.images_paths[:test_ds.num_database])
-    q_texts   = test_ds.descriptions[test_ds.num_database:]
-    n_cand    = min(max_rerank_k, predictions.shape[1])
-    reranked  = predictions.copy()
+    db_paths = np.array(test_ds.images_paths[:test_ds.num_database])
+    q_texts  = test_ds.descriptions[test_ds.num_database:]
+    n_cand   = min(max_rerank_k, predictions.shape[1])
+    reranked = predictions.copy()
 
-    # ── Build ALL (query, image) pairs upfront ────────────────
     all_pairs = []
     for q_idx in range(test_ds.num_queries):
         cand_indices = predictions[q_idx, :n_cand]
@@ -300,25 +430,22 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
     logger.info(f"Total pairs to score: {len(all_pairs)} "
                 f"({test_ds.num_queries} queries × {n_cand} candidates)")
 
-    # ── Score all pairs in flat batches ───────────────────────
-    all_scores = {}  # (q_idx, rank) → score
+    all_scores = {}
 
     for start in tqdm(range(0, len(all_pairs), batch_size), desc="JEV rerank"):
-        chunk = all_pairs[start: start + batch_size]
-
+        chunk   = all_pairs[start: start + batch_size]
         records, keys = [], []
 
         for q_idx, rank, query_text, img_path in chunk:
             try:
-                image = Image.open(img_path).convert("RGB")
+                image  = Image.open(img_path).convert("RGB")
                 record = {
                     "state":     {"query": query_text},
                     "images":    [image],
                     "questions": QUESTION_SCHEMA,
                 }
                 encoded = encode_record(
-                    jev_processor.tokenizer, record, processor=jev_processor
-                )
+                    jev_processor.tokenizer, record, processor=jev_processor)
                 records.append(encoded)
                 keys.append((q_idx, rank))
             except Exception as e:
@@ -329,10 +456,7 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
             continue
 
         batch = collate_records(
-            records,
-            jev_processor.tokenizer.pad_token_id,
-            torch.device(device),
-        )
+            records, jev_processor.tokenizer.pad_token_id, torch.device(device))
 
         with torch.inference_mode():
             batch_logits = jev_model(batch)
@@ -341,16 +465,12 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
             results = {}
             for question, q_logits in zip(encoded.questions, logits):
                 probs = q_logits.float().softmax(-1).tolist()
-                results[question.question_id] = dict(
-                    zip(question.option_ids, probs)
-                )
+                results[question.question_id] = dict(zip(question.option_ids, probs))
             match_prob    = results["place_match"].get("match", 0.0)
             location_prob = list(results["confidence"].values())[0]
             all_scores[(q_idx, rank)] = (
-                match_weight * match_prob + (1 - match_weight) * location_prob
-            )
+                match_weight * match_prob + (1 - match_weight) * location_prob)
 
-    # ── Rerank each query using collected scores ───────────────
     for q_idx in range(test_ds.num_queries):
         cand_indices = predictions[q_idx, :n_cand]
         scores = np.array([all_scores.get((q_idx, r), 0.0) for r in range(n_cand)])
@@ -360,15 +480,10 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
     logger.info("JEV reranking complete.")
     return reranked
 
+
 def rerank_by_filip(model, test_ds, predictions, vision_descriptors, text_descriptors,
                     img_local_descs, text_local_desc, text_tokens_all=None,
                     max_rerank_k=20, alpha=0.0, device="cuda"):
-    """Rerank the stage-1 shortlist with FILIP token-wise max similarity.
-
-    alpha fuses the stage-1 global score after z-normalising both, so the
-    two scales are comparable:  alpha * z(global) + (1-alpha) * z(filip).
-    alpha = 1.0 must reproduce the stage-1 ordering - use it as a sanity check.
-    """
     logger.info(f"Reranking top-{max_rerank_k} candidates using FILIP MaxSim...")
 
     head = getattr(model.single_encoder, "filip_loss", None)
@@ -381,7 +496,7 @@ def rerank_by_filip(model, test_ds, predictions, vision_descriptors, text_descri
     use_idf = getattr(head, "use_idf", False) and text_tokens_all is not None
     if getattr(head, "use_idf", False) and text_tokens_all is None:
         logger.warning("FILIP head trained with IDF weights but no token ids passed; "
-                       "falling back to uniform weights (will not match training).")
+                       "falling back to uniform weights.")
 
     reranked = predictions.copy()
     img_l = torch.from_numpy(img_local_descs).to(device)
@@ -389,14 +504,13 @@ def rerank_by_filip(model, test_ds, predictions, vision_descriptors, text_descri
     dtype = next(head.parameters()).dtype
 
     db_g = F.normalize(torch.from_numpy(vision_descriptors).to(device).float(), dim=-1)
-    q_g = F.normalize(torch.from_numpy(text_descriptors).to(device).float(), dim=-1)
+    q_g  = F.normalize(torch.from_numpy(text_descriptors).to(device).float(), dim=-1)
 
     with torch.no_grad():
         for q_idx in tqdm(range(test_ds.num_queries), desc="FILIP rerank"):
             q_ds_idx = test_ds.num_database + q_idx
-
-            raw_t = txt_l[q_ds_idx]
-            mask = raw_t.abs().sum(dim=-1) > 0
+            raw_t    = txt_l[q_ds_idx]
+            mask     = raw_t.abs().sum(dim=-1) > 0
             if mask.sum() == 0:
                 continue
             raw_t = raw_t[mask].unsqueeze(0)
@@ -407,20 +521,20 @@ def rerank_by_filip(model, test_ds, predictions, vision_descriptors, text_descri
             if use_idf:
                 ids = torch.from_numpy(text_tokens_all[q_ds_idx]).to(device)
                 ids = ids[mask].clamp(0, head.idf_weights.numel() - 1)
-                w = head.idf_weights[ids].to(t.dtype)
+                w   = head.idf_weights[ids].to(t.dtype)
             else:
                 w = torch.ones(t.shape[0], device=device, dtype=t.dtype)
             w = w / w.sum().clamp(min=1e-6)
 
-            cand = predictions[q_idx, :max_rerank_k]
+            cand  = predictions[q_idx, :max_rerank_k]
             v_raw = img_l[cand]
             if has_cls:
-                v_raw = v_raw[:, 1:]                     # drop CLS, as in training
+                v_raw = v_raw[:, 1:]
             v = head.vision_proj(_maybe(head, "v_norm", v_raw.to(dtype)))
             v = F.normalize(v, dim=-1)
 
-            sim = torch.einsum('nd,kmd->knm', t, v)
-            best = sim.max(dim=-1).values
+            sim    = torch.einsum('nd,kmd->knm', t, v)
+            best   = sim.max(dim=-1).values
             s_filip = (best * w.unsqueeze(0)).sum(-1).float()
 
             if alpha > 0:
@@ -437,14 +551,9 @@ def rerank_by_filip(model, test_ds, predictions, vision_descriptors, text_descri
 
 def rerank_by_mllm(image_paths, target_text, predictions,
                    max_concurrent_requests=8, debug=True):
-    """Rerank candidates on viewpoint-invariant scene text & landmark matching.
-
-    Ties keep their original stage-1 order.
-    """
     if len(image_paths) != len(predictions):
         raise ValueError(
-            f"Length mismatch: {len(image_paths)} image paths vs {len(predictions)} predictions."
-        )
+            f"Length mismatch: {len(image_paths)} image paths vs {len(predictions)} predictions.")
 
     async def encode_image_async(image_path):
         def _read_and_b64(path):
@@ -454,7 +563,6 @@ def rerank_by_mllm(image_paths, target_text, predictions,
             with open(path, "rb") as image_file:
                 b64_str = base64.b64encode(image_file.read()).decode("utf-8")
                 return f"data:{mime_type};base64,{b64_str}"
-
         return await asyncio.to_thread(_read_and_b64, image_path)
 
     async def evaluate_single_image(client, semaphore, orig_rank, pred_index, path):
@@ -463,11 +571,9 @@ def rerank_by_mllm(image_paths, target_text, predictions,
                 if debug:
                     print(f"[Debug] Path missing: {path}")
                 return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
-
             try:
                 img_data_url = await encode_image_async(path)
-
-                prompt_text = f"""
+                prompt_text  = f"""
 You are an expert visual place recognition and OCR assistant.
 Analyze this image to evaluate if it shows the location described by the target text query.
 
@@ -486,43 +592,35 @@ SCORING CRITERIA (0 to 100):
 OUTPUT FORMAT:
 Respond ONLY with a JSON object: {{"score": <number 0-100>, "reason": "<brief justification>"}}
 """
-
                 response = await client.chat.completions.create(
                     model="neuralmagic/Qwen2.5-VL-72B-Instruct-FP8-Dynamic",
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text.strip()},
-                                {"type": "image_url", "image_url": {"url": img_data_url}},
-                            ],
-                        }
-                    ],
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text.strip()},
+                            {"type": "image_url", "image_url": {"url": img_data_url}},
+                        ],
+                    }],
                     temperature=0.0,
                     max_tokens=80,
                 )
-
                 raw_output = response.choices[0].message.content.strip()
-
                 score = 0.0
                 try:
                     clean_json = raw_output
                     if "```" in clean_json:
                         clean_json = re.sub(r"```[a-zA-Z]*", "", clean_json).strip()
-                    data = json.loads(clean_json)
+                    data  = json.loads(clean_json)
                     score = float(data.get("score", data.get("confidence_score", 0.0)))
                 except Exception:
                     match = re.search(
                         r'"(?:score|confidence_score)"\s*:\s*(\d+(?:\.\d+)?)', raw_output)
                     if match:
                         score = float(match.group(1))
-
                 if debug:
                     print(f"[Debug] Orig Rank {orig_rank:02d} | Pred {pred_index} | "
                           f"Score: {score} | File: {os.path.basename(path)}")
-
                 return {"pred_index": pred_index, "score": score, "orig_rank": orig_rank}
-
             except Exception as e:
                 if debug:
                     print(f"[Debug Error] Candidate {pred_index} failed: {e}")
@@ -549,9 +647,8 @@ Respond ONLY with a JSON object: {{"score": <number 0-100>, "reason": "<brief ju
     else:
         results = asyncio.run(run_batch())
 
-    # primary key: score desc; secondary: original rank asc
-    sorted_results = sorted(results, key=lambda x: (-x["score"], x["orig_rank"]))
-    reranked_preds = [res["pred_index"] for res in sorted_results]
+    sorted_results  = sorted(results, key=lambda x: (-x["score"], x["orig_rank"]))
+    reranked_preds  = [res["pred_index"] for res in sorted_results]
 
     if debug:
         print("\n--- Final Reranked Candidate Order ---")
@@ -561,19 +658,13 @@ Respond ONLY with a JSON object: {{"score": <number 0-100>, "reason": "<brief ju
 
     return reranked_preds
 
+
 @torch.no_grad()
 def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
                                vision_descriptors, text_descriptors,
                                img_local_descs, text_local_desc,
                                text_tokens_all=None, text_attentions=None,
                                K=20, device="cuda"):
-    """Is FILIP's MaxSim a different signal from the global cosine, or the same
-    one computed expensively?
-
-    Both scores are evaluated on the SAME candidate set (the global top-K), so
-    they are directly comparable. `scores` from faiss on L2-normalised
-    descriptors are already cosines aligned with `predictions`.
-    """
     head = getattr(model.single_encoder, "filip_loss", None)
     if head is None:
         logger.warning("No filip_loss head; skipping diagnostic.")
@@ -582,14 +673,14 @@ def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
 
     has_cls = getattr(model.single_encoder, "has_cls", True)
     use_idf = getattr(head, "use_idf", False) and text_tokens_all is not None
-    dtype = next(head.parameters()).dtype
-    nd, nq = test_ds.num_database, test_ds.num_queries
-    K = min(K, predictions.shape[1])
+    dtype   = next(head.parameters()).dtype
+    nd, nq  = test_ds.num_database, test_ds.num_queries
+    K       = min(K, predictions.shape[1])
 
     img_l = torch.from_numpy(img_local_descs).to(device)
     txt_l = torch.from_numpy(text_local_desc).to(device)
 
-    G = scores[:, :K].astype(np.float64)
+    G  = scores[:, :K].astype(np.float64)
     Fm = np.zeros((nq, K), dtype=np.float64)
 
     for q in tqdm(range(nq), desc="filip-vs-global"):
@@ -606,29 +697,28 @@ def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
 
         if use_idf:
             ids = torch.from_numpy(text_tokens_all[gi]).to(device)[m]
-            w = head.idf_weights[ids.clamp(0, head.idf_weights.numel() - 1)].to(t.dtype)
+            w   = head.idf_weights[ids.clamp(0, head.idf_weights.numel() - 1)].to(t.dtype)
         else:
             w = torch.ones(t.shape[0], device=device, dtype=t.dtype)
         w = w / w.sum().clamp(min=1e-6)
 
         cand = predictions[q, :K]
-        v = img_l[cand]
+        v    = img_l[cand]
         if has_cls:
             v = v[:, 1:]
         v = F.normalize(head.vision_proj(_maybe(head, "v_norm", v.to(dtype))), dim=-1)
 
-        sim = torch.einsum('nd,kmd->knm', t, v)
-        Fm[q] = (sim.max(dim=-1).values * w.unsqueeze(0)).sum(-1).float().cpu().numpy()
+        sim    = torch.einsum('nd,kmd->knm', t, v)
+        Fm[q]  = (sim.max(dim=-1).values * w.unsqueeze(0)).sum(-1).float().cpu().numpy()
 
-    # ---- agreement -------------------------------------------------------
-    def _rank(a):                       # ranks within each row
+    def _rank(a):
         return np.argsort(np.argsort(a, axis=1), axis=1).astype(np.float64)
 
-    def _rowcorr(a, b):                 # mean WITHIN-query correlation
-        a = a - a.mean(1, keepdims=True)
-        b = b - b.mean(1, keepdims=True)
+    def _rowcorr(a, b):
+        a   = a - a.mean(1, keepdims=True)
+        b   = b - b.mean(1, keepdims=True)
         den = (np.sqrt((a ** 2).sum(1)) * np.sqrt((b ** 2).sum(1)))
-        ok = den > 1e-12
+        ok  = den > 1e-12
         return ((a * b).sum(1)[ok] / den[ok]).mean()
 
     logger.info("=" * 62)
@@ -639,14 +729,12 @@ def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
     logger.info(f"  relative spread  global : {(G.std(1) / np.abs(G.mean(1) + 1e-9)).mean():.4f}")
     logger.info(f"  top-1 agreement         : {(Fm.argmax(1) == 0).mean():.3f}")
 
-    # ---- does it help? ---------------------------------------------------
     if getattr(test_ds, 'get_positives', None) is not None:
-        pos = [set(np.asarray(p).ravel().tolist()) for p in test_ds.get_positives()]
-        g_ok = np.array([predictions[q, 0] in pos[q] for q in range(nq)])
-        f_ok = np.array([predictions[q, int(Fm[q].argmax())] in pos[q] for q in range(nq)])
-        in_k = np.array([len(pos[q] & set(predictions[q, :K].tolist())) > 0
-                         for q in range(nq)])
-
+        pos      = [set(np.asarray(p).ravel().tolist()) for p in test_ds.get_positives()]
+        g_ok     = np.array([predictions[q, 0] in pos[q] for q in range(nq)])
+        f_ok     = np.array([predictions[q, int(Fm[q].argmax())] in pos[q] for q in range(nq)])
+        in_k     = np.array([len(pos[q] & set(predictions[q, :K].tolist())) > 0
+                             for q in range(nq)])
         repairable = (~g_ok) & in_k
         logger.info(f"  R@1 global              : {100 * g_ok.mean():.2f}")
         logger.info(f"  R@1 filip (reordered)   : {100 * f_ok.mean():.2f}")
@@ -664,7 +752,7 @@ def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     os.environ["TOKENIZERS_PARALLELISM"] = "False"
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark     = False
     start_time = datetime.now()
 
     logger.remove()
@@ -680,9 +768,9 @@ def main(args):
     logger.info(f"The outputs are being saved in {log_dir}")
 
     IMAGENET_MEAN_STD = {'mean': [0.485, 0.456, 0.406], 'std': [0.229, 0.224, 0.225]}
-    BLIP_MEAN_STD = {'mean': [0.48145466, 0.4578275, 0.40821073],
-                     'std': [0.26862954, 0.26130258, 0.27577711]}
-    SIGLIP_MEAN_STD = {'mean': [0.5, 0.5, 0.5], 'std': [0.5, 0.5, 0.5]}
+    BLIP_MEAN_STD     = {'mean': [0.48145466, 0.4578275, 0.40821073],
+                         'std':  [0.26862954, 0.26130258, 0.27577711]}
+    SIGLIP_MEAN_STD   = {'mean': [0.5, 0.5, 0.5], 'std': [0.5, 0.5, 0.5]}
 
     dataset_mean_std = IMAGENET_MEAN_STD
     if 'blip' in args.model_name.lower() or 'clip' in args.model_name.lower() \
@@ -695,101 +783,109 @@ def main(args):
     logger.info(f"VLM encoder dim: {model.encoder_dim}")
 
     is_msls_challenge = False
-    # ViT-B/16 at 224: (224/16)^2 = 196 patches, +1 CLS. CLIP text is 77 tokens.
-    num_img_tokens = 197
-    num_text_tokens = 77
-    
+
+    # ---- Local token buffer dimensions -----------------------------------
+    # cross_modal=3 (LaVPR_cross / DINOv2 + BGE): different dims from CLIP
+    if args.cross_modal == 3:
+        num_img_tokens = model.img_local_tokens   # 256 for DINOv2-B at 224px
+        num_text_tokens = model.txt_local_tokens  # 512 for BGE max length
+        txt_local_dim   = model.txt_local_dim     # 1024 BGE-large / 768 BGE-base
+        img_local_dim   = model.img_local_dim     # 768 for DINOv2-B
+    else:
+        # ViT-B/16 at 224: (224/16)^2 = 196 patches, +1 CLS. CLIP text is 77 tokens.
+        num_img_tokens  = 197
+        num_text_tokens = 77
+        txt_local_dim   = model.encoder_dim
+        img_local_dim   = 768
+
     if args.data in ['amster', 'amstertime']:
         args.database_folder = "/home/shared/datasets/amstertime/test/database"
-        args.queries_folder = "/home/shared/datasets/amstertime/test/queries"
-        args.image_root = "/home/shared/datasets/amstertime/test"
-        args.queries_csv = "datasets/descriptions/amstertime_descriptions.csv"
+        args.queries_folder  = "/home/shared/datasets/amstertime/test/queries"
+        args.image_root      = "/home/shared/datasets/amstertime/test"
+        args.queries_csv     = "datasets/descriptions/amstertime_descriptions.csv"
     elif args.data in ['pitts', 'pitts_test', 'pitts30k']:
         args.database_folder = "/home/shared/datasets/pitts30k/images/test/database"
-        args.queries_folder = "/home/shared/datasets/pitts30k/images/test/queries"
-        args.image_root = "/home/shared/datasets/pitts30k/images/test"
-        args.queries_csv = "datasets/descriptions/pitts30k_test_descriptions.csv"
+        args.queries_folder  = "/home/shared/datasets/pitts30k/images/test/queries"
+        args.image_root      = "/home/shared/datasets/pitts30k/images/test"
+        args.queries_csv     = "datasets/descriptions/pitts30k_test_descriptions.csv"
     elif args.data in ['pitts_val', 'pitts30k_val']:
         args.database_folder = "/home/shared/datasets/pitts30k/images/val/database"
-        args.queries_folder = "/home/shared/datasets/pitts30k/images/val/queries"
-        args.image_root = "/home/shared/datasets/pitts30k/images/val"
-        args.queries_csv = "datasets/descriptions/pitts30k_val_800_queries.csv"
+        args.queries_folder  = "/home/shared/datasets/pitts30k/images/val/queries"
+        args.image_root      = "/home/shared/datasets/pitts30k/images/val"
+        args.queries_csv     = "datasets/descriptions/pitts30k_val_800_queries.csv"
     elif args.data in ['msls', 'msls_val']:
         args.database_folder = "/home/shared/datasets/msls/val/database"
-        args.queries_folder = "/home/shared/datasets/msls/val/query"
-        args.image_root = "/home/shared/datasets/msls/val/"
-        args.queries_csv = "datasets/descriptions/msls_val_descriptions.csv"
+        args.queries_folder  = "/home/shared/datasets/msls/val/query"
+        args.image_root      = "/home/shared/datasets/msls/val/"
+        args.queries_csv     = "datasets/descriptions/msls_val_descriptions.csv"
     elif args.data == 'msls_challenge':
         args.database_folder = "/home/shared/datasets/msls_challenge"
-        args.queries_folder = None
-        args.image_root = "/home/shared/datasets/msls_challenge/test"
-        args.queries_csv = "datasets/descriptions/msls_challenge_descriptions.csv"
+        args.queries_folder  = None
+        args.image_root      = "/home/shared/datasets/msls_challenge/test"
+        args.queries_csv     = "datasets/descriptions/msls_challenge_descriptions.csv"
     elif args.data == 'nordland':
         args.database_folder = "/home/shared/datasets/nordland/test/database"
-        args.queries_folder = "/home/shared/datasets/nordland/test/queries"
-        args.image_root = "/home/shared/datasets/nordland/test"
-        args.queries_csv = "datasets/descriptions/nordland_descriptions.csv"
-        
+        args.queries_folder  = "/home/shared/datasets/nordland/test/queries"
+        args.image_root      = "/home/shared/datasets/nordland/test"
+        args.queries_csv     = "datasets/descriptions/nordland_descriptions.csv"
 
-    if 'msls_challenge' in args.image_root:
-        test_ds = MSLSTest(dataset_root=args.database_folder, image_root=args.image_root,
-                           csv_path=args.queries_csv, mean_std=dataset_mean_std,
-                           image_size=args.image_size)
+    if 'msls_challenge' in getattr(args, 'image_root', ''):
+        test_ds = MSLSTest(
+            dataset_root=args.database_folder, image_root=args.image_root,
+            csv_path=args.queries_csv, mean_std=dataset_mean_std,
+            image_size=args.image_size)
         is_msls_challenge = True
     else:
         test_ds = TestDataset(
-            args.database_folder,
-            args.queries_folder,
-            args.queries_csv,
-            args.image_root,
-            mean_std=dataset_mean_std,
+            args.database_folder, args.queries_folder, args.queries_csv,
+            args.image_root, mean_std=dataset_mean_std,
             positive_dist_threshold=args.positive_dist_threshold,
-            image_size=args.image_size,
-            use_labels=args.use_labels,
-        )
+            image_size=args.image_size, use_labels=args.use_labels)
     logger.info(f"Testing on {test_ds}")
 
     max_results = max(args.recall_values)
-    need_local = (getattr(args, 'reranker', False)
-                  or getattr(args, 'reranker_filip', False)
-                  or getattr(args, 'filip_retrieval', False))
+    need_local  = (getattr(args, 'reranker',        False)
+                   or getattr(args, 'reranker_filip',  False)
+                   or getattr(args, 'filip_retrieval', False))
 
     with torch.inference_mode():
         logger.debug("Extracting database descriptors for evaluation/testing")
-        database_subset_ds = Subset(test_ds, list(range(test_ds.num_database)))
-        database_dataloader = DataLoader(dataset=database_subset_ds,
-                                         num_workers=args.num_workers,
-                                         batch_size=args.batch_size)
+        database_subset_ds  = Subset(test_ds, list(range(test_ds.num_database)))
+        database_dataloader = DataLoader(
+            dataset=database_subset_ds,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size)
 
-        # zeros, not empty: an unpopulated buffer should fail loudly
-        vision_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")
-        text_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")
-        all_descriptors = np.zeros((len(test_ds), model.encoder_dim), dtype="float32")        
-        img_local_descs = np.zeros((len(test_ds), num_img_tokens, 768), dtype="float32")
-        text_local_desc = np.zeros((len(test_ds), num_text_tokens, model.encoder_dim), dtype="float32")
-        text_tokens_all = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)       
-        text_attentions = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)       
+        # Allocate buffers — zeros so unpopulated entries fail loudly
+        vision_descriptors = np.zeros((len(test_ds), model.encoder_dim),  dtype="float32")
+        text_descriptors   = np.zeros((len(test_ds), model.encoder_dim),  dtype="float32")
+        all_descriptors    = np.zeros((len(test_ds), model.encoder_dim),  dtype="float32")
+        img_local_descs    = np.zeros((len(test_ds), num_img_tokens,  img_local_dim), dtype="float32")
+        text_local_descs   = np.zeros((len(test_ds), num_text_tokens, txt_local_dim), dtype="float32")
+        text_tokens_all    = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)
+        text_attentions    = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)
 
         for images, indices, texts in tqdm(database_dataloader):
             encode_batch(model, args, images, texts, indices, all_descriptors,
                          vision_descriptors, text_descriptors, img_local_descs,
-                         text_local_desc, text_tokens_all, text_attentions)
+                         text_local_descs, text_tokens_all, text_attentions)
 
         logger.debug("Extracting queries descriptors for evaluation/testing")
-        queries_subset_ds = Subset(
+        queries_subset_ds  = Subset(
             test_ds, list(range(test_ds.num_database,
                                 test_ds.num_database + test_ds.num_queries)))
-        queries_dataloader = DataLoader(dataset=queries_subset_ds,
-                                        num_workers=args.num_workers,
-                                        batch_size=args.batch_size)
+        queries_dataloader = DataLoader(
+            dataset=queries_subset_ds,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size)
         for images, indices, texts in tqdm(queries_dataloader):
             encode_batch(model, args, images, texts, indices, all_descriptors,
                          vision_descriptors, text_descriptors, img_local_descs,
-                         text_local_desc, text_tokens_all, text_attentions)
+                         text_local_descs, text_tokens_all, text_attentions)
 
     if need_local:
         logger.info(f"local buffers | img {np.abs(img_local_descs).sum():.1f}  "
-                    f"text {np.abs(text_local_desc).sum():.1f}  "
+                    f"text {np.abs(text_local_descs).sum():.1f}  "
                     f"(both must be non-zero)")
 
     if args.cross_modal:
@@ -800,70 +896,86 @@ def main(args):
         queries_descriptors = text_descriptors[test_ds.num_database:]
     else:
         database_descriptors = text_descriptors[: test_ds.num_database]
-        queries_descriptors = text_descriptors[test_ds.num_database:]
+        queries_descriptors  = text_descriptors[test_ds.num_database:]
 
     # ---- 1. Stage-1 retrieval -------------------------------------------
     if args.filip_retrieval:
-        # FILIP-only: token-wise MaxSim IS the retrieval similarity
         scores, predictions = filip_full_retrieval(
             model, test_ds, vision_descriptors, text_descriptors,
-            img_local_descs, text_local_desc, text_tokens_all,
+            img_local_descs, text_local_descs, text_tokens_all,
             max_results=max_results,
             db_chunk=getattr(args, 'filip_db_chunk', 2048),
             alpha=getattr(args, 'filip_alpha', 0.0),
             db_on_gpu=getattr(args, 'filip_db_on_gpu', True),
-            device=args.device)      
+            device=args.device)
     else:
         scores, predictions = get_queries_predictions(
             model.encoder_dim, database_descriptors, all_descriptors,
             queries_descriptors, max_results)
 
     if getattr(args, 'filip_diag', 0) and not args.filip_retrieval:
-                filip_vs_global_diagnostic(
-                    model, test_ds, predictions, scores,
-                    vision_descriptors, text_descriptors,
-                    img_local_descs, text_local_desc,
-                    text_tokens_all=text_tokens_all, text_attentions=text_attentions,
-                    K=min(args.max_rerank, max_results), device=args.device)
-    
-    # ---- 2. Reranking ----------------------------------------------------
-    if args.reranker:
-        max_rerank_k = min(args.max_rerank, max_results)
-        predictions = rerank_predictions(
-            model, test_ds, predictions, vision_descriptors, text_descriptors,
-            img_local_descs, text_local_desc, max_rerank_k=max_rerank_k,
-            device=args.device)
+        filip_vs_global_diagnostic(
+            model, test_ds, predictions, scores,
+            vision_descriptors, text_descriptors,
+            img_local_descs, text_local_descs,
+            text_tokens_all=text_tokens_all, text_attentions=text_attentions,
+            K=min(args.max_rerank, max_results), device=args.device)
+
+    # # ---- 2. Reranking ----------------------------------------------------
+    # if args.reranker:
+    #     max_rerank_k = min(args.max_rerank, max_results)
+    #     predictions  = rerank_predictions(
+    #         model, test_ds, predictions, vision_descriptors, text_descriptors,
+    #         img_local_descs, text_local_descs, max_rerank_k=max_rerank_k,
+    #         device=args.device)
 
     if args.reranker_filip:
         max_rerank_k = min(args.max_rerank, max_results)
-        predictions = rerank_by_filip(
+        predictions  = rerank_by_filip(
             model, test_ds, predictions, vision_descriptors, text_descriptors,
-            img_local_descs, text_local_desc, text_tokens_all=text_tokens_all,
+            img_local_descs, text_local_descs, text_tokens_all=text_tokens_all,
             max_rerank_k=max_rerank_k, alpha=getattr(args, 'filip_alpha', 0.0),
             device=args.device)
 
     if args.reranker_mllm:
-        q_texts = test_ds.descriptions[test_ds.num_database:]
-        db_paths_array = np.array(test_ds.images_paths[:test_ds.num_database])
-        db_images = db_paths_array[predictions]
+        q_texts      = test_ds.descriptions[test_ds.num_database:]
+        db_paths_arr = np.array(test_ds.images_paths[:test_ds.num_database])
+        db_images    = db_paths_arr[predictions]
         for i in range(len(q_texts)):
             print(f"Sending query {i} to LLM")
             predictions[i] = rerank_by_mllm(db_images[i], q_texts[i], predictions[i])
-            
-      # ── JEV reranker ──────────────────────────────────────────────────────
+
     if args.reranker_jev:
         max_rerank_k = min(args.max_rerank, max_results)
-        predictions = rerank_by_jev(
+        predictions  = rerank_by_jev(
             test_ds, predictions,
             max_rerank_k=max_rerank_k,
             batch_size=getattr(args, "jev_batch_size", 32),
             match_weight=getattr(args, "jev_match_weight", 0.6),
-            device=args.device,
+            device=args.device)
+
+    # ---- LaVPR cross-attention reranker (stage-2) -----------------------
+    if getattr(args, 'reranker', False) and args.cross_modal == 3:
+        max_rerank_k = min(args.max_rerank, max_results)
+        predictions  = rerank_by_lavpr(
+            model           = model,
+            test_ds         = test_ds,
+            predictions     = predictions,
+            img_local_descs = img_local_descs,
+            text_local_desc = text_local_descs,
+            text_attentions = text_attentions,
+            vision_descs    = vision_descriptors,
+            text_descs      = text_descriptors,
+            max_rerank_k    = max_rerank_k,
+            rerank_batch    = getattr(args, 'rerank_batch', 64),
+            alpha           = getattr(args, 'rerank_alpha', 0.0),
+            device          = args.device,
         )
 
     # ---- 3. Metrics ------------------------------------------------------
     if is_msls_challenge:
-        test_ds.save_predictions(predictions, log_dir / "msls_challenge_predictions.txt", k=25)
+        test_ds.save_predictions(
+            predictions, log_dir / "msls_challenge_predictions.txt", k=25)
     else:
         if args.use_labels:
             positives_per_query = test_ds.get_positives()
@@ -874,7 +986,7 @@ def main(args):
                         recalls[i:] += 1
                         break
 
-            recalls = recalls / test_ds.num_queries * 100
+            recalls     = recalls / test_ds.num_queries * 100
             recalls_str = ", ".join([f"R@{val}: {rec:.1f}"
                                      for val, rec in zip(args.recall_values, recalls)])
             logger.info(f"{recalls_str}")

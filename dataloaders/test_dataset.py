@@ -68,8 +68,8 @@ class TestDataset(data.Dataset):
         self.image_root = image_root
 
         #loop over images_paths_csv. if path contains database_folder, add to database_paths
-        #self.database_paths = read_images_paths(database_folder)        
-        self.database_paths = [path for path in self.images_paths_csv if database_folder in path]   
+        self.database_paths = read_images_paths(database_folder)        
+        #self.database_paths = [path for path in self.images_paths_csv if database_folder in path]   
         self.database_paths = sorted(self.database_paths)
         
         # only for debug - small data check!!!!
