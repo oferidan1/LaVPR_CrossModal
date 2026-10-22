@@ -1,24 +1,31 @@
 """
 train_reranker.py
 =================
-Stage-2 reranker training.  Mirrors train.py structure exactly.
+Stage-2 reranker training — supports two architectures via --model_type:
 
-Validation uses the real Pitts30k val set via GSVCitiesDataModule,
-reporting R@k before reranking (stage-1 only) and after (stage-1 + reranker).
+  cross_attn  (default)
+      Text tokens attend to image patches via CrossAttnBlock × n_layers.
+      CLS of attended text → score_head → scalar.
+      Fast, lightweight, good for R@1.
 
-Usage
------
-python train_reranker.py \
-    --backbone_ckpt  checkpoints/lavpr_cross_best.ckpt \
-    --triplets_json  cache/gsv_triplets.json \
-    --embeddings_npz cache/gsv_embeddings.npz \
-    --image_root     /home/shared/datasets/gsv_cities/ \
-    --train_csv      datasets/descriptions/gsv_cities_places.csv \
-    --val_image_root /home/shared/datasets/pitts30k/images/val \
-    --val_csv        datasets/descriptions/pitts30k_val_800_queries.csv \
-    --out_dim        768 \
-    --batch_size     8  \
-    --gpu            0
+  qformer
+      Learned queries attend to both image patches and text tokens.
+      Mean-pool queries → score_head → scalar.
+      More expressive, better fusion, higher ceiling.
+
+Both architectures share the same training loop, loss, dataloader,
+and validation pipeline.
+
+Example commands
+----------------
+# Cross-attention (default, reproduces previous experiments)
+python train_reranker.py --model_type cross_attn --loss_name margin
+
+# QFormer
+python train_reranker.py --model_type qformer --n_layers 2 --num_queries 32
+
+# Resume
+python train_reranker.py --resume LOGS/reranker/.../last.ckpt
 """
 
 import os
@@ -43,18 +50,18 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     a = p.add_argument
 
-    # Backbone (frozen)
+    # ---- Backbone (frozen) ----
     a('--backbone_ckpt',    type=str,
       default='checkpoints/dinov2-bge-ft-lora-ms/checkpoints/'
-              'lavpr_epoch(19)_step(15640)_R1[0.5663]_R5[0.8237].ckpt')
+              'lavpr_epoch(19)_step(15640)_R1[0.5663]_R5[0.8237].ckpt',
+      help='Frozen LaVPR_cross checkpoint')
 
-    # Pre-mined data
+    # ---- Pre-mined data ----
     a('--triplets_json',    type=str, default='cache/gsv_triplets.json')
-
     a('--token_path',       type=str, default='cache/local_tokens',
-      help='Path to local_tokens.h5 or local_tokens/ directory of .pt files')
+      help='local_tokens.h5 or local_tokens/ directory of .pt files')
 
-    # GSV train dataset (same as train.py)
+    # ---- GSV train dataset ----
     a('--image_root',       type=str,
       default='/home/shared/datasets/gsv_cities/')
     a('--train_csv',        type=str,
@@ -64,64 +71,75 @@ def parse_args():
     a('--image_size',       type=int, default=224)
     a('--img_per_place',    type=int, default=4)
 
-    # Pitts30k validation (same as train.py)
+    # ---- Pitts30k validation ----
     a('--val_image_root',   type=str,
       default='/home/shared/datasets/pitts30k/images/val')
     a('--val_csv',          type=str,
       default='datasets/descriptions/pitts30k_val_800_queries.csv')
     a('--val_set_names',    type=str, default=['pitts30k_val'], nargs='+')
 
-    # Shortlist
+    # ---- Shortlist ----
     a('--top_k_train',      type=int, default=100,
-      help='Mined shortlist size (in gsv_triplets.json)')
-    a('--max_cands',        type=int, default=50,
-      help='Candidates actually loaded per step — tune to fit VRAM')
+      help='Mined shortlist size in gsv_triplets.json')
+    a('--max_cands',        type=int, default=20,
+      help='Candidates loaded per step — tune for VRAM/speed')
     a('--rerank_k',         type=int, default=20,
-      help='Shortlist size for reranker at val / inference')
-    a('--max_pos',          type=int, default=4)
+      help='Shortlist size at val / inference')
+    a('--max_pos',          type=int, default=4,
+      help='Max positives per sample (4 GSV views)')
 
-    # Reranker architecture
-    a('--d_model',          type=int,   default=128)
-    a('--n_heads',          type=int,   default=4)
-    a('--n_layers',         type=int,   default=2)
+    # ---- Architecture ----
+    a('--model_type',       type=str, default='cross_attn',
+      choices=['cross_attn', 'qformer'],
+      help='Reranker architecture: '
+           'cross_attn=text attends image patches, '
+           'qformer=learned queries fuse both modalities')
+    a('--d_model',          type=int,   default=128,
+      help='Inner attention dimension')
+    a('--n_heads',          type=int,   default=4,
+      help='Attention heads (d_model must be divisible by n_heads)')
+    a('--n_layers',         type=int,   default=1,
+      help='Number of attention layers')
     a('--dropout',          type=float, default=0.1)
-    a('--deep_score_head',  action='store_true',
-      help='Use 2-layer score head Linear(d→d/2)+GELU+Linear instead of Linear(d→1)')
     a('--out_dim',          type=int,   default=768,
-      help='Must match backbone embeds_dim')
+      help='Output embedding dim — must match backbone embeds_dim')
+    a('--deep_score_head',  action='store_true',
+      help='2-layer score head: Linear(d→d/2)+GELU+Linear vs Linear(d→1)')
+    a('--num_queries',      type=int,   default=32,
+      help='[QFormer only] Number of learned query vectors')
 
-
-
-    # Loss
+    # ---- Loss ----
     a('--loss_name',        type=str,   default='margin',
       choices=['margin', 'bce'],
-      help='Loss function: margin=ranking loss (R@1 focused), bce=binary cross-entropy')
+      help='margin: ranking loss optimises R@1 directly. '
+           'bce: binary CE, all positives contribute equally')
     a('--margin',           type=float, default=0.3,
-      help='Margin for ranking loss (only used when --loss_name margin)')
+      help='Margin for ranking loss (margin only)')
 
-    # Optimiser
+    # ---- Optimiser ----
     a('--lr',               type=float, default=1e-4)
     a('--weight_decay',     type=float, default=1e-3)
     a('--warmup_steps',     type=int,   default=200)
     a('--epochs',           type=int,   default=10)
-    a('--batch_size',       type=int,   default=8,
-      help='Queries per batch — keep small to fit VRAM')
-    a('--grad_accum',       type=int,   default=1,
-      help='Gradient accumulation steps — effective batch = batch_size × grad_accum')
+    a('--batch_size',       type=int,   default=32,
+      help='Queries per batch — memory: batch_size × max_cands token pairs')
+    a('--grad_accum',       type=int,   default=2,
+      help='Gradient accumulation — effective batch = batch_size × grad_accum')
 
-    # Hardware
+    # ---- Hardware ----
     a('--gpu',              type=str,   default='0')
     a('--num_workers',      type=int,   default=4)
     a('--precision',        type=str,   default='bf16',
       choices=['32', '16', 'bf16'])
     a('--faiss_gpu',        action='store_true')
 
-    # Re-mining
+    # ---- Re-mining ----
     a('--remine_every',     type=int,   default=0,
       help='Re-run build_rerank_dataset.py every N epochs (0=disabled)')
 
-    # Resume
-    a('--resume',           type=str,   default=None)
+    # ---- Resume ----
+    a('--resume',           type=str,   default=None,
+      help='Resume from reranker .ckpt')
 
     return p.parse_args()
 
@@ -131,7 +149,7 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 class ReMiningCallback(pl.Callback):
-    def __init__(self, remine_every: int, build_script_args: list):
+    def __init__(self, remine_every, build_script_args):
         self.remine_every      = remine_every
         self.build_script_args = build_script_args
 
@@ -156,27 +174,29 @@ if __name__ == '__main__':
     args = parse_args()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
-    print(f"\nPeak memory per step: {args.max_cands} candidates × 1 query "
-          f"(loop over {args.batch_size} queries, K={args.max_cands} tokens each)")
+    eff_batch = args.batch_size * args.grad_accum
+    print(f"\nModel type      : {args.model_type}")
+    print(f"Effective batch : {eff_batch}  "
+          f"({args.batch_size} × grad_accum={args.grad_accum})")
+    print(f"Pairs per step  : {args.batch_size} queries × "
+          f"{args.max_cands} candidates = {args.batch_size * args.max_cands}")
 
     # ------------------------------------------------------------------
-    # Train DataModule — loads precomputed tokens, backbone never runs
+    # Train DataModule  (precomputed tokens — backbone never runs)
     # ------------------------------------------------------------------
     train_datamodule = RerankDataModule(
-        triplets_json  = args.triplets_json,
-        token_path     = args.token_path,
-        train_csv      = args.train_csv,
-        top_k_train    = args.top_k_train,
-        max_cands      = args.max_cands,
-        max_pos        = args.max_pos,
-        batch_size     = args.batch_size,
-        num_workers    = args.num_workers,
+        triplets_json = args.triplets_json,
+        token_path    = args.token_path,
+        train_csv     = args.train_csv,
+        top_k_train   = args.top_k_train,
+        max_cands     = args.max_cands,
+        max_pos       = args.max_pos,
+        batch_size    = args.batch_size,
+        num_workers   = args.num_workers,
     )
 
     # ------------------------------------------------------------------
-    # Val DataModule  (Pitts30k — same as train.py)
-    # Attached to the model so validation_epoch_end can reach it via
-    # self.trainer.datamodule
+    # Val DataModule  (Pitts30k — backbone runs live on raw images)
     # ------------------------------------------------------------------
     val_datamodule = GSVCitiesDataModule(
         batch_size                    = args.batch_size,
@@ -195,10 +215,6 @@ if __name__ == '__main__':
         val_csv                       = args.val_csv,
         mapping_json_path             = args.mapping_path,
     )
-
-    # Attach val_datamodule onto train_datamodule so the model's
-    # validation_epoch_end can reach val_datasets / val_set_names
-    # via self.trainer.datamodule  (mirrors how train.py works)
     train_datamodule.val_datamodule = val_datamodule
 
     # ------------------------------------------------------------------
@@ -206,17 +222,28 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     if args.resume is not None:
         print(f"Resuming from {args.resume}")
+        _ckpt      = torch.load(args.resume, map_location='cpu', weights_only=False)
+        _sd        = _ckpt.get('state_dict', {})
+        _hp        = _ckpt.get('hyper_parameters', {})
+        # Detect architecture from saved hparams — fall back to arg
+        _sh_w      = _sd.get('reranker.score_head.1.weight')
+        _deep      = (_sh_w is not None and _sh_w.shape[0] > 1)
+        _model_type = _hp.get('model_type', args.model_type)
+        args.model_type = _model_type   # fix log_dir to match checkpoint
         model = CrossModalRerankModule.load_from_checkpoint(
-            args.resume, map_location='cpu')
+            args.resume, map_location='cpu',
+            deep_score_head=_deep)
     else:
         model = CrossModalRerankModule(
             backbone_ckpt   = args.backbone_ckpt,
+            model_type      = args.model_type,
             d_model         = args.d_model,
             n_heads         = args.n_heads,
             n_layers        = args.n_layers,
             dropout         = args.dropout,
             out_dim         = args.out_dim,
             deep_score_head = args.deep_score_head,
+            num_queries     = args.num_queries,
             rerank_k        = args.rerank_k,
             faiss_gpu       = args.faiss_gpu,
             loss_name       = args.loss_name,
@@ -230,15 +257,18 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
+    # Checkpoint filename includes model_type for easy identification
+    ckpt_name = (
+        f'{args.model_type}_'
+        'ep({epoch:02d})_'
+        'R1rr[{pitts30k_val/R1_reranked:.4f}]_'
+        'R5rr[{pitts30k_val/R5_reranked:.4f}]_'
+        'R10rr[{pitts30k_val/R10_reranked:.4f}]_'
+        'gain[{pitts30k_val/R1_gain:.4f}]'
+    )
     checkpoint_cb = ModelCheckpoint(
         monitor                 = 'pitts30k_val/R1_reranked',
-        filename                = 'reranker_'
-                                  'ep({epoch:02d})_'
-                                  'R1s1[{pitts30k_val/R1_stage1:.4f}]_'
-                                  'R1rr[{pitts30k_val/R1_reranked:.4f}]_'
-                                  'R5rr[{pitts30k_val/R5_reranked:.4f}]_'
-                                  'R10rr[{pitts30k_val/R10_reranked:.4f}]_'
-                                  'gain[{pitts30k_val/R1_gain:.4f}]',
+        filename                = ckpt_name,
         auto_insert_metric_name = False,
         save_weights_only       = True,
         save_top_k              = 3,
@@ -264,20 +294,22 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Trainer
     # ------------------------------------------------------------------
+    log_dir = './LOGS/reranker'
+
     trainer = pl.Trainer(
         accelerator                       = 'gpu',
         devices                           = [0],
-        default_root_dir                  = './LOGS/reranker',
+        default_root_dir                  = log_dir,
         num_sanity_val_steps              = 0,
         max_epochs                        = args.epochs,
         check_val_every_n_epoch           = 1,
         callbacks                         = callbacks,
         reload_dataloaders_every_n_epochs = 1,
-        accumulate_grad_batches           = args.grad_accum,
         log_every_n_steps                 = 20,
         gradient_clip_val                 = 1.0,
         gradient_clip_algorithm           = 'norm',
         precision                         = args.precision,
+        accumulate_grad_batches           = args.grad_accum,
     )
 
     trainer.fit(model=model, datamodule=train_datamodule)
