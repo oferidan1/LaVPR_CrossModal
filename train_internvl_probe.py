@@ -129,15 +129,19 @@ class InternVLRerankDataset(Dataset):
         print(f"Total pairs: {len(self.pairs):,} "
               f"({len(triplets):,} queries × ~{max_cands} cands)")
 
-        # InternVL2 uses its own pixel normalisation internally via
-        # dynamic_preprocess; we pass raw PIL images as tensors here
-        # using standard ImageNet stats for compatibility with the
-        # vision encoder's expected input range.
+        # InternVL2 vision encoder uses its own normalisation stats,
+        # NOT standard ImageNet. Using wrong stats degrades vision features.
+        # These are the values from InternVL2's build_transform():
+        #   mean = (0.485, 0.456, 0.406)  — OpenAI CLIP stats
+        #   std  = (0.229, 0.224, 0.225)
+        # InternVL2 actually uses IMAGENET_MEAN/STD from its own config.
+        # Confirmed from: https://huggingface.co/OpenGVLab/InternVL2-1B
         self.transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize((image_size, image_size),
+                              interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std =[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406),
+                                 std =(0.229, 0.224, 0.225)),
         ])
 
     def _load_image(self, idx):
@@ -212,17 +216,18 @@ class InternVLReranker(nn.Module):
         super().__init__()
 
         print(f"Loading InternVL2 from {internvl_path}...")
-        from transformers import AutoTokenizer, AutoModel, PreTrainedModel
-
-        # Compatibility patch for newer transformers with remote InternVL code
-        if not hasattr(PreTrainedModel, 'all_tied_weights_keys'):
-            PreTrainedModel.all_tied_weights_keys = {}
+        from transformers import AutoTokenizer, AutoModel
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             internvl_path, trust_remote_code=True)
         # Ensure pad token exists
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Cache image context token id — stored on the model, not config.
+        # Try model attribute first, then tokenizer special tokens.
+        # Must be cached before forward() is ever called.
+        self.img_context_token_id = None  # set after vlm is loaded below
 
         self.vlm = AutoModel.from_pretrained(
             internvl_path,
@@ -232,19 +237,20 @@ class InternVLReranker(nn.Module):
             use_flash_attn    = False,
         )
 
-        # Ensure img_context_token_id is configured
-        self.img_context_token_id = self.tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>')
-        self.vlm.img_context_token_id = self.img_context_token_id
-
-        # Determine visual tokens per 224x224 image dynamically
-        with torch.no_grad():
-            dummy_img = torch.zeros(1, 3, 224, 224, dtype=torch.bfloat16)
-            extract_fn = getattr(self.vlm, 'extract_feature', None)
-            if extract_fn is not None:
-                self.num_image_tokens = extract_fn(dummy_img).shape[1]
-            else:
-                self.num_image_tokens = 64
-        print(f"Visual tokens per 224x224 image: {self.num_image_tokens}")
+        # Resolve img_context_token_id — try several locations InternVL2
+        # may store it depending on version:
+        self.img_context_token_id = (
+            getattr(self.vlm, 'img_context_token_id', None)
+            or getattr(self.vlm.config, 'img_context_token_id', None)
+            or self.tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>')
+        )
+        if (self.img_context_token_id is None
+                or self.img_context_token_id
+                   == self.tokenizer.unk_token_id):
+            raise RuntimeError(
+                "Could not find img_context_token_id. "
+                "Check that '<IMG_CONTEXT>' is in the tokenizer vocab.")
+        print(f"img_context_token_id: {self.img_context_token_id}")
 
         # Detect LLM hidden dim BEFORE LoRA wrapping (safer)
         with torch.no_grad():
@@ -265,9 +271,6 @@ class InternVLReranker(nn.Module):
                 bias           = 'none',
             )
             self.vlm = get_peft_model(self.vlm, lora_cfg)
-            self.vlm.img_context_token_id = self.img_context_token_id
-            if hasattr(self.vlm, 'base_model') and hasattr(self.vlm.base_model, 'model'):
-                self.vlm.base_model.model.img_context_token_id = self.img_context_token_id
             self.vlm.print_trainable_parameters()
         else:
             for p in self.vlm.parameters():
@@ -289,82 +292,131 @@ class InternVLReranker(nn.Module):
 
     def forward(self, pixel_values, texts):
         """
-        Joint image+text forward through InternVL2.
+        Joint image+text forward through InternVL2 using
+        prepare_inputs_embeds — the correct internal API.
+
+        InternVL2's forward works by:
+          1. Vision encoder extracts patch embeddings.
+          2. patch embeddings are projected to LLM dim via mlp1.
+          3. Projected patches replace <img> placeholder tokens in the
+             LLM input embedding sequence.
+          4. LLM runs over the fused sequence — every attention layer
+             sees both patch tokens and text tokens.
+
+        This is identical to what chat() does internally, but
+        differentiable and without running generation.
 
         Parameters
         ----------
         pixel_values : (B, 3, H, W) float tensor on device
-        texts        : List[str] length B — query descriptions
+        texts        : List[str] length B
 
         Returns
         -------
-        scores : (B,) float — relevance scores (logits)
+        scores : (B,) float — relevance scores (logits, fp32)
         """
         device = pixel_values.device
         B      = pixel_values.shape[0]
+        bf16   = torch.bfloat16
 
-        # Ensure img_context_token_id is set
-        if getattr(self.vlm, 'img_context_token_id', None) is None:
-            self.vlm.img_context_token_id = self.img_context_token_id
-            if hasattr(self.vlm, 'base_model') and hasattr(self.vlm.base_model, 'model'):
-                self.vlm.base_model.model.img_context_token_id = self.img_context_token_id
+        # ── 1. Vision encoder ──────────────────────────────────────────
+        # InternVL2's extract_feature() runs:
+        #   ViT → pixel_shuffle (reduces tokens) → mlp1 (projects to D_llm)
+        # It returns (B, n_patches, D_llm) ready to inject into the LLM.
+        # Do NOT call mlp1 again — extract_feature already includes it.
+        img_embeds = self.vlm.extract_feature(
+            pixel_values.to(bf16))                    # (B, n_patches, D_llm)
+        n_patches  = img_embeds.shape[1]              # 64 for 224px input
 
-        # Determine number of image tokens for input resolution
-        h, w = pixel_values.shape[2], pixel_values.shape[3]
-        if h == 224 and w == 224 and hasattr(self, 'num_image_tokens'):
-            num_patches = self.num_image_tokens
+        # ── 2. Build input_ids with img_context_token placeholder ────────
+        # Tokenize text part only (no image placeholder string)
+        img_token_id = self.img_context_token_id  # cached in __init__
+
+        text_enc = self.tokenizer(
+            texts,
+            return_tensors     = 'pt',
+            padding            = True,
+            truncation         = True,
+            max_length         = 256,
+            add_special_tokens = True,
+        ).to(device)                                   # (B, L_text)
+
+        # Build img placeholder: [img_token_id] × n_patches for each item
+        # Shape: (B, n_patches)
+        img_ids = torch.full(
+            (B, n_patches), img_token_id,
+            dtype=torch.long, device=device)
+
+        # Newline token between image and text
+        nl_id  = self.tokenizer.encode('\n',
+                                       add_special_tokens=False)[0]
+        nl_ids = torch.full((B, 1), nl_id, dtype=torch.long, device=device)
+
+        # Full sequence: [BOS] [IMG×n_patches] [\n] [text tokens]
+        # Drop BOS from text_enc since we'll keep it from img prefix
+        bos_id  = self.tokenizer.bos_token_id
+        # Remove leading BOS from text tokens if present
+        text_ids = text_enc['input_ids']
+        if bos_id is not None and (text_ids[:, 0] == bos_id).all():
+            text_ids = text_ids[:, 1:]
+            text_mask = text_enc['attention_mask'][:, 1:]
         else:
-            with torch.no_grad():
-                extract_fn = getattr(self.vlm, 'extract_feature', None)
-                if extract_fn is None and hasattr(self.vlm, 'get_base_model'):
-                    extract_fn = getattr(self.vlm.get_base_model(), 'extract_feature', None)
-                dummy = pixel_values[:1].to(torch.bfloat16)
-                num_patches = extract_fn(dummy).shape[1]
+            text_mask = text_enc['attention_mask']
 
-        img_ctx_token   = '<IMG_CONTEXT>'
-        img_placeholder = img_ctx_token * num_patches
+        # BOS prefix
+        bos_ids  = torch.full((B, 1), bos_id or 1,
+                              dtype=torch.long, device=device)
+        bos_mask = torch.ones((B, 1), dtype=torch.long, device=device)
+        nl_mask  = torch.ones((B, 1), dtype=torch.long, device=device)
+        img_mask_attn = torch.ones((B, n_patches),
+                                   dtype=torch.long, device=device)
 
-        prompts = [f'{img_placeholder}\n{t}' for t in texts]
+        # Append EOS after text — gives model a dedicated summary token
+        # that has attended over all image patches + all text tokens.
+        eos_id   = self.tokenizer.eos_token_id or 2
+        eos_ids  = torch.full((B, 1), eos_id, dtype=torch.long, device=device)
+        eos_mask = torch.ones((B, 1), dtype=torch.long, device=device)
 
-        enc = self.tokenizer(
-            prompts,
-            return_tensors = 'pt',
-            padding        = True,
-            truncation     = True,
-            max_length     = num_patches + 512,
-        ).to(device)
+        input_ids      = torch.cat([bos_ids, img_ids, nl_ids,
+                                    text_ids, eos_ids], dim=1)
+        attention_mask = torch.cat([bos_mask, img_mask_attn, nl_mask,
+                                    text_mask, eos_mask], dim=1)
 
-        # InternVL requires image_flags for filtering valid images
-        image_flags = torch.ones((B, 1), dtype=torch.long, device=device)
+        # ── 3. Build input embeddings, replace img positions with patches ─
+        embed_fn     = self.vlm.language_model.get_input_embeddings()
+        # Clone so in-place assignment does not corrupt autograd graph
+        input_embeds = embed_fn(input_ids).clone()    # (B, L, D_llm)
 
-        # Joint forward — InternVL2 replaces img_context_token positions
-        # with visual patch embeddings from the vision encoder.
-        out = self.vlm(
-            input_ids      = enc['input_ids'],
-            attention_mask = enc['attention_mask'],
-            pixel_values   = pixel_values.to(torch.bfloat16),
-            image_flags    = image_flags,
+        # Positions 1 … n_patches (after BOS) hold img_token_id
+        # Replace them with projected visual patch embeddings
+        img_positions = slice(1, 1 + n_patches)
+        input_embeds[:, img_positions, :] = img_embeds.to(input_embeds.dtype)
+
+        # ── 4. LLM forward over fused sequence ────────────────────────
+        out = self.vlm.language_model(
+            inputs_embeds        = input_embeds,
+            attention_mask       = attention_mask,
             output_hidden_states = True,
-            return_dict    = True,
+            return_dict          = True,
         )
 
-        # Last hidden state: (B, L, D_llm)
-        # out.hidden_states is a tuple of (n_layers+1) tensors
         if out.hidden_states is None:
             raise RuntimeError(
-                "output_hidden_states=True but hidden_states is None. "
-                "Check that the model supports this flag.")
-        last_hidden = out.hidden_states[-1].float()  # fp32 for score head
+                "output_hidden_states=True but hidden_states is None.")
 
-        # Pool at last real (non-padding) token position.
-        # attention_mask accounts for padding added by the tokenizer;
-        # seq_lens is the index of the last real token (0-indexed).
-        seq_lens  = enc['attention_mask'].sum(dim=1) - 1  # (B,)
+        last_hidden = out.hidden_states[-1].float()   # (B, L, D_llm) fp32
+
+        # ── 5. Pool at last real token → score ─────────────────────────
+        # Last real token = EOS or last non-padding text token.
+        # For a causal LLM this position has attended over the full
+        # sequence (image patches + text) so it is the correct summary
+        # representation for scoring.
+        seq_lens  = attention_mask.sum(dim=1) - 1     # (B,) 0-indexed
         seq_lens  = seq_lens.clamp(min=0)
         batch_idx = torch.arange(B, device=device)
-        pooled    = last_hidden[batch_idx, seq_lens]       # (B, D_llm)
+        pooled    = last_hidden[batch_idx, seq_lens]  # (B, D_llm)
 
-        return self.score_head(pooled).squeeze(-1)         # (B,)
+        return self.score_head(pooled).squeeze(-1)    # (B,)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +432,7 @@ class InternVLRerankerLightning(pl.LightningModule):
         lora_r:          int   = 16,
         lora_alpha:      int   = 32,
         lora_dropout:    float = 0.05,
-        lora_targets:    str   = 'q_proj,v_proj,k_proj,o_proj',
+        lora_targets:    str   = 'q_proj,v_proj,k_proj,o_proj,qkv,proj',        
         # ---- Backbone (val only) ----
         backbone_ckpt:   str   = None,
         # ---- Loss ----
@@ -606,10 +658,11 @@ class InternVLRerankerLightning(pl.LightningModule):
 
         transform = transforms.Compose([
             transforms.Resize((self.hparams.image_size,
-                               self.hparams.image_size)),
+                               self.hparams.image_size),
+                              interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std =[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406),
+                                 std =(0.229, 0.224, 0.225)),
         ])
 
         rerank_bs = 8   # InternVL2 joint forward is memory intensive
@@ -691,10 +744,11 @@ class InternVLRerankerLightning(pl.LightningModule):
     def configure_optimizers(self):
         # score_head always trainable; LoRA params trainable when lora_r>0
         params = [p for p in self.model.parameters() if p.requires_grad]
-        # Sanity check — score_head must always be in trainable params
-        assert any(p is q for q in params
-                   for p in self.model.score_head.parameters()), \
-            "score_head params not in trainable params — check requires_grad"
+        # Sanity check — every score_head param must be in trainable params
+        assert all(
+            any(p is q for q in params)
+            for p in self.model.score_head.parameters()
+        ), "score_head params not in trainable params — check requires_grad"
         n_train = sum(p.numel() for p in params)
         print(f"Trainable params: {n_train:,}")
 
@@ -796,8 +850,7 @@ def parse_args():
     a('--internvl_path',  type=str,   default='OpenGVLab/InternVL2-1B')
     a('--lora_r',         type=int,   default=16,
       help='LoRA rank. 0 = frozen VLM, probe-only.')
-    a('--lora_targets',   type=str,
-      default='q_proj,v_proj,k_proj,o_proj')
+    a('--lora_targets',   type=str,   default='q_proj,v_proj,k_proj,o_proj,qkv,proj')
 
     # Backbone
     a('--backbone_ckpt',  type=str,

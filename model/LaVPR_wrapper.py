@@ -133,9 +133,7 @@ class LaVPR_wrapper():
 
             self.single_encoder = self.single_encoder.to(args.device).eval()
             self.encoder_dim = self.embeds_dim
-            if 0 < args.agg_type < 4:
-                self.encoder_dim = 1280
-
+         
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

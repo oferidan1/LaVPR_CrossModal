@@ -748,6 +748,131 @@ def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
 
 # ---------------------------------------------------------------------------
 
+@torch.no_grad()
+def rerank_by_max_sim(
+    test_ds,
+    predictions:      np.ndarray,
+    img_local_descs:  np.ndarray,   # (N_total, N_patches, D_img)
+    text_local_descs: np.ndarray,   # (N_total, L_text,    D_txt)
+    text_attentions:  np.ndarray,   # (N_total, L_text)  1=real 0=pad
+    vision_descs:     np.ndarray = None,  # (N_total, D) global image embeds
+    text_descs:       np.ndarray = None,  # (N_total, D) global text  embeds
+    max_rerank_k:     int   = 20,
+    rerank_batch:     int   = 64,
+    alpha:            float = 0.0,   # 0=MaxSim only, >0 blends with global cosine
+    device:           str   = "cuda",
+    skip_cls:         bool  = True,  # drop CLS token from image patches (index 0)
+) -> np.ndarray:
+    """
+    Rerank stage-1 predictions using token-level MaxSim (FILIP-style) on
+    raw, pre-computed local descriptors — no learned projection heads required.
+
+    For each (query, candidate) pair:
+      1. L2-normalise text tokens  t  (L, D_txt)
+         L2-normalise image patches v  (P, D_img)   [D_txt must equal D_img]
+      2. sim[l, p] = t[l] · v[p]                    cosine similarity matrix
+      3. max_sim[l] = max_p(sim[l, p])               best patch per text token
+      4. score = mean(max_sim[l] for real l)         aggregate
+
+    Optionally fuse with global cosine similarity via z-normalised blending.
+    """
+    num_db = test_ds.num_database
+    num_q  = test_ds.num_queries
+    n_cand = min(max_rerank_k, predictions.shape[1])
+
+    logger.info(f"MaxSim reranking top-{n_cand} for {num_q} queries "
+                f"(batch={rerank_batch}, alpha={alpha}, skip_cls={skip_cls})")
+
+    D_img = img_local_descs.shape[-1]
+    D_txt = text_local_descs.shape[-1]
+    if D_img != D_txt:
+        raise ValueError(
+            f"MaxSim requires matching embedding dims, got img={D_img} txt={D_txt}. "
+            "Use a model where both heads share the same dim, or project first.")
+
+    reranked = predictions.copy()
+
+    for q_start in tqdm(range(0, num_q, rerank_batch), desc="MaxSim rerank"):
+        q_end = min(q_start + rerank_batch, num_q)
+        bsz   = q_end - q_start
+
+        # ---- Text tokens: trim padding, build padded batch ----
+        txt_locals, txt_masks = [], []
+        for q in range(q_start, q_end):
+            ds_idx   = num_db + q
+            mask_row = text_attentions[ds_idx]          # (L,)
+            real_len = int(mask_row.sum())
+            real_len = max(real_len, 1)
+            txt_locals.append(text_local_descs[ds_idx][:real_len])  # (real_len, D)
+            txt_masks .append(mask_row         [:real_len])
+
+        max_L = max(t.shape[0] for t in txt_locals)
+        txt_np = np.zeros((bsz, max_L, D_txt), dtype=np.float32)
+        msk_np = np.zeros((bsz, max_L),        dtype=np.float32)
+        for b, (tl, tm) in enumerate(zip(txt_locals, txt_masks)):
+            L = tl.shape[0]
+            txt_np[b, :L] = tl
+            msk_np[b, :L] = tm
+
+        txt_t = torch.from_numpy(txt_np).to(device)   # (B, L, D)
+        msk_t = torch.from_numpy(msk_np).bool().to(device)  # (B, L)
+
+        # ---- Image patch tokens ----
+        cand_idx = predictions[q_start:q_end, :n_cand]         # (B, K)
+        img_np   = np.stack([img_local_descs[cand_idx[b]]
+                             for b in range(bsz)], axis=0)     # (B, K, P, D)
+        if skip_cls:
+            img_np = img_np[:, :, 1:, :]                       # drop CLS patch
+
+        img_t = torch.from_numpy(img_np).to(device)            # (B, K, P, D)
+        K, P, D = img_t.shape[1], img_t.shape[2], img_t.shape[3]
+        L_ = txt_t.shape[1]
+
+        # ---- L2-normalise both ----
+        img_norm = F.normalize(img_t,  dim=-1)                 # (B, K, P, D)
+        txt_norm = F.normalize(txt_t,  dim=-1)                 # (B, L, D)
+
+        # ---- Batched MaxSim  ----
+        # Expand text so we can do a single einsum over all candidates
+        # txt: (B, 1, L, D) -> (B, K, L, D)
+        txt_exp = txt_norm.unsqueeze(1).expand(-1, K, -1, -1)  # (B, K, L, D)
+        # sim[b, k, l, p] = txt[b,k,l,:] · img[b,k,:,p]
+        sim = torch.einsum('bkld,bkpd->bklp', txt_exp, img_norm)  # (B, K, L, P)
+
+        # Best patch per text token
+        max_sim_per_token = sim.max(dim=-1).values              # (B, K, L)
+
+        # Mask padding tokens, then mean over real tokens
+        mask_exp = msk_t.unsqueeze(1).expand(-1, K, -1)        # (B, K, L)
+        max_sim_per_token = max_sim_per_token * mask_exp        # zero out pad
+        n_real = mask_exp.sum(dim=-1).clamp(min=1)             # (B, K)
+        local_scores = (max_sim_per_token.sum(dim=-1) / n_real).cpu().numpy()  # (B, K)
+
+        # ---- Optional: z-normalised blend with global cosine ----
+        if alpha > 0.0 and vision_descs is not None and text_descs is not None:
+            for b in range(bsz):
+                q_ds_idx  = num_db + q_start + b
+                q_global  = text_descs  [q_ds_idx]
+                db_globals = vision_descs[cand_idx[b]]
+                q_norm    = q_global  / (np.linalg.norm(q_global)   + 1e-8)
+                db_norm_g = db_globals / (np.linalg.norm(db_globals, axis=1, keepdims=True) + 1e-8)
+                global_sim = db_norm_g @ q_norm                # (K,)
+
+                def _zn(x):
+                    std = x.std()
+                    return (x - x.mean()) / (std + 1e-8) if std > 1e-8 else x
+
+                local_scores[b] = alpha * _zn(global_sim) + (1.0 - alpha) * _zn(local_scores[b])
+
+        # ---- Reorder shortlist ----
+        for b in range(bsz):
+            order = np.argsort(-local_scores[b])
+            reranked[q_start + b, :n_cand] = cand_idx[b][order]
+
+    logger.info("MaxSim reranking complete.")
+    return reranked
+
+
 def main(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     os.environ["TOKENIZERS_PARALLELISM"] = "False"
@@ -828,179 +953,342 @@ def main(args):
         args.queries_folder  = "/home/shared/datasets/nordland/test/queries"
         args.image_root      = "/home/shared/datasets/nordland/test"
         args.queries_csv     = "datasets/descriptions/nordland_descriptions.csv"
+    elif args.data == 'sfxl':
+        args.database_folder = "/home/shared/datasets/SF-XL/processed/test/database"
+        args.queries_folder  = "/home/shared/datasets/SF-XL/processed/test/queries_v1"
+        args.image_root      = "/home/shared/datasets/SF-XL/processed/test"
+        args.queries_csv     = "datasets/descriptions/sfxl_queries_v1.csv"
+    elif args.data in ['svox', 'svox_all']:
+        args.database_folder = "/home/shared/datasets/svox/images/test/gallery"
+        args.image_root      = "/home/shared/datasets/svox/images/test"
+        eval_conditions = [
+            ("Night",    f"{args.image_root}/queries_night",    "datasets/descriptions/svox_night.csv"),
+            ("Sun",      f"{args.image_root}/queries_sun",      "datasets/descriptions/svox_sun.csv"),
+            ("Rain",     f"{args.image_root}/queries_rain",     "datasets/descriptions/svox_rain.csv"),
+            ("Snow",     f"{args.image_root}/queries_snow",     "datasets/descriptions/svox_snow.csv"),
+            ("Overcast", f"{args.image_root}/queries_overcast", "datasets/descriptions/svox_overcast.csv"),
+        ]  
+    elif args.data == 'sped':
+            args.database_folder = "/home/shared/datasets/SPEDTEST/test/database"
+            args.queries_folder  = "/home/shared/datasets/SPEDTEST/test/queries"
+            args.image_root      = "/home/shared/datasets/SPEDTEST/test"
+            args.queries_csv     = "datasets/descriptions/sped.csv"
 
-    if 'msls_challenge' in getattr(args, 'image_root', ''):
-        test_ds = MSLSTest(
-            dataset_root=args.database_folder, image_root=args.image_root,
-            csv_path=args.queries_csv, mean_std=dataset_mean_std,
-            image_size=args.image_size)
-        is_msls_challenge = True
-    else:
-        test_ds = TestDataset(
-            args.database_folder, args.queries_folder, args.queries_csv,
-            args.image_root, mean_std=dataset_mean_std,
-            positive_dist_threshold=args.positive_dist_threshold,
-            image_size=args.image_size, use_labels=args.use_labels)
-    logger.info(f"Testing on {test_ds}")
+    if 'eval_conditions' not in locals():
+        eval_conditions = [(None, getattr(args, 'queries_folder', None), getattr(args, 'queries_csv', None))]
 
     max_results = max(args.recall_values)
     need_local  = (getattr(args, 'reranker',        False)
                    or getattr(args, 'reranker_filip',  False)
                    or getattr(args, 'filip_retrieval', False))
 
-    with torch.inference_mode():
-        logger.debug("Extracting database descriptors for evaluation/testing")
-        database_subset_ds  = Subset(test_ds, list(range(test_ds.num_database)))
-        database_dataloader = DataLoader(
-            dataset=database_subset_ds,
-            num_workers=args.num_workers,
-            batch_size=args.batch_size)
+    db_vision_descriptors = None
+    db_text_descriptors   = None
+    db_all_descriptors    = None
+    db_img_local_descs    = None
+    db_text_local_descs   = None
+    db_text_tokens_all    = None
+    db_text_attentions    = None
 
-        # Allocate buffers — zeros so unpopulated entries fail loudly
-        vision_descriptors = np.zeros((len(test_ds), model.encoder_dim),  dtype="float32")
-        text_descriptors   = np.zeros((len(test_ds), model.encoder_dim),  dtype="float32")
-        all_descriptors    = np.zeros((len(test_ds), model.encoder_dim),  dtype="float32")
-        img_local_descs    = np.zeros((len(test_ds), num_img_tokens,  img_local_dim), dtype="float32")
-        text_local_descs   = np.zeros((len(test_ds), num_text_tokens, txt_local_dim), dtype="float32")
-        text_tokens_all    = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)
-        text_attentions    = np.zeros((len(test_ds), num_text_tokens), dtype=np.int64)
+    all_cond_results      = []
+    all_retrieval_recalls = []
+    all_reranking_recalls = []
+    is_msls_challenge     = False
+    reranking_enabled     = False
 
-        for images, indices, texts in tqdm(database_dataloader):
-            encode_batch(model, args, images, texts, indices, all_descriptors,
-                         vision_descriptors, text_descriptors, img_local_descs,
-                         text_local_descs, text_tokens_all, text_attentions)
+    for cond_idx, (cond_name, q_folder, q_csv) in enumerate(eval_conditions):
+        args.queries_folder = q_folder
+        args.queries_csv    = q_csv
 
-        logger.debug("Extracting queries descriptors for evaluation/testing")
-        queries_subset_ds  = Subset(
-            test_ds, list(range(test_ds.num_database,
-                                test_ds.num_database + test_ds.num_queries)))
-        queries_dataloader = DataLoader(
-            dataset=queries_subset_ds,
-            num_workers=args.num_workers,
-            batch_size=args.batch_size)
-        for images, indices, texts in tqdm(queries_dataloader):
-            encode_batch(model, args, images, texts, indices, all_descriptors,
-                         vision_descriptors, text_descriptors, img_local_descs,
-                         text_local_descs, text_tokens_all, text_attentions)
+        if cond_name:
+            banner = f"\n{'='*75}\n  Evaluating SVOX condition: {cond_name} ({cond_idx+1}/{len(eval_conditions)})\n  Queries: {q_folder}\n  CSV: {q_csv}\n{'='*75}"
+            logger.info(banner)
+            print(banner)
 
-    if need_local:
-        logger.info(f"local buffers | img {np.abs(img_local_descs).sum():.1f}  "
-                    f"text {np.abs(text_local_descs).sum():.1f}  "
-                    f"(both must be non-zero)")
-
-    if args.cross_modal:
-        if not args.is_image:
-            database_descriptors = text_descriptors[: test_ds.num_database]
+        if 'msls_challenge' in getattr(args, 'image_root', ''):
+            test_ds = MSLSTest(
+                dataset_root=args.database_folder, image_root=args.image_root,
+                csv_path=args.queries_csv, mean_std=dataset_mean_std,
+                image_size=args.image_size)
+            is_msls_challenge = True
         else:
-            database_descriptors = vision_descriptors[: test_ds.num_database]
-        queries_descriptors = text_descriptors[test_ds.num_database:]
-    else:
-        database_descriptors = text_descriptors[: test_ds.num_database]
-        queries_descriptors  = text_descriptors[test_ds.num_database:]
+            test_ds = TestDataset(
+                args.database_folder, args.queries_folder, args.queries_csv,
+                args.image_root, mean_std=dataset_mean_std,
+                positive_dist_threshold=args.positive_dist_threshold,
+                image_size=args.image_size, use_labels=args.use_labels)
+        logger.info(f"Testing on {test_ds}")
 
-    # ---- 1. Stage-1 retrieval -------------------------------------------
-    if args.filip_retrieval:
-        scores, predictions = filip_full_retrieval(
-            model, test_ds, vision_descriptors, text_descriptors,
-            img_local_descs, text_local_descs, text_tokens_all,
-            max_results=max_results,
-            db_chunk=getattr(args, 'filip_db_chunk', 2048),
-            alpha=getattr(args, 'filip_alpha', 0.0),
-            db_on_gpu=getattr(args, 'filip_db_on_gpu', True),
-            device=args.device)
-    else:
-        scores, predictions = get_queries_predictions(
-            model.encoder_dim, database_descriptors, all_descriptors,
-            queries_descriptors, max_results)
+        num_db    = test_ds.num_database
+        num_q     = test_ds.num_queries
+        total_len = len(test_ds)
 
-    if getattr(args, 'filip_diag', 0) and not args.filip_retrieval:
-        filip_vs_global_diagnostic(
-            model, test_ds, predictions, scores,
-            vision_descriptors, text_descriptors,
-            img_local_descs, text_local_descs,
-            text_tokens_all=text_tokens_all, text_attentions=text_attentions,
-            K=min(args.max_rerank, max_results), device=args.device)
+        # Allocate descriptor buffers for this evaluation run
+        vision_descriptors = np.zeros((total_len, model.encoder_dim), dtype="float32")
+        text_descriptors   = np.zeros((total_len, model.encoder_dim), dtype="float32")
+        all_descriptors    = np.zeros((total_len, model.encoder_dim), dtype="float32")
+        img_local_descs    = np.zeros((total_len, num_img_tokens,  img_local_dim), dtype="float32")
+        text_local_descs   = np.zeros((total_len, num_text_tokens, txt_local_dim), dtype="float32")
+        text_tokens_all    = np.zeros((total_len, num_text_tokens), dtype=np.int64)
+        text_attentions    = np.zeros((total_len, num_text_tokens), dtype=np.int64)
 
-    # # ---- 2. Reranking ----------------------------------------------------
-    # if args.reranker:
-    #     max_rerank_k = min(args.max_rerank, max_results)
-    #     predictions  = rerank_predictions(
-    #         model, test_ds, predictions, vision_descriptors, text_descriptors,
-    #         img_local_descs, text_local_descs, max_rerank_k=max_rerank_k,
-    #         device=args.device)
+        with torch.inference_mode():
+            if db_vision_descriptors is None:
+                logger.info(f"Extracting database descriptors for evaluation/testing (encoded ONCE for gallery: {num_db} images)")
+                database_subset_ds  = Subset(test_ds, list(range(num_db)))
+                database_dataloader = DataLoader(
+                    dataset=database_subset_ds,
+                    num_workers=args.num_workers,
+                    batch_size=args.batch_size)
 
-    if args.reranker_filip:
-        max_rerank_k = min(args.max_rerank, max_results)
-        predictions  = rerank_by_filip(
-            model, test_ds, predictions, vision_descriptors, text_descriptors,
-            img_local_descs, text_local_descs, text_tokens_all=text_tokens_all,
-            max_rerank_k=max_rerank_k, alpha=getattr(args, 'filip_alpha', 0.0),
-            device=args.device)
+                for images, indices, texts in tqdm(database_dataloader, desc="Encoding gallery"):
+                    encode_batch(model, args, images, texts, indices, all_descriptors,
+                                 vision_descriptors, text_descriptors, img_local_descs,
+                                 text_local_descs, text_tokens_all, text_attentions)
 
-    if args.reranker_mllm:
-        q_texts      = test_ds.descriptions[test_ds.num_database:]
-        db_paths_arr = np.array(test_ds.images_paths[:test_ds.num_database])
-        db_images    = db_paths_arr[predictions]
-        for i in range(len(q_texts)):
-            print(f"Sending query {i} to LLM")
-            predictions[i] = rerank_by_mllm(db_images[i], q_texts[i], predictions[i])
+                # Cache gallery descriptors
+                db_vision_descriptors = vision_descriptors[:num_db].copy()
+                db_text_descriptors   = text_descriptors[:num_db].copy()
+                db_all_descriptors    = all_descriptors[:num_db].copy()
+                db_img_local_descs    = img_local_descs[:num_db].copy()
+                db_text_local_descs   = text_local_descs[:num_db].copy()
+                db_text_tokens_all    = text_tokens_all[:num_db].copy()
+                db_text_attentions    = text_attentions[:num_db].copy()
+            else:
+                logger.info(f"Reusing pre-encoded gallery descriptors ({num_db} images)")
+                vision_descriptors[:num_db] = db_vision_descriptors
+                text_descriptors[:num_db]   = db_text_descriptors
+                all_descriptors[:num_db]    = db_all_descriptors
+                img_local_descs[:num_db]    = db_img_local_descs
+                text_local_descs[:num_db]   = db_text_local_descs
+                text_tokens_all[:num_db]    = db_text_tokens_all
+                text_attentions[:num_db]    = db_text_attentions
 
-    if args.reranker_jev:
-        max_rerank_k = min(args.max_rerank, max_results)
-        predictions  = rerank_by_jev(
-            test_ds, predictions,
-            max_rerank_k=max_rerank_k,
-            batch_size=getattr(args, "jev_batch_size", 32),
-            match_weight=getattr(args, "jev_match_weight", 0.6),
-            device=args.device)
+            desc_label = f"Encoding {cond_name} queries" if cond_name else "Extracting queries descriptors"
+            logger.debug(desc_label)
+            queries_subset_ds  = Subset(test_ds, list(range(num_db, num_db + num_q)))
+            queries_dataloader = DataLoader(
+                dataset=queries_subset_ds,
+                num_workers=args.num_workers,
+                batch_size=args.batch_size)
+            for images, indices, texts in tqdm(queries_dataloader, desc=desc_label):
+                encode_batch(model, args, images, texts, indices, all_descriptors,
+                             vision_descriptors, text_descriptors, img_local_descs,
+                             text_local_descs, text_tokens_all, text_attentions)
 
-    # ---- LaVPR cross-attention reranker (stage-2) -----------------------
-    if getattr(args, 'reranker', False) and args.cross_modal == 3:
-        max_rerank_k = min(args.max_rerank, max_results)
-        predictions  = rerank_by_lavpr(
-            model           = model,
-            test_ds         = test_ds,
-            predictions     = predictions,
-            img_local_descs = img_local_descs,
-            text_local_desc = text_local_descs,
-            text_attentions = text_attentions,
-            vision_descs    = vision_descriptors,
-            text_descs      = text_descriptors,
-            max_rerank_k    = max_rerank_k,
-            rerank_batch    = getattr(args, 'rerank_batch', 64),
-            alpha           = getattr(args, 'rerank_alpha', 0.0),
-            device          = args.device,
-        )
+        if need_local:
+            logger.info(f"local buffers | img {np.abs(img_local_descs).sum():.1f}  "
+                        f"text {np.abs(text_local_descs).sum():.1f}  "
+                        f"(both must be non-zero)")
 
-    # ---- 3. Metrics ------------------------------------------------------
-    if is_msls_challenge:
-        test_ds.save_predictions(
-            predictions, log_dir / "msls_challenge_predictions.txt", k=25)
-    else:
-        if args.use_labels:
-            positives_per_query = test_ds.get_positives()
-            recalls = np.zeros(len(args.recall_values))
-            for query_index, preds in enumerate(predictions):
-                for i, n in enumerate(args.recall_values):
-                    if np.any(np.isin(preds[:n], positives_per_query[query_index])):
-                        recalls[i:] += 1
-                        break
+        if args.cross_modal:
+            if not args.is_image:
+                database_descriptors = text_descriptors[: test_ds.num_database]
+            else:
+                database_descriptors = vision_descriptors[: test_ds.num_database]
+            queries_descriptors = text_descriptors[test_ds.num_database:]
+        else:
+            database_descriptors = text_descriptors[: test_ds.num_database]
+            queries_descriptors  = text_descriptors[test_ds.num_database:]
+        
+        # ---- 1. Stage-1 retrieval -------------------------------------------
+        if args.filip_retrieval:
+            scores, retrieval_predictions = filip_full_retrieval(
+                model, test_ds, vision_descriptors, text_descriptors,
+                img_local_descs, text_local_descs, text_tokens_all,
+                max_results=max_results,
+                db_chunk=getattr(args, 'filip_db_chunk', 2048),
+                alpha=getattr(args, 'filip_alpha', 0.0),
+                db_on_gpu=getattr(args, 'filip_db_on_gpu', True),
+                device=args.device)
+        else:
+            scores, retrieval_predictions = get_queries_predictions(
+                model.encoder_dim, database_descriptors, all_descriptors,
+                queries_descriptors, max_results)
 
-            recalls     = recalls / test_ds.num_queries * 100
-            recalls_str = ", ".join([f"R@{val}: {rec:.1f}"
-                                     for val, rec in zip(args.recall_values, recalls)])
-            logger.info(f"{recalls_str}")
+        if getattr(args, 'filip_diag', 0) and not args.filip_retrieval:
+            filip_vs_global_diagnostic(
+                model, test_ds, retrieval_predictions, scores,
+                vision_descriptors, text_descriptors,
+                img_local_descs, text_local_descs,
+                text_tokens_all=text_tokens_all, text_attentions=text_attentions,
+                K=min(args.max_rerank, max_results), device=args.device)
 
-            model_path = args.lora_path if args.lora_path is not None else args.model_path
+        # ---- 2. Reranking ----------------------------------------------------
+        reranking_predictions = retrieval_predictions.copy()
+        reranking_enabled     = False
+        
+        if getattr(args, 'max_sim', False):
+            reranking_enabled     = True
+            max_rerank_k          = min(args.max_rerank, max_results)
+            reranking_predictions = rerank_by_max_sim(
+                test_ds         = test_ds,
+                predictions     = reranking_predictions,
+                img_local_descs = img_local_descs,
+                text_local_descs= text_local_descs,
+                text_attentions = text_attentions,
+                vision_descs    = vision_descriptors if getattr(args, 'rerank_alpha', 0.0) > 0 else None,
+                text_descs      = text_descriptors   if getattr(args, 'rerank_alpha', 0.0) > 0 else None,
+                max_rerank_k    = max_rerank_k,
+                rerank_batch    = getattr(args, 'rerank_batch', 64),
+                alpha           = getattr(args, 'rerank_alpha', 0.0),
+                device          = args.device,
+                skip_cls        = getattr(args, 'max_sim_skip_cls', True),
+            )
+
+        if args.reranker_filip:
+            reranking_enabled     = True
+            max_rerank_k          = min(args.max_rerank, max_results)
+            reranking_predictions = rerank_by_filip(
+                model, test_ds, reranking_predictions, vision_descriptors, text_descriptors,
+                img_local_descs, text_local_descs, text_tokens_all=text_tokens_all,
+                max_rerank_k=max_rerank_k, alpha=getattr(args, 'filip_alpha', 0.0),
+                device=args.device)
+
+        if args.reranker_mllm:
+            reranking_enabled = True
+            q_texts           = test_ds.descriptions[test_ds.num_database:]
+            db_paths_arr      = np.array(test_ds.images_paths[:test_ds.num_database])
+            db_images         = db_paths_arr[reranking_predictions]
+            for i in range(len(q_texts)):
+                print(f"Sending query {i} to LLM")
+                reranking_predictions[i] = rerank_by_mllm(db_images[i], q_texts[i], reranking_predictions[i])
+
+        if args.reranker_jev:
+            reranking_enabled     = True
+            max_rerank_k          = min(args.max_rerank, max_results)
+            reranking_predictions = rerank_by_jev(
+                test_ds, reranking_predictions,
+                max_rerank_k=max_rerank_k,
+                batch_size=getattr(args, "jev_batch_size", 32),
+                match_weight=getattr(args, "jev_match_weight", 0.6),
+                device=args.device)
+
+        # ---- LaVPR cross-attention reranker (stage-2) -----------------------
+        if getattr(args, 'reranker', False) and args.cross_modal == 3 and args.max_sim == 0:
+            reranking_enabled     = True
+            max_rerank_k          = min(args.max_rerank, max_results)
+            reranking_predictions = rerank_by_lavpr(
+                model           = model,
+                test_ds         = test_ds,
+                predictions     = reranking_predictions,
+                img_local_descs = img_local_descs,
+                text_local_desc = text_local_descs,
+                text_attentions = text_attentions,
+                vision_descs    = vision_descriptors,
+                text_descs      = text_descriptors,
+                max_rerank_k    = max_rerank_k,
+                rerank_batch    = getattr(args, 'rerank_batch', 64),
+                alpha           = getattr(args, 'rerank_alpha', 0.0),
+                device          = args.device,
+            )
+
+        if not reranking_enabled and (
+            bool(getattr(args, 'reranker', False))
+            or bool(getattr(args, 'reranker_filip', False))
+            or bool(getattr(args, 'reranker_mllm', False))
+            or bool(getattr(args, 'reranker_jev', False))
+        ):
+            reranking_enabled = True
+
+        # ---- 3. Metrics ------------------------------------------------------
+        if is_msls_challenge:
+            final_predictions = reranking_predictions if reranking_enabled else retrieval_predictions
+            test_ds.save_predictions(
+                final_predictions, log_dir / "msls_challenge_predictions.txt", k=25)
+        else:
+            if args.use_labels:
+                positives_per_query = test_ds.get_positives()
+
+                def compute_recalls(preds_matrix):
+                    rec = np.zeros(len(args.recall_values))
+                    for query_index, preds in enumerate(preds_matrix):
+                        for i, n in enumerate(args.recall_values):
+                            if np.any(np.isin(preds[:n], positives_per_query[query_index])):
+                                rec[i:] += 1
+                                break
+                    rec = rec / test_ds.num_queries * 100
+                    r_str = ", ".join([f"R@{val}: {r:.1f}"
+                                      for val, r in zip(args.recall_values, rec)])
+                    return rec, r_str
+
+                retrieval_recalls, retrieval_recalls_str = compute_recalls(retrieval_predictions)
+                all_retrieval_recalls.append(retrieval_recalls)
+
+                prefix = f"[SVOX {cond_name}] " if cond_name else ""
+                if reranking_enabled:
+                    reranking_recalls, reranking_recalls_str = compute_recalls(reranking_predictions)
+                    all_reranking_recalls.append(reranking_recalls)
+                    logger.info(f"{prefix}Retrieval Recall: {retrieval_recalls_str}")
+                    logger.info(f"{prefix}Reranking Recall: {reranking_recalls_str}")
+                    print(f"{prefix}Retrieval Recall: {retrieval_recalls_str}")
+                    print(f"{prefix}Reranking Recall: {reranking_recalls_str}")
+                    recalls_str = reranking_recalls_str
+                    all_cond_results.append((cond_name or "Overall", retrieval_recalls_str, reranking_recalls_str))
+                else:
+                    logger.info(f"{prefix}Retrieval Recall: {retrieval_recalls_str}")
+                    print(f"{prefix}Retrieval Recall: {retrieval_recalls_str}")
+                    recalls_str = retrieval_recalls_str
+                    all_cond_results.append((cond_name or "Overall", retrieval_recalls_str, None))
+
+                model_path = args.lora_path if args.lora_path is not None else args.model_path
+                csv_model_tag = f"{args.model_name} [SVOX {cond_name}]" if cond_name else args.model_name
+                with open("eval_vpr_results.csv", "a") as f:
+                    if reranking_enabled:
+                        f.write(f"{model_path},{csv_model_tag},Retrieval: {retrieval_recalls_str} | Reranking: {reranking_recalls_str}\n")
+                    else:
+                        f.write(f"{model_path},{csv_model_tag},{recalls_str}\n")
+
+        if args.num_preds_to_save != 0:
+            logger.info("Saving final predictions")
+            final_predictions = reranking_predictions if reranking_enabled else retrieval_predictions
+            save_dir = log_dir / cond_name if cond_name else log_dir
+            save_dir.mkdir(parents=True, exist_ok=True)
+            visualizations.save_preds(
+                final_predictions[:, : args.num_preds_to_save], test_ds, save_dir,
+                args.save_only_wrong_preds, args.use_labels,
+                test_ds.images_paths_csv, texts=test_ds.descriptions)
+
+    # ---- Summary across multiple conditions (e.g. SVOX) -----------------
+    if len(eval_conditions) > 1 and all_retrieval_recalls:
+        mean_retrieval = np.mean(all_retrieval_recalls, axis=0)
+        mean_retrieval_str = ", ".join([f"R@{val}: {r:.1f}" for val, r in zip(args.recall_values, mean_retrieval)])
+
+        header = f"\n{'='*75}\n  SVOX Evaluation Summary (All {len(eval_conditions)} Conditions)\n{'='*75}"
+        logger.info(header)
+        print(header)
+
+        for c_name, r_str, rr_str in all_cond_results:
+            if rr_str:
+                line = f"  {c_name:<10} | Retrieval: {r_str} | Reranking: {rr_str}"
+            else:
+                line = f"  {c_name:<10} | Retrieval: {r_str}"
+            logger.info(line)
+            print(line)
+
+        sep = f"{'-'*75}"
+        logger.info(sep)
+        print(sep)
+
+        model_path = args.lora_path if args.lora_path is not None else args.model_path
+        if reranking_enabled and all_reranking_recalls:
+            mean_reranking = np.mean(all_reranking_recalls, axis=0)
+            mean_reranking_str = ", ".join([f"R@{val}: {r:.1f}" for val, r in zip(args.recall_values, mean_reranking)])
+            mean_line = f"  {'MEAN':<10} | Retrieval: {mean_retrieval_str} | Reranking: {mean_reranking_str}"
+            logger.info(mean_line)
+            print(mean_line)
             with open("eval_vpr_results.csv", "a") as f:
-                f.write(f"{model_path},{args.model_name},{recalls_str}\n")
+                f.write(f"{model_path},{args.model_name} [SVOX Mean],Retrieval: {mean_retrieval_str} | Reranking: {mean_reranking_str}\n")
+        else:
+            mean_line = f"  {'MEAN':<10} | Retrieval: {mean_retrieval_str}"
+            logger.info(mean_line)
+            print(mean_line)
+            with open("eval_vpr_results.csv", "a") as f:
+                f.write(f"{model_path},{args.model_name} [SVOX Mean],{mean_retrieval_str}\n")
 
-    if args.num_preds_to_save != 0:
-        logger.info("Saving final predictions")
-        visualizations.save_preds(
-            predictions[:, : args.num_preds_to_save], test_ds, log_dir,
-            args.save_only_wrong_preds, args.use_labels,
-            test_ds.images_paths_csv, texts=test_ds.descriptions)
+        footer = f"{'='*75}\n"
+        logger.info(footer)
+        print(footer)
 
 
 if __name__ == "__main__":

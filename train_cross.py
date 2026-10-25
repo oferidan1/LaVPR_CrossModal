@@ -50,6 +50,8 @@ def parse_arguments():
     # Misc
     a("--resume",              type=str,   default=None,                                                   help="checkpoint path to resume from")
     a("--is_llp",              type=int,   default=0,                                                      help="LLP (CLS-reweighting) pooling: 0=no / 1=yes")
+    a("--filip_loss",          type=float,   default=0,                                                    help="filip loss : 0=no / 1=yes")
+    
 
     return parser.parse_args()
 
@@ -107,6 +109,7 @@ if __name__ == '__main__':
         unimodal_loss=args.unimodal_loss,
         pos_loss=args.pos_loss,
         is_llp=args.is_llp,
+        filip_loss=args.filip_loss
     )
 
     if args.resume is not None:
