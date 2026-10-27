@@ -115,7 +115,10 @@ def parse_arguments():
     parser.add_argument("--is_image", type=int, default="1", help="is image support")    
     parser.add_argument("--is_llp", type=int, default="0", help="is llp support")            
     parser.add_argument("--data", type=str, default=None, help="amstertime/pitts/msls")  
-    parser.add_argument("--max_sim", type=int, default="0", help="is max sim reranking")              
+    parser.add_argument("--stage1_cache", type=str, default=None, help="stage1 cache")      
+    parser.add_argument("--max_sim", type=int, default="0", help="is max sim reranking")  
+    parser.add_argument('--rerank_internvl', type=str, default=None, help='Path to InternVL2 cross-encoder reranker checkpoint.')
+    parser.add_argument('--internvl_batch', type=int, default=8, help='Batch size for InternVL2 reranking (memory intensive, keep small).')            
 
     args = parser.parse_args()
     

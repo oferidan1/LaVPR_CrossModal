@@ -211,7 +211,7 @@ class InternVLReranker(nn.Module):
         lora_r:          int  = 16,
         lora_alpha:      int  = 32,
         lora_dropout:    float = 0.05,
-        lora_targets:    str  = 'q_proj,v_proj,k_proj,o_proj',
+        lora_targets:    str  = 'q_proj,v_proj,k_proj,o_proj,qkv,proj',
     ):
         super().__init__()
 
@@ -252,17 +252,52 @@ class InternVLReranker(nn.Module):
                 "Check that '<IMG_CONTEXT>' is in the tokenizer vocab.")
         print(f"img_context_token_id: {self.img_context_token_id}")
 
+        # Cache BOS/EOS ids — resolved once, used every forward call
+        bos = self.tokenizer.bos_token_id
+        if bos is None:
+            bos = self.tokenizer.convert_tokens_to_ids('<s>')
+            if bos == self.tokenizer.unk_token_id:
+                bos = 1
+        self.bos_token_id = bos
+
+        eos = self.tokenizer.eos_token_id
+        if eos is None:
+            eos = self.tokenizer.convert_tokens_to_ids('</s>')
+            if eos == self.tokenizer.unk_token_id:
+                eos = 2
+        self.eos_token_id = eos
+
+        nl = self.tokenizer.encode('\n', add_special_tokens=False)
+        self.nl_token_id  = nl[0] if nl else 13
+
+        print(f"bos={self.bos_token_id}  "
+              f"eos={self.eos_token_id}  "
+              f"nl={self.nl_token_id}")
+
         # Detect LLM hidden dim BEFORE LoRA wrapping (safer)
         with torch.no_grad():
-            dummy = torch.zeros(1, 4, dtype=torch.long)
-            D_llm = self.vlm.language_model.get_input_embeddings()(
+            dummy     = torch.zeros(1, 4, dtype=torch.long)
+            self.D_llm = self.vlm.language_model.get_input_embeddings()(
                 dummy).shape[-1]
+        D_llm = self.D_llm
         print(f"D_llm={D_llm}")
 
         self.use_lora = lora_r > 0
         if self.use_lora:
             from peft import get_peft_model, LoraConfig
-            targets = [t.strip() for t in lora_targets.split(',')]
+            if lora_targets == 'all-linear':
+                # Find every nn.Linear in the model manually —
+                # 'all-linear' string shortcut requires newer PEFT versions.
+                targets = set()
+                for name, module in self.vlm.named_modules():
+                    if isinstance(module, nn.Linear):
+                        # Use the leaf module name (last segment)
+                        targets.add(name.split('.')[-1])
+                targets = list(targets)
+                print(f"LoRA all-linear: {len(targets)} unique layer names: "
+                      f"{sorted(targets)}")
+            else:
+                targets = [t.strip() for t in lora_targets.split(',')]
             lora_cfg = LoraConfig(
                 r              = lora_r,
                 lora_alpha     = lora_alpha,
@@ -287,6 +322,9 @@ class InternVLReranker(nn.Module):
         )
         nn.init.zeros_(self.score_head[1].weight)
         nn.init.zeros_(self.score_head[1].bias)
+        # Note: zero init means all initial scores = 0, so argsort
+        # preserves stage-1 order at epoch 0 (zero gain, not negative).
+        # If gain is negative after training, check pos/neg score debug.
         n_head = sum(p.numel() for p in self.score_head.parameters())
         print(f"Score head params: {n_head:,}")
 
@@ -324,7 +362,12 @@ class InternVLReranker(nn.Module):
         #   ViT → pixel_shuffle (reduces tokens) → mlp1 (projects to D_llm)
         # It returns (B, n_patches, D_llm) ready to inject into the LLM.
         # Do NOT call mlp1 again — extract_feature already includes it.
-        img_embeds = self.vlm.extract_feature(
+        # extract_feature is defined on the base InternVLChatModel.
+        # When LoRA-wrapped, call via get_base_model() to be safe.
+        base_vlm   = (self.vlm.get_base_model()
+                      if hasattr(self.vlm, 'get_base_model')
+                      else self.vlm)
+        img_embeds = base_vlm.extract_feature(
             pixel_values.to(bf16))                    # (B, n_patches, D_llm)
         n_patches  = img_embeds.shape[1]              # 64 for 224px input
 
@@ -347,43 +390,33 @@ class InternVLReranker(nn.Module):
             (B, n_patches), img_token_id,
             dtype=torch.long, device=device)
 
-        # Newline token between image and text
-        nl_id  = self.tokenizer.encode('\n',
-                                       add_special_tokens=False)[0]
-        nl_ids = torch.full((B, 1), nl_id, dtype=torch.long, device=device)
+        # Use cached token ids from __init__
+        bos_id = self.bos_token_id
+        eos_id = self.eos_token_id
+        nl_id  = self.nl_token_id
 
-        # Full sequence: [BOS] [IMG×n_patches] [\n] [text tokens]
-        # Drop BOS from text_enc since we'll keep it from img prefix
-        bos_id  = self.tokenizer.bos_token_id
-        # Remove leading BOS from text tokens if present
-        text_ids = text_enc['input_ids']
-        if bos_id is not None and (text_ids[:, 0] == bos_id).all():
-            text_ids = text_ids[:, 1:]
-            text_mask = text_enc['attention_mask'][:, 1:]
-        else:
-            text_mask = text_enc['attention_mask']
+        nl_ids  = torch.full((B, 1), nl_id,  dtype=torch.long, device=device)
+        bos_ids = torch.full((B, 1), bos_id, dtype=torch.long, device=device)
+        eos_ids = torch.full((B, 1), eos_id, dtype=torch.long, device=device)
 
-        # BOS prefix
-        bos_ids  = torch.full((B, 1), bos_id or 1,
-                              dtype=torch.long, device=device)
-        bos_mask = torch.ones((B, 1), dtype=torch.long, device=device)
-        nl_mask  = torch.ones((B, 1), dtype=torch.long, device=device)
-        img_mask_attn = torch.ones((B, n_patches),
-                                   dtype=torch.long, device=device)
+        text_ids  = text_enc['input_ids']
+        text_mask = text_enc['attention_mask']
 
-        # Append EOS after text — gives model a dedicated summary token
-        # that has attended over all image patches + all text tokens.
-        eos_id   = self.tokenizer.eos_token_id or 2
-        eos_ids  = torch.full((B, 1), eos_id, dtype=torch.long, device=device)
-        eos_mask = torch.ones((B, 1), dtype=torch.long, device=device)
+        # Remove leading BOS from tokenized text — we prepend our own
+        if text_ids.shape[1] > 0 and (text_ids[:, 0] == bos_id).all():
+            text_ids  = text_ids[:, 1:]
+            text_mask = text_mask[:, 1:]
+
+        ones1 = torch.ones((B, 1),        dtype=torch.long, device=device)
+        onesN = torch.ones((B, n_patches), dtype=torch.long, device=device)
 
         input_ids      = torch.cat([bos_ids, img_ids, nl_ids,
                                     text_ids, eos_ids], dim=1)
-        attention_mask = torch.cat([bos_mask, img_mask_attn, nl_mask,
-                                    text_mask, eos_mask], dim=1)
+        attention_mask = torch.cat([ones1, onesN, ones1,
+                                    text_mask, ones1], dim=1)
 
         # ── 3. Build input embeddings, replace img positions with patches ─
-        embed_fn     = self.vlm.language_model.get_input_embeddings()
+        embed_fn     = base_vlm.language_model.get_input_embeddings()
         # Clone so in-place assignment does not corrupt autograd graph
         input_embeds = embed_fn(input_ids).clone()    # (B, L, D_llm)
 
@@ -393,7 +426,13 @@ class InternVLReranker(nn.Module):
         input_embeds[:, img_positions, :] = img_embeds.to(input_embeds.dtype)
 
         # ── 4. LLM forward over fused sequence ────────────────────────
-        out = self.vlm.language_model(
+        # InternVLChatModel.forward() does not accept inputs_embeds —
+        # we must call the language_model directly.
+        # LoRA wraps the language_model's attention layers internally,
+        # so calling base_vlm.language_model() still activates LoRA
+        # adapters because they are registered on the layer modules,
+        # not on the top-level PeftModel forward.
+        out = base_vlm.language_model(
             inputs_embeds        = input_embeds,
             attention_mask       = attention_mask,
             output_hidden_states = True,
@@ -432,7 +471,7 @@ class InternVLRerankerLightning(pl.LightningModule):
         lora_r:          int   = 16,
         lora_alpha:      int   = 32,
         lora_dropout:    float = 0.05,
-        lora_targets:    str   = 'q_proj,v_proj,k_proj,o_proj,qkv,proj',        
+        lora_targets:    str   = 'q_proj,v_proj,k_proj,o_proj,qkv,proj',
         # ---- Backbone (val only) ----
         backbone_ckpt:   str   = None,
         # ---- Loss ----
@@ -505,12 +544,31 @@ class InternVLRerankerLightning(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         scores = self.model(batch['image'].to(self.device), batch['text'])
+        labels = batch['label'].to(self.device)
         loss   = self._compute_loss(
-            scores,
-            batch['label'].to(self.device),
+            scores, labels,
             batch['query_idx'].to(self.device),
         )
         self.log('train/loss', loss, prog_bar=True, logger=True)
+
+        # Debug every 100 steps — confirm pos scores > neg scores
+        if batch_idx % 100 == 0:
+            pos_mask = labels > 0.5
+            neg_mask = labels <= 0.5
+            if pos_mask.any() and neg_mask.any():
+                pos_mean = scores[pos_mask].mean().item()
+                neg_mean = scores[neg_mask].mean().item()
+                gap = pos_mean - neg_mean
+                if gap > 0.01:
+                    status = 'OK'
+                elif gap < -0.01:
+                    status = 'INVERTED — check labels!'
+                else:
+                    status = 'no signal yet'
+                print(f"\n[DEBUG step {self.global_step}] "
+                      f"pos_score={pos_mean:.4f}  "
+                      f"neg_score={neg_mean:.4f}  "
+                      f"gap={gap:.4f}  ({status})")
         return loss
 
     # ------------------------------------------------------------------
@@ -645,11 +703,22 @@ class InternVLRerankerLightning(pl.LightningModule):
         I_reranked = I_stage1[:, :K].copy()
 
         db_img_paths = val_dataset.images_paths[:num_db]
-        if hasattr(val_dataset, 'descriptions') and \
-                len(val_dataset.descriptions) > num_db:
-            q_texts = val_dataset.descriptions[num_db:]
-        else:
-            q_texts = all_texts[num_db:]
+
+        # q_texts: always use all_texts[num_db:] — collected from
+        # validation_step in dataloader order (db first, queries after).
+        # This is guaranteed correct regardless of val_dataset attributes.
+        q_texts = all_texts[num_db:]
+        print(f"[DEBUG val] len(all_texts)={len(all_texts)}  "
+              f"num_db={num_db}  N_q={N_q}  len(q_texts)={len(q_texts)}")
+
+        if len(q_texts) != N_q:
+            print(f"ERROR: len(q_texts)={len(q_texts)} != N_q={N_q}. "
+                  f"all_texts has wrong length — check val dataloader order.")
+            self._log_results(r1_s1, r5_s1, r10_s1, r20_s1,
+                              r1_s1, r5_s1, r10_s1, r20_s1)
+            self._restore_internvl()
+            return
+
         if len(q_texts) == 0:
             print("No query texts — skipping reranking.")
             self._log_results(r1_s1, r5_s1, r10_s1, r20_s1,
@@ -665,7 +734,16 @@ class InternVLRerankerLightning(pl.LightningModule):
                                  std =(0.229, 0.224, 0.225)),
         ])
 
-        rerank_bs = 8   # InternVL2 joint forward is memory intensive
+        # Debug — confirm query/image pairing is correct
+        print(f"\n[DEBUG val] N_q={N_q}  num_db={num_db}  "
+              f"len(q_texts)={len(q_texts)}")
+        print(f"[DEBUG val] q_texts[0][:80]: {q_texts[0][:80]}")
+        print(f"[DEBUG val] db_img_paths[I_stage1[0,0]]: "
+              f"{db_img_paths[I_stage1[0, 0]]}")
+        print(f"[DEBUG val] positives[0]: {list(positives[0])[:5]}")
+        print(f"[DEBUG val] I_stage1[0,:5]: {I_stage1[0,:5].tolist()}")
+
+        rerank_bs = 8
 
         with torch.no_grad():
             for q0 in tqdm(range(0, N_q, rerank_bs),
@@ -690,9 +768,24 @@ class InternVLRerankerLightning(pl.LightningModule):
 
                 # Debug score stats on first batch only
                 if q0 == 0:
-                    print(f"\n[DEBUG] scores: mean={scores.mean():.4f} "
+                    print(f"\n[DEBUG val scores] mean={scores.mean():.4f} "
                           f"std={scores.std():.4f} "
                           f"min={scores.min():.4f} max={scores.max():.4f}")
+                    # Check if stage-1 rank-1 candidate scores higher than others
+                    # scores[b] is (K,) — index 0 is stage-1 top-1
+                    for b in range(min(3, bsz)):
+                        q_idx_abs  = q0 + b
+                        pos_set    = set(positives[q_idx_abs])
+                        cands_b    = cand_idx[b].tolist()
+                        pos_scores = [scores[b,k] for k,c in enumerate(cands_b)
+                                      if c in pos_set]
+                        neg_scores = [scores[b,k] for k,c in enumerate(cands_b)
+                                      if c not in pos_set]
+                        if pos_scores and neg_scores:
+                            print(f"  q{b}: pos_score={np.mean(pos_scores):.4f}  "
+                                  f"neg_score={np.mean(neg_scores):.4f}  "
+                                  f"gap={np.mean(pos_scores)-np.mean(neg_scores):.4f}"
+                                  f"  {'OK' if np.mean(pos_scores) > np.mean(neg_scores) else 'INVERTED'}")
 
                 for b in range(bsz):
                     order              = np.argsort(-scores[b])
@@ -736,6 +829,13 @@ class InternVLRerankerLightning(pl.LightningModule):
         self.log(f'{sn}/R10_reranked',r10_rr, **nk)
         self.log(f'{sn}/R20_reranked',r20_rr, **nk)
         self.log(f'{sn}/R1_gain',     r1_rr - r1_s1, **kw)
+        # Alias without '/' for ModelCheckpoint filename template.
+        # on_epoch=True and sync_dist=True ensure PL can read these
+        # when it formats the checkpoint filename after validation.
+        ckpt_kw = dict(prog_bar=False, logger=True,
+                       on_epoch=True, sync_dist=False)
+        self.log('val_R1_reranked', r1_rr,         **ckpt_kw)
+        self.log('val_R1_gain',     r1_rr - r1_s1, **ckpt_kw)
 
     # ------------------------------------------------------------------
     # Optimiser
@@ -850,7 +950,11 @@ def parse_args():
     a('--internvl_path',  type=str,   default='OpenGVLab/InternVL2-1B')
     a('--lora_r',         type=int,   default=16,
       help='LoRA rank. 0 = frozen VLM, probe-only.')
-    a('--lora_targets',   type=str,   default='q_proj,v_proj,k_proj,o_proj,qkv,proj')
+    a('--lora_targets',   type=str,
+      default='q_proj,v_proj,k_proj,o_proj,qkv,proj',
+      help='"all-linear" targets every nn.Linear in the full model '
+           '(vision encoder, mlp1, LLM attention + FFN). '
+           'Pass a comma-separated list to restrict to specific layers.')
 
     # Backbone
     a('--backbone_ckpt',  type=str,
@@ -996,17 +1100,19 @@ if __name__ == '__main__':
 
     # Checkpoint
     val_set_name = args.val_set_names[0]
-    ckpt_name = (
-        'internvl_reranker_'
-        'ep({epoch:02d})_'
-        f'R1rr[{{{val_set_name}/R1_reranked:.4f}}]_'
-        f'gain[{{{val_set_name}/R1_gain:.4f}}]'
-    )
+    # PL ModelCheckpoint uses {metric_name:.4f} syntax.
+    # Metric names with '/' must be escaped as '{val_set_name/metric}'
+    # but '/' in filenames causes path issues on Linux.
+    # Workaround: use a fixed filename template with epoch only,
+    # and rely on monitor + save_top_k=3 to keep the best checkpoints.
     checkpoint_cb = ModelCheckpoint(
         monitor                 = f'{val_set_name}/R1_reranked',
-        filename                = ckpt_name,
+        filename                = 'internvl_reranker_ep{epoch:02d}_R1rr{val_R1_reranked:.4f}_gain{val_R1_gain:.4f}',
         auto_insert_metric_name = False,
-        save_weights_only       = True,
+        save_weights_only       = False,  # must be False for LoRA — True
+                                          # skips optimizer state but also
+                                          # risks missing PEFT adapter weights
+                                          # in some PL+PEFT version combos.
         save_top_k              = 3,
         mode                    = 'max',
         save_last               = True,
