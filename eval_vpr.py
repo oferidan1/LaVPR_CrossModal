@@ -573,55 +573,117 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
     return reranked
 
 
-def rerank_by_mllm(image_paths, target_text, predictions,
-                   max_concurrent_requests=8, debug=True):
-    if len(image_paths) != len(predictions):
-        raise ValueError(f"Length mismatch.")
+def rerank_by_mllm(
+    test_ds, predictions, max_rerank_k=25,
+    max_concurrent_requests=16,
+) -> np.ndarray:
+    q_texts      = test_ds.descriptions[test_ds.num_database:]
+    db_paths_arr = np.array(test_ds.images_paths[:test_ds.num_database])
+    num_q        = len(q_texts)
+    n_cand       = min(max_rerank_k, predictions.shape[1])
 
-    async def encode_image_async(image_path):
-        def _read_and_b64(path):
-            mime_type, _ = mimetypes.guess_type(path)
-            if not mime_type: mime_type = "image/jpeg"
-            with open(path, "rb") as f:
-                return f"data:{mime_type};base64,{base64.b64encode(f.read()).decode()}"
-        return await asyncio.to_thread(_read_and_b64, image_path)
+    all_tasks = []
+    for q_idx in range(num_q):
+        for rank in range(n_cand):
+            db_idx   = int(predictions[q_idx, rank])
+            img_path = db_paths_arr[db_idx]
+            all_tasks.append((q_idx, rank, q_texts[q_idx], img_path))
 
-    async def evaluate_single_image(client, semaphore, orig_rank, pred_index, path):
-        async with semaphore:
-            if not os.path.exists(path):
-                return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
+    # Sort by image path so vLLM MM cache hits are maximised:
+    # the same db image appears across many queries; adjacent requests
+    # for the same image reuse the already-encoded visual features.
+    all_tasks.sort(key=lambda x: x[3])
+
+    logger.info(
+        f"MLLM batch rerank: {num_q} queries × {n_cand} candidates "
+        f"= {len(all_tasks)} requests  (concurrency={max_concurrent_requests})")
+
+    # Static system prompt separated so vLLM prefix-caches it across all
+    # requests — only the user turn (query text + image) varies per request.
+    SYSTEM_PROMPT = (
+        "You are an expert visual place recognition assistant. "
+        "Score whether the image shows the location described by the query. "
+        "SCORING CRITERIA (0-100): 85-100 strong match, 50-84 partial, 0-49 no match. "
+        'Respond ONLY with a JSON object: {"score": <0-100>, "reason": "<brief>"}'
+    )
+    USER_TMPL = 'TARGET QUERY: "{query}"'
+
+    async def _b64(path: str) -> str:
+        def _read(p):
+            mime, _ = mimetypes.guess_type(p)
+            if not mime:
+                mime = "image/jpeg"
+            with open(p, "rb") as f:
+                return f"data:{mime};base64,{base64.b64encode(f.read()).decode()}"
+        return await asyncio.to_thread(_read, path)
+
+    async def _score_one(client, sem, q_idx, rank, query_text, img_path):
+        # File I/O and b64 encoding happen OUTSIDE the semaphore so slots
+        # are not wasted on disk work — only the actual HTTP request is gated.
+        try:
+            exists = await asyncio.to_thread(os.path.exists, img_path)
+            if not exists:
+                logger.warning(f"MLLM: image not found: {img_path}")
+                return (q_idx, rank, 0.0)
+            img_url = await _b64(img_path)
+        except Exception as e:
+            logger.warning(f"MLLM: image load failed ({img_path}): {e}")
+            return (q_idx, rank, 0.0)
+
+        async with sem:
             try:
-                img_data_url = await encode_image_async(path)
-                prompt_text = f"""You are an expert visual place recognition and OCR assistant.
-Analyze this image to evaluate if it shows the location described by the target text query.
-TARGET QUERY: "{target_text}"
-SCORING CRITERIA (0 to 100): 85-100 strong match, 50-84 partial, 0-49 no match.
-OUTPUT FORMAT: Respond ONLY with a JSON object: {{"score": <number 0-100>, "reason": "<brief justification>"}}"""
-                response = await client.chat.completions.create(
-                    model="neuralmagic/Qwen2.5-VL-72B-Instruct-FP8-Dynamic",
-                    messages=[{"role": "user", "content": [
-                        {"type": "text", "text": prompt_text.strip()},
-                        {"type": "image_url", "image_url": {"url": img_data_url}},
-                    ]}], temperature=0.0, max_tokens=80)
-                raw = response.choices[0].message.content.strip()
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model="neuralmagic/Qwen2.5-VL-72B-Instruct-FP8-Dynamic",
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": [
+                                {"type": "text",
+                                 "text": USER_TMPL.format(query=query_text)},
+                                {"type": "image_url",
+                                 "image_url": {"url": img_url}},
+                            ]},
+                        ],
+                        temperature=0.0,
+                        max_tokens=80,
+                    ),
+                    timeout=120.0,
+                )
+                raw   = response.choices[0].message.content.strip()
                 score = 0.0
                 try:
                     clean = re.sub(r"```[a-zA-Z]*", "", raw).strip()
                     score = float(json.loads(clean).get("score", 0.0))
                 except Exception:
-                    m = re.search(r'"(?:score)"\s*:\s*(\d+(?:\.\d+)?)', raw)
-                    if m: score = float(m.group(1))
-                return {"pred_index": pred_index, "score": score, "orig_rank": orig_rank}
-            except Exception:
-                return {"pred_index": pred_index, "score": 0.0, "orig_rank": orig_rank}
+                    m = re.search(r'"score"\s*:\s*(\d+(?:\.\d+)?)', raw)
+                    if m:
+                        score = float(m.group(1))
+                return (q_idx, rank, score)
 
-    async def run_batch():
-        semaphore = asyncio.Semaphore(max_concurrent_requests)
-        async with AsyncOpenAI(base_url="http://localhost:8000/v1",
-                               api_key="not-needed") as client:
-            tasks = [evaluate_single_image(client, semaphore, oi, pi, path)
-                     for oi, (pi, path) in enumerate(zip(predictions, image_paths))]
-            return await asyncio.gather(*tasks)
+            except asyncio.TimeoutError:
+                logger.warning(f"MLLM: request timed out ({img_path})")
+                return (q_idx, rank, 0.0)
+            except Exception as e:
+                logger.warning(f"MLLM: request failed ({img_path}): {e}")
+                return (q_idx, rank, 0.0)
+
+    async def _run_all():
+        t0  = time.perf_counter()
+        sem = asyncio.Semaphore(max_concurrent_requests)
+        async with AsyncOpenAI(
+            base_url="http://localhost:8000/v1", api_key="not-needed"
+        ) as client:
+            coros   = [
+                _score_one(client, sem, q_idx, rank, qt, path)
+                for q_idx, rank, qt, path in all_tasks
+            ]
+            results = []
+            for coro in tqdm(asyncio.as_completed(coros),
+                             total=len(coros), desc="MLLM rerank"):
+                results.append(await coro)
+        TIMING.record('rerank_mllm_total', num_q * n_cand,
+                      time.perf_counter() - t0)
+        return results
 
     try:
         loop = asyncio.get_running_loop()
@@ -629,11 +691,23 @@ OUTPUT FORMAT: Respond ONLY with a JSON object: {{"score": <number 0-100>, "reas
         loop = None
     if loop and loop.is_running():
         import nest_asyncio; nest_asyncio.apply()
-        results = loop.run_until_complete(run_batch())
+        raw_results = loop.run_until_complete(_run_all())
     else:
-        results = asyncio.run(run_batch())
-    return [r["pred_index"] for r in sorted(results, key=lambda x: (-x["score"], x["orig_rank"]))]
+        raw_results = asyncio.run(_run_all())
 
+    score_map = {}
+    for q_idx, rank, score in raw_results:
+        score_map[(q_idx, rank)] = score
+
+    reranked = predictions.copy()
+    for q_idx in range(num_q):
+        cand_indices = predictions[q_idx, :n_cand]
+        sc    = np.array([score_map.get((q_idx, r), 0.0) for r in range(n_cand)])
+        order = np.argsort(-sc)
+        reranked[q_idx, :n_cand] = cand_indices[order]
+
+    logger.info("MLLM batch reranking complete.")
+    return reranked
 
 @torch.no_grad()
 def rerank_by_filip(
@@ -1191,14 +1265,13 @@ def main(args):
                 skip_cls=getattr(args,'max_sim_skip_cls',True))
 
         if args.reranker_mllm:
-            reranking_enabled = True
-            q_texts      = test_ds.descriptions[test_ds.num_database:]
-            db_paths_arr = np.array(test_ds.images_paths[:test_ds.num_database])
-            db_images    = db_paths_arr[reranking_predictions]
-            for i in range(len(q_texts)):
-                print(f"Sending query {i} to LLM")
-                reranking_predictions[i] = rerank_by_mllm(
-                    db_images[i], q_texts[i], reranking_predictions[i])
+            reranking_enabled     = True
+            max_rerank_k          = min(args.max_rerank, max_results)
+            reranking_predictions = rerank_by_mllm(
+                test_ds, reranking_predictions,
+                max_rerank_k=max_rerank_k,
+                max_concurrent_requests=getattr(args, 'mllm_concurrent', 24),
+            )
 
         if args.reranker_jev:
             reranking_enabled     = True
