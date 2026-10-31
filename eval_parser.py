@@ -118,7 +118,10 @@ def parse_arguments():
     parser.add_argument("--stage1_cache", type=str, default=None, help="stage1 cache")      
     parser.add_argument("--max_sim", type=int, default="0", help="is max sim reranking")  
     parser.add_argument('--rerank_internvl', type=str, default=None, help='Path to InternVL2 cross-encoder reranker checkpoint.')
-    parser.add_argument('--internvl_batch', type=int, default=8, help='Batch size for InternVL2 reranking (memory intensive, keep small).')            
+    parser.add_argument('--internvl_batch', type=int, default=8, help='Batch size for InternVL2 reranking (memory intensive, keep small).')                
+    parser.add_argument('--ablate_alpha',  action='store_true', help='Run offline alpha ablation after reranking')
+    parser.add_argument('--ablate_alphas', type=float, nargs='+', default=None, help='Alpha values to sweep (default: 0.0 to 1.0 in 0.1 steps)')
+    parser.add_argument('--ablate_norm',   default='zscore', choices=['zscore', 'minmax', 'none'],  help='Score normalization before blending')
 
     args = parser.parse_args()
     

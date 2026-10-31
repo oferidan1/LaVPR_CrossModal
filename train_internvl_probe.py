@@ -8,7 +8,8 @@ Architecture (LoRA mode):
     The image tokens are inserted into the LLM context via InternVL2's
     native <image> token mechanism. LoRA adapts the LLM cross-attention
     layers so the model learns to ground text tokens in image regions.
-    Score = Linear(last_hidden_state[last_real_token]) → scalar.
+    Score = Linear(last_hidden_state[last_real_token]) → logit.
+    Inference: sigmoid(logit) → [0,1] probability via predict().
 
     This is the correct use of a VLM as a cross-encoder reranker,
     analogous to MonoBERT / RankLLaMA in text retrieval.
@@ -192,7 +193,8 @@ class InternVLReranker(nn.Module):
            <image> token position (InternVL2's native mechanism).
         3. The LLM attention layers process patch tokens + text tokens
            together — every layer attends over the full multimodal context.
-        4. Score = score_head(last_real_token_hidden_state) → scalar.
+        4. Score = score_head(last_real_token_hidden_state) → logit.
+           Use predict() at inference to get sigmoid probability in [0,1].
 
     With LoRA (lora_r > 0):
         LoRA adapts q,k,v,o projections in the LLM attention layers.
@@ -314,17 +316,17 @@ class InternVLReranker(nn.Module):
             n = sum(p.numel() for p in self.vlm.parameters())
             print(f"VLM frozen: {n:,} params")
 
-        # Score head: LayerNorm + Linear(D_llm → 1)
-        # Zero-init linear so initial scores are uniform (stable training)
+        # Score head: LayerNorm + Linear(D_llm → 1) → raw logit
+        # Small normal init so initial logits are near 0 (sigmoid ≈ 0.5).
+        # Zero bias keeps the neutral start — avoids the large-negative-logit
+        # problem caused by zero weight + class imbalance.
         self.score_head = nn.Sequential(
             nn.LayerNorm(D_llm),
             nn.Linear(D_llm, 1, bias=True),
         )
-        nn.init.zeros_(self.score_head[1].weight)
+        nn.init.normal_(self.score_head[1].weight, mean=0.0, std=0.01)
         nn.init.zeros_(self.score_head[1].bias)
-        # Note: zero init means all initial scores = 0, so argsort
-        # preserves stage-1 order at epoch 0 (zero gain, not negative).
-        # If gain is negative after training, check pos/neg score debug.
+
         n_head = sum(p.numel() for p in self.score_head.parameters())
         print(f"Score head params: {n_head:,}")
 
@@ -351,7 +353,8 @@ class InternVLReranker(nn.Module):
 
         Returns
         -------
-        scores : (B,) float — relevance scores (logits, fp32)
+        scores : (B,) float32 — raw logits (unbounded).
+                 Use predict() to get sigmoid probabilities in [0, 1].
         """
         device = pixel_values.device
         B      = pixel_values.shape[0]
@@ -455,7 +458,18 @@ class InternVLReranker(nn.Module):
         batch_idx = torch.arange(B, device=device)
         pooled    = last_hidden[batch_idx, seq_lens]  # (B, D_llm)
 
-        return self.score_head(pooled).squeeze(-1)    # (B,)
+        # ── 6. Score head → raw logits ─────────────────────────────────
+        # Return logits so the loss can use binary_cross_entropy_with_logits,
+        # which is autocast-safe and numerically stable.
+        # For inference use predict() which applies sigmoid → [0, 1].
+        return self.score_head(pooled).squeeze(-1)    # (B,) raw logits
+
+    def predict(self, pixel_values, texts):
+        """
+        Inference-only wrapper — returns relevance probabilities in [0, 1].
+        Do NOT use during training; loss expects raw logits from forward().
+        """
+        return torch.sigmoid(self.forward(pixel_values, texts))
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +490,7 @@ class InternVLRerankerLightning(pl.LightningModule):
         backbone_ckpt:   str   = None,
         # ---- Loss ----
         loss_name:       str   = 'bce',
-        margin:          float = 0.3,
+        margin:          float = 0.3,   # logit space
         # ---- Optimiser ----
         lr:              float = 1e-4,
         weight_decay:    float = 1e-4,
@@ -515,9 +529,14 @@ class InternVLRerankerLightning(pl.LightningModule):
     # ------------------------------------------------------------------
 
     def _bce_loss(self, scores, labels):
-        return F.binary_cross_entropy_with_logits(scores, labels)
+        # scores are raw logits from forward() — use _with_logits which is
+        # autocast-safe, numerically stable, and applies sigmoid internally.
+        # plain binary_cross_entropy crashes under bf16 autocast.
+        return F.binary_cross_entropy_with_logits(
+            scores.float(), labels.float())
 
     def _margin_loss(self, scores, labels, query_idx):
+        # scores are raw logits — margin=0.3 is appropriate for logit space.
         total = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
         valid = 0
         for qid in query_idx.unique():
@@ -551,7 +570,8 @@ class InternVLRerankerLightning(pl.LightningModule):
         )
         self.log('train/loss', loss, prog_bar=True, logger=True)
 
-        # Debug every 100 steps — confirm pos scores > neg scores
+        # Debug every 100 steps — confirm pos scores > neg scores.
+        # Threshold 0.01 is appropriate for [0, 1] probability space.
         if batch_idx % 100 == 0:
             pos_mask = labels > 0.5
             neg_mask = labels <= 0.5
@@ -711,12 +731,13 @@ class InternVLRerankerLightning(pl.LightningModule):
         print(f"[DEBUG val] len(all_texts)={len(all_texts)}  "
               f"num_db={num_db}  N_q={N_q}  len(q_texts)={len(q_texts)}")
 
+        # Bug fix: _restore_internvl() already called above before reranking.
+        # Do NOT call it again in error branches — InternVL2 is already on GPU.
         if len(q_texts) != N_q:
             print(f"ERROR: len(q_texts)={len(q_texts)} != N_q={N_q}. "
                   f"all_texts has wrong length — check val dataloader order.")
             self._log_results(r1_s1, r5_s1, r10_s1, r20_s1,
                               r1_s1, r5_s1, r10_s1, r20_s1)
-            self._restore_internvl()
             return
 
         if len(q_texts) == 0:
@@ -764,15 +785,15 @@ class InternVLRerankerLightning(pl.LightningModule):
                         texts_flat.append(qt)
 
                 pv     = torch.stack(imgs_flat).to(self.device)
-                scores = self.model(pv, texts_flat).view(bsz, K).cpu().numpy()
+                # predict() applies sigmoid → [0, 1] probabilities for blending
+                scores = self.model.predict(pv, texts_flat).view(bsz, K).cpu().numpy()
 
                 # Debug score stats on first batch only
                 if q0 == 0:
                     print(f"\n[DEBUG val scores] mean={scores.mean():.4f} "
                           f"std={scores.std():.4f} "
                           f"min={scores.min():.4f} max={scores.max():.4f}")
-                    # Check if stage-1 rank-1 candidate scores higher than others
-                    # scores[b] is (K,) — index 0 is stage-1 top-1
+                    # Check if positive candidates score higher than negatives
                     for b in range(min(3, bsz)):
                         q_idx_abs  = q0 + b
                         pos_set    = set(positives[q_idx_abs])
@@ -983,7 +1004,8 @@ def parse_args():
     # Loss
     a('--loss_name',      type=str,   default='bce',
       choices=['bce', 'margin'])
-    a('--margin',         type=float, default=0.3)
+    a('--margin',         type=float, default=0.3,
+      help='Margin for margin loss. In logit space.')
 
     # Optimiser
     a('--lr',             type=float, default=1e-4)

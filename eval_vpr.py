@@ -18,7 +18,6 @@ import os
 from dataloaders.test_dataset import TestDataset
 from dataloaders.MapillaryTestDataset import MSLSTest
 import utils.visualizations as visualizations
-from sklearn.decomposition import PCA
 import asyncio
 import base64
 import json
@@ -42,6 +41,12 @@ def _z(x):
     return (x - x.mean()) / x.std().clamp(min=1e-6)
 
 
+def _zn_np(x: np.ndarray) -> np.ndarray:
+    """Z-score normalize a 1-D numpy array; return x unchanged if std is tiny."""
+    std = x.std()
+    return (x - x.mean()) / (std + 1e-8) if std > 1e-8 else x
+
+
 # ---------------------------------------------------------------------------
 # Timing stats accumulator
 # ---------------------------------------------------------------------------
@@ -54,15 +59,6 @@ class TimingStats:
 
     def record(self, name: str, n_items: int, elapsed_s: float):
         self._data.setdefault(name, []).append((n_items, elapsed_s))
-
-    # What "items" means per stage — ms/item is always per candidate image:
-    #   encode_batch          → images in that dataloader batch
-    #   encode_gallery_total  → total gallery images
-    #   encode_queries_total  → total query images
-    #   faiss_stage1          → queries searched
-    #   rerank_*_batch        → candidate images scored (bsz × K)
-    #   rerank_jev_batch      → (query, candidate) pairs in that chunk
-    #   filip_retrieval_*     → queries processed (each queries full gallery)
 
     def summary(self) -> str:
         if not self._data:
@@ -176,12 +172,227 @@ def save_rerank_cache(save_path, predictions, scores,
             row = [q_path]
             for r in range(k):
                 db_idx = int(predictions[q_idx, r])
+                sc_val = float(scores[q_idx, r])
                 row.append(db_arr[db_idx])
-                row.append(f'{scores[q_idx, r]:.6f}')
+                row.append('' if np.isnan(sc_val) else f'{sc_val:.6f}')
             writer.writerow(row)
     logger.info(
         f"Stage-2 cache saved → {save_path}  "
         f"(queries={len(query_filenames)}, topk={k})")
+
+
+# ---------------------------------------------------------------------------
+# Combined cache: retrieval + rerank scores side-by-side for alpha ablation
+# ---------------------------------------------------------------------------
+
+def save_combined_cache(save_path, retrieval_predictions, retrieval_scores,
+                        rerank_predictions, rerank_scores,
+                        query_filenames, db_filenames,
+                        topk=STAGE1_TOPK_SAVE):
+    """
+    Saves one row per query in RETRIEVAL order so retrieval scores are
+    monotone descending.  For each candidate both ret_score and rerank_score
+    are recorded so offline alpha ablation needs only this one file.
+
+    rerank_predictions / rerank_scores may be None (pure retrieval run).
+    Candidates outside the reranked window get an empty rerank_score field
+    (reads back as NaN).
+
+    Columns:
+        query_path,
+        db_path_1, ret_score_1, rerank_score_1,
+        db_path_2, ret_score_2, rerank_score_2,
+        ...
+    """
+    k      = min(topk, retrieval_predictions.shape[1])
+    db_arr = np.array(db_filenames)
+
+    # Build per-query {db_idx: rerank_score} lookup from rerank results.
+    rerank_lookup = {}   # q_idx -> {db_idx: score}
+    if rerank_predictions is not None and rerank_scores is not None:
+        for q_idx in range(rerank_predictions.shape[0]):
+            rerank_lookup[q_idx] = {
+                int(rerank_predictions[q_idx, r]): float(rerank_scores[q_idx, r])
+                for r in range(rerank_predictions.shape[1])
+                if not np.isnan(rerank_scores[q_idx, r])
+            }
+
+    with open(save_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        header = ['query_path']
+        for r in range(1, k + 1):
+            header += [f'db_path_{r}', f'ret_score_{r}', f'rerank_score_{r}']
+        writer.writerow(header)
+
+        for q_idx, q_path in enumerate(query_filenames):
+            row   = [q_path]
+            q_lut = rerank_lookup.get(q_idx, {})
+            for r in range(k):
+                db_idx    = int(retrieval_predictions[q_idx, r])
+                ret_sc    = float(retrieval_scores[q_idx, r])
+                rerank_sc = q_lut.get(db_idx, float('nan'))
+                row += [
+                    db_arr[db_idx],
+                    f'{ret_sc:.6f}',
+                    '' if np.isnan(rerank_sc) else f'{rerank_sc:.6f}',
+                ]
+            writer.writerow(row)
+
+    logger.info(
+        f"Combined cache saved → {save_path}  "
+        f"(queries={len(query_filenames)}, topk={k}, "
+        f"has_rerank={'yes' if rerank_predictions is not None else 'no'})")
+
+
+def load_combined_cache(save_path, db_filenames):
+    """
+    Returns a dict with arrays shaped (n_queries, topk):
+        query_filenames   list[str]
+        db_paths          list[list[str]]
+        predictions       int64   (db indices, -1 if path not found)
+        ret_scores        float32
+        rerank_scores     float32 (nan where not reranked)
+    """
+    db_path_to_idx = {p: i for i, p in enumerate(db_filenames)}
+    query_filenames = []
+    db_paths_rows, ret_rows, rerank_rows, pred_rows = [], [], [], []
+
+    with open(save_path, 'r', newline='') as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        k      = (len(header) - 1) // 3
+        for row in reader:
+            query_filenames.append(row[0])
+            db_ps, rets, reranks, idxs = [], [], [], []
+            for r in range(k):
+                db_path  = row[1 + r * 3]
+                ret_sc   = float(row[2 + r * 3])
+                rr_field = row[3 + r * 3]
+                rr_sc    = float(rr_field) if rr_field else float('nan')
+                db_ps.append(db_path)
+                rets.append(ret_sc)
+                reranks.append(rr_sc)
+                idxs.append(db_path_to_idx.get(db_path, -1))
+            db_paths_rows.append(db_ps)
+            ret_rows.append(rets)
+            rerank_rows.append(reranks)
+            pred_rows.append(idxs)
+
+    n_missing = sum(1 for row in pred_rows for idx in row if idx == -1)
+    if n_missing:
+        logger.warning(
+            f"Combined cache: {n_missing} db paths not found in current dataset.")
+    logger.info(
+        f"Combined cache loaded ← {save_path}  "
+        f"(queries={len(query_filenames)}, topk={k})")
+    return {
+        'query_filenames': query_filenames,
+        'db_paths':        db_paths_rows,
+        'predictions':     np.array(pred_rows,   dtype=np.int64),
+        'ret_scores':      np.array(ret_rows,    dtype=np.float32),
+        'rerank_scores':   np.array(rerank_rows, dtype=np.float32),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Offline alpha ablation over a combined cache
+# ---------------------------------------------------------------------------
+
+def ablate_alpha(combined, positives_per_query, recall_values,
+                 alphas=None, normalize='zscore'):
+    """
+    Sweep alpha values using pre-computed retrieval + rerank scores.
+
+    combined            — dict returned by load_combined_cache()
+    positives_per_query — list[set[int]]  (db indices that are positives)
+    recall_values       — e.g. [1, 5, 10, 25]
+    alphas              — list of floats in [0,1]; None → 11 values 0.0..1.0
+    normalize           — 'zscore' | 'minmax' | 'none'
+
+    Returns:
+        results  dict  alpha -> np.array of recall@k values (%)
+    """
+    if alphas is None:
+        alphas = [round(a / 10, 1) for a in range(11)]
+
+    ret_scores    = combined['ret_scores'].copy()     # (Q, K)
+    rerank_scores = combined['rerank_scores'].copy()  # (Q, K), NaN where missing
+    predictions   = combined['predictions']           # (Q, K)
+    Q, K          = ret_scores.shape
+
+    # Queries where rerank scores are entirely NaN can only use retrieval.
+    has_rerank = ~np.all(np.isnan(rerank_scores), axis=1)   # (Q,)
+
+    def _norm_rows(mat):
+        out = mat.copy()
+        for q in range(Q):
+            row   = out[q]
+            valid = ~np.isnan(row)
+            if valid.sum() < 2:
+                out[q] = np.where(valid, 0.0, np.nan)
+                continue
+            if normalize == 'zscore':
+                std    = row[valid].std()
+                out[q] = np.where(valid,
+                                  (row - row[valid].mean()) / max(std, 1e-8),
+                                  np.nan)
+            elif normalize == 'minmax':
+                lo, hi = row[valid].min(), row[valid].max()
+                out[q] = np.where(valid,
+                                  (row - lo) / max(hi - lo, 1e-8),
+                                  np.nan)
+            # 'none' → leave as-is
+        return out
+
+    ret_n    = _norm_rows(ret_scores)
+    rerank_n = _norm_rows(rerank_scores)
+
+    def compute_recalls(preds_matrix):
+        rec = np.zeros(len(recall_values))
+        for q_idx, preds in enumerate(preds_matrix):
+            pos = positives_per_query[q_idx]
+            for i, n in enumerate(recall_values):
+                if np.any(np.isin(preds[:n], list(pos))):
+                    rec[i:] += 1
+                    break
+        return rec / Q * 100
+
+    results = {}
+    for alpha in alphas:
+        blended = np.full_like(ret_n, np.nan)
+        for q in range(Q):
+            if not has_rerank[q] or alpha == 1.0:
+                # Pure retrieval
+                blended[q] = ret_n[q]
+            elif alpha == 0.0:
+                # Pure rerank; fall back to retrieval where rerank is missing
+                blended[q] = np.where(np.isnan(rerank_n[q]),
+                                      ret_n[q], rerank_n[q])
+            else:
+                rr         = np.where(np.isnan(rerank_n[q]), 0.0, rerank_n[q])
+                blended[q] = alpha * ret_n[q] + (1.0 - alpha) * rr
+
+        final_preds = np.zeros_like(predictions)
+        for q in range(Q):
+            order           = np.argsort(-blended[q])
+            final_preds[q]  = predictions[q][order]
+
+        results[alpha] = compute_recalls(final_preds)
+
+    # Pretty-print summary
+    header = (f"\n{'='*70}\n  Alpha ablation  (normalize={normalize})\n"
+              f"{'='*70}")
+    logger.info(header); print(header)
+    rv_str = "  ".join([f"R@{v:>2}" for v in recall_values])
+    logger.info(f"  {'alpha':>6}  {rv_str}")
+    print(     f"  {'alpha':>6}  {rv_str}")
+    for alpha, rec in results.items():
+        row = "  ".join([f"{r:5.1f}" for r in rec])
+        logger.info(f"  {alpha:>6.2f}  {row}")
+        print(     f"  {alpha:>6.2f}  {row}")
+    logger.info('='*70); print('='*70)
+
+    return results
 
 
 def verify_cache_query_order(cache, test_ds):
@@ -325,17 +536,21 @@ def filip_full_retrieval(model, test_ds, vision_descriptors, text_descriptors,
 
 
 # ---------------------------------------------------------------------------
-# Rerankers
+# Rerankers  (all return (predictions, scores) tuples)
 # ---------------------------------------------------------------------------
 
 def rerank_predictions(model, test_ds, predictions, vision_descriptors,
                        text_descriptors, img_local_descs, text_local_desc,
                        text_attentions=None, max_rerank_k=25, device="cuda"):
+    """Cross-attention reranker. Returns (reranked_predictions, reranked_scores)."""
     logger.info(f"Reranking top-{max_rerank_k} candidates using Cross-Attention...")
     rerank_model = model.single_encoder
     rerank_model.to(device)
     rerank_model.eval()
-    reranked_predictions      = predictions.copy()
+    num_q = test_ds.num_queries
+    reranked_predictions = predictions.copy()
+    reranked_scores      = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
+
     img_local_descs_tensor    = torch.from_numpy(img_local_descs).to(device)
     text_local_desc_tensor    = torch.from_numpy(text_local_desc).to(device)
     vision_descriptors_tensor = torch.from_numpy(vision_descriptors).to(device)
@@ -346,7 +561,7 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
         logger.warning("rerank_predictions: no attention mask supplied.")
     n_cand = int(max_rerank_k)
     with torch.no_grad():
-        for q_idx in tqdm(range(test_ds.num_queries), desc="Reranking queries"):
+        for q_idx in tqdm(range(num_q), desc="Reranking queries"):
             t0 = time.perf_counter()
             actual_q_ds_idx  = test_ds.num_database + q_idx
             query_text_global = text_descriptors_tensor[actual_q_ds_idx].unsqueeze(0)
@@ -373,14 +588,15 @@ def rerank_predictions(model, test_ds, predictions, vision_descriptors,
                 text_local_expanded  = text_local_expanded.bfloat16()
                 candidate_img_global = candidate_img_global.bfloat16()
                 text_global_expanded = text_global_expanded.bfloat16()
-            scores = rerank_model.cross_attn_classifier(
+            per_q_scores = rerank_model.cross_attn_classifier(
                 candidate_img_local, text_local_expanded,
                 candidate_img_global, text_global_expanded)
-            scores = scores.float().cpu().numpy()
-            reranked_order = np.argsort(-scores)
+            per_q_scores     = per_q_scores.float().cpu().numpy()
+            reranked_order   = np.argsort(-per_q_scores)
             reranked_predictions[q_idx, :n_cand] = candidate_db_indices[reranked_order]
+            reranked_scores[q_idx, :n_cand]      = per_q_scores[reranked_order]
             TIMING.record('rerank_cross_attn_per_query', n_cand, time.perf_counter() - t0)
-    return reranked_predictions
+    return reranked_predictions, reranked_scores
 
 
 @torch.no_grad()
@@ -388,7 +604,8 @@ def rerank_by_lavpr(
     model, test_ds, predictions, img_local_descs, text_local_desc,
     text_attentions, vision_descs=None, text_descs=None,
     max_rerank_k=20, rerank_batch=64, alpha=0.0, device='cuda',
-) -> np.ndarray:
+):
+    """LaVPR reranker. Returns (reranked_predictions, reranked_scores)."""
     reranker = model.reranker_network
     if reranker is None:
         raise RuntimeError("reranker_network is None.")
@@ -398,8 +615,6 @@ def rerank_by_lavpr(
     num_q   = test_ds.num_queries
     n_cand  = min(max_rerank_k, predictions.shape[1])
 
-    # Detect reranker's expected input dims from its projection layers.
-    # reranker.img_proj / txt_proj are Linear(D_in, D_hidden).
     img_proj_in = reranker.img_proj.weight.shape[1]
     txt_proj_in = reranker.txt_proj.weight.shape[1]
     got_img_dim = img_local_descs.shape[-1]
@@ -412,22 +627,16 @@ def rerank_by_lavpr(
     if got_img_dim != img_proj_in:
         raise RuntimeError(
             f"rerank_by_lavpr: img local dim mismatch — "
-            f"reranker expects {img_proj_in}, buffer has {got_img_dim}. "
-            "Make sure --cross_modal=3 and the model was trained with the "
-            "same img_local_dim as the reranker (check model.img_local_tokens "
-            "and model.embeds_dim).")
+            f"reranker expects {img_proj_in}, buffer has {got_img_dim}.")
     if got_txt_dim != txt_proj_in:
         raise RuntimeError(
             f"rerank_by_lavpr: text local dim mismatch — "
-            f"reranker expects {txt_proj_in}, buffer has {got_txt_dim}. "
-            "The reranker was likely trained with raw BGE dim "
-            f"({txt_proj_in}) but the eval buffer holds projected "
-            f"embeds_dim ({got_txt_dim}). Pass the raw local text "
-            "descriptors (before image_proj_local / text_proj_local).")
+            f"reranker expects {txt_proj_in}, buffer has {got_txt_dim}.")
 
     logger.info(f"LaVPR reranking top-{n_cand} for {num_q} queries  "
                 f"(batch={rerank_batch}  alpha={alpha}  dtype={w_dtype})")
-    reranked = predictions.copy()
+    reranked        = predictions.copy()
+    reranked_scores = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
 
     for q_start in tqdm(range(0, num_q, rerank_batch), desc="LaVPR rerank"):
         t0    = time.perf_counter()
@@ -483,24 +692,23 @@ def rerank_by_lavpr(
                 db_norm    = db_globals / (np.linalg.norm(
                     db_globals, axis=1, keepdims=True) + 1e-8)
                 global_sim = db_norm @ q_norm
-                def _zn(x):
-                    std = x.std()
-                    return (x - x.mean()) / (std + 1e-8) if std > 1e-8 else x
-                local_scores[b] = (alpha * _zn(global_sim)
-                                   + (1.0 - alpha) * _zn(local_scores[b]))
+                local_scores[b] = (alpha * _zn_np(global_sim)
+                                   + (1.0 - alpha) * _zn_np(local_scores[b]))
 
         for b in range(bsz):
             order = np.argsort(-local_scores[b])
-            reranked[q_start + b, :n_cand] = cand_idx[b][order]
+            reranked[q_start + b, :n_cand]        = cand_idx[b][order]
+            reranked_scores[q_start + b, :n_cand] = local_scores[b][order]
 
         TIMING.record('rerank_lavpr_batch', bsz * n_cand, time.perf_counter() - t0)
 
     logger.info("LaVPR reranking complete.")
-    return reranked
+    return reranked, reranked_scores
 
 
 def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
                   match_weight=0.6, device="cuda"):
+    """JEV reranker. Returns (reranked_predictions, reranked_scores)."""
     from huggingface_hub import snapshot_download
     from PIL import Image
     logger.info(f"Reranking top-{max_rerank_k} candidates using JEV...")
@@ -526,12 +734,16 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
     db_paths = np.array(test_ds.images_paths[:test_ds.num_database])
     q_texts  = test_ds.descriptions[test_ds.num_database:]
     n_cand   = min(max_rerank_k, predictions.shape[1])
-    reranked = predictions.copy()
+    num_q    = test_ds.num_queries
+    reranked        = predictions.copy()
+    reranked_scores = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
+
     all_pairs = []
-    for q_idx in range(test_ds.num_queries):
+    for q_idx in range(num_q):
         cand_indices = predictions[q_idx, :n_cand]
         for rank, db_idx in enumerate(cand_indices):
             all_pairs.append((q_idx, rank, q_texts[q_idx], db_paths[db_idx]))
+
     all_scores = {}
     for start in tqdm(range(0, len(all_pairs), batch_size), desc="JEV rerank"):
         t0    = time.perf_counter()
@@ -561,22 +773,26 @@ def rerank_by_jev(test_ds, predictions, max_rerank_k=25, batch_size=64,
                 results[question.question_id] = dict(zip(question.option_ids, probs))
             match_prob    = results["place_match"].get("match", 0.0)
             location_prob = list(results["confidence"].values())[0]
-            all_scores[(q_idx, rank)] = (match_weight*match_prob
-                                         + (1-match_weight)*location_prob)
+            all_scores[(q_idx, rank)] = (match_weight * match_prob
+                                         + (1 - match_weight) * location_prob)
         TIMING.record('rerank_jev_batch', len(chunk), time.perf_counter() - t0)
-    for q_idx in range(test_ds.num_queries):
+
+    for q_idx in range(num_q):
         cand_indices = predictions[q_idx, :n_cand]
         sc    = np.array([all_scores.get((q_idx, r), 0.0) for r in range(n_cand)])
         order = np.argsort(-sc)
-        reranked[q_idx, :n_cand] = cand_indices[order]
+        reranked[q_idx, :n_cand]        = cand_indices[order]
+        reranked_scores[q_idx, :n_cand] = sc[order]
+
     logger.info("JEV reranking complete.")
-    return reranked
+    return reranked, reranked_scores
 
 
 def rerank_by_mllm(
     test_ds, predictions, max_rerank_k=25,
     max_concurrent_requests=16,
-) -> np.ndarray:
+):
+    """MLLM async reranker. Returns (reranked_predictions, reranked_scores)."""
     q_texts      = test_ds.descriptions[test_ds.num_database:]
     db_paths_arr = np.array(test_ds.images_paths[:test_ds.num_database])
     num_q        = len(q_texts)
@@ -589,17 +805,13 @@ def rerank_by_mllm(
             img_path = db_paths_arr[db_idx]
             all_tasks.append((q_idx, rank, q_texts[q_idx], img_path))
 
-    # Sort by image path so vLLM MM cache hits are maximised:
-    # the same db image appears across many queries; adjacent requests
-    # for the same image reuse the already-encoded visual features.
+    # Sort by image path so vLLM MM cache hits are maximised.
     all_tasks.sort(key=lambda x: x[3])
 
     logger.info(
         f"MLLM batch rerank: {num_q} queries × {n_cand} candidates "
         f"= {len(all_tasks)} requests  (concurrency={max_concurrent_requests})")
 
-    # Static system prompt separated so vLLM prefix-caches it across all
-    # requests — only the user turn (query text + image) varies per request.
     SYSTEM_PROMPT = (
         "You are an expert visual place recognition assistant. "
         "Score whether the image shows the location described by the query. "
@@ -618,8 +830,6 @@ def rerank_by_mllm(
         return await asyncio.to_thread(_read, path)
 
     async def _score_one(client, sem, q_idx, rank, query_text, img_path):
-        # File I/O and b64 encoding happen OUTSIDE the semaphore so slots
-        # are not wasted on disk work — only the actual HTTP request is gated.
         try:
             exists = await asyncio.to_thread(os.path.exists, img_path)
             if not exists:
@@ -699,72 +909,80 @@ def rerank_by_mllm(
     for q_idx, rank, score in raw_results:
         score_map[(q_idx, rank)] = score
 
-    reranked = predictions.copy()
+    reranked        = predictions.copy()
+    reranked_scores = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
+
     for q_idx in range(num_q):
         cand_indices = predictions[q_idx, :n_cand]
         sc    = np.array([score_map.get((q_idx, r), 0.0) for r in range(n_cand)])
         order = np.argsort(-sc)
-        reranked[q_idx, :n_cand] = cand_indices[order]
+        reranked[q_idx, :n_cand]        = cand_indices[order]
+        reranked_scores[q_idx, :n_cand] = sc[order]
 
     logger.info("MLLM batch reranking complete.")
-    return reranked
+    return reranked, reranked_scores
+
 
 @torch.no_grad()
 def rerank_by_filip(
     test_ds, predictions, img_local_descs, text_local_descs, text_attentions,
     vision_descs=None, text_descs=None, max_rerank_k=20, rerank_batch=64,
     alpha=0.0, device="cuda", skip_cls=True,
-) -> np.ndarray:
+):
+    """FILIP reranker. Returns (reranked_predictions, reranked_scores)."""
     num_db = test_ds.num_database; num_q = test_ds.num_queries
     n_cand = min(max_rerank_k, predictions.shape[1])
     D_img  = img_local_descs.shape[-1]; D_txt = text_local_descs.shape[-1]
     if D_img != D_txt:
         raise ValueError(f"FILIP: img dim ({D_img}) != text dim ({D_txt}).")
     logger.info(f"FILIP reranking top-{n_cand} for {num_q} queries")
-    reranked = predictions.copy()
+    reranked        = predictions.copy()
+    reranked_scores = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
+
     for q_start in tqdm(range(0, num_q, rerank_batch), desc="FILIP rerank"):
         t0    = time.perf_counter()
         q_end = min(q_start + rerank_batch, num_q); bsz = q_end - q_start
         txt_locals, txt_masks = [], []
         for q in range(q_start, q_end):
-            ds_idx = num_db+q; mask_row = text_attentions[ds_idx]
+            ds_idx = num_db + q; mask_row = text_attentions[ds_idx]
             real_len = max(int(mask_row.sum()), 1)
             txt_locals.append(text_local_descs[ds_idx][:real_len])
             txt_masks .append(mask_row         [:real_len])
         max_L = max(t.shape[0] for t in txt_locals)
-        txt_np = np.zeros((bsz,max_L,D_txt),dtype=np.float32)
-        msk_np = np.zeros((bsz,max_L),      dtype=np.float32)
-        for b,(tl,tm) in enumerate(zip(txt_locals,txt_masks)):
-            L=tl.shape[0]; txt_np[b,:L]=tl; msk_np[b,:L]=tm
+        txt_np = np.zeros((bsz, max_L, D_txt), dtype=np.float32)
+        msk_np = np.zeros((bsz, max_L),        dtype=np.float32)
+        for b, (tl, tm) in enumerate(zip(txt_locals, txt_masks)):
+            L = tl.shape[0]; txt_np[b, :L] = tl; msk_np[b, :L] = tm
         txt_t = torch.from_numpy(txt_np).to(device)
         msk_t = torch.from_numpy(msk_np).bool().to(device)
-        cand_idx = predictions[q_start:q_end,:n_cand]
-        img_np   = np.stack([img_local_descs[cand_idx[b]] for b in range(bsz)],axis=0)
-        if skip_cls: img_np = img_np[:,:,1:,:]
-        img_t    = torch.from_numpy(img_np).to(device); K=img_t.shape[1]
+        cand_idx = predictions[q_start:q_end, :n_cand]
+        img_np   = np.stack([img_local_descs[cand_idx[b]] for b in range(bsz)], axis=0)
+        if skip_cls: img_np = img_np[:, :, 1:, :]
+        img_t    = torch.from_numpy(img_np).to(device); K = img_t.shape[1]
         img_norm = F.normalize(img_t, dim=-1); txt_norm = F.normalize(txt_t, dim=-1)
-        txt_exp  = txt_norm.unsqueeze(1).expand(-1,K,-1,-1)
+        txt_exp  = txt_norm.unsqueeze(1).expand(-1, K, -1, -1)
         sim      = torch.einsum('bkld,bkpd->bklp', txt_exp, img_norm)
         max_sim  = sim.max(dim=-1).values
-        mask_exp = msk_t.unsqueeze(1).expand(-1,K,-1)
+        mask_exp = msk_t.unsqueeze(1).expand(-1, K, -1)
         max_sim  = max_sim * mask_exp
         n_real   = mask_exp.sum(dim=-1).clamp(min=1)
-        filip_scores = (max_sim.sum(dim=-1)/n_real).cpu().numpy()
+        filip_scores = (max_sim.sum(dim=-1) / n_real).cpu().numpy()
         if alpha > 0.0 and vision_descs is not None and text_descs is not None:
             for b in range(bsz):
-                q_ds_idx=num_db+q_start+b
-                q_global=text_descs[q_ds_idx]; db_globals=vision_descs[cand_idx[b]]
-                q_n=q_global/(np.linalg.norm(q_global)+1e-8)
-                db_n=db_globals/(np.linalg.norm(db_globals,axis=1,keepdims=True)+1e-8)
-                global_sim=db_n@q_n
-                def _zn(x): std=x.std(); return (x-x.mean())/(std+1e-8) if std>1e-8 else x
-                filip_scores[b]=alpha*_zn(global_sim)+(1.0-alpha)*_zn(filip_scores[b])
+                q_ds_idx = num_db + q_start + b
+                q_global = text_descs[q_ds_idx]; db_globals = vision_descs[cand_idx[b]]
+                q_n  = q_global   / (np.linalg.norm(q_global) + 1e-8)
+                db_n = db_globals / (np.linalg.norm(db_globals, axis=1, keepdims=True) + 1e-8)
+                global_sim = db_n @ q_n
+                filip_scores[b] = alpha * _zn_np(global_sim) + (1.0 - alpha) * _zn_np(filip_scores[b])
         for b in range(bsz):
-            order=np.argsort(-filip_scores[b])
-            reranked[q_start+b,:n_cand]=cand_idx[b][order]
+            order = np.argsort(-filip_scores[b])
+            reranked[q_start + b, :n_cand]        = cand_idx[b][order]
+            reranked_scores[q_start + b, :n_cand] = filip_scores[b][order]
         TIMING.record('rerank_filip_batch', bsz * n_cand, time.perf_counter() - t0)
+
     logger.info("FILIP reranking complete.")
-    return reranked
+    return reranked, reranked_scores
 
 
 @torch.no_grad()
@@ -772,117 +990,61 @@ def rerank_by_max_sim(
     test_ds, predictions, img_local_descs, text_local_descs, text_attentions,
     vision_descs=None, text_descs=None, max_rerank_k=20, rerank_batch=64,
     alpha=0.0, device="cuda", skip_cls=True,
-) -> np.ndarray:
+):
+    """MaxSim reranker. Returns (reranked_predictions, reranked_scores)."""
     num_db = test_ds.num_database; num_q = test_ds.num_queries
     n_cand = min(max_rerank_k, predictions.shape[1])
     D_img  = img_local_descs.shape[-1]; D_txt = text_local_descs.shape[-1]
     if D_img != D_txt:
         raise ValueError(f"MaxSim requires matching dims, got img={D_img} txt={D_txt}.")
     logger.info(f"MaxSim reranking top-{n_cand} for {num_q} queries")
-    reranked = predictions.copy()
+    reranked        = predictions.copy()
+    reranked_scores = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
+
     for q_start in tqdm(range(0, num_q, rerank_batch), desc="MaxSim rerank"):
         t0    = time.perf_counter()
-        q_end = min(q_start+rerank_batch,num_q); bsz=q_end-q_start
+        q_end = min(q_start + rerank_batch, num_q); bsz = q_end - q_start
         txt_locals, txt_masks = [], []
-        for q in range(q_start,q_end):
-            ds_idx=num_db+q; mask_row=text_attentions[ds_idx]
-            real_len=max(int(mask_row.sum()),1)
+        for q in range(q_start, q_end):
+            ds_idx = num_db + q; mask_row = text_attentions[ds_idx]
+            real_len = max(int(mask_row.sum()), 1)
             txt_locals.append(text_local_descs[ds_idx][:real_len])
             txt_masks .append(mask_row         [:real_len])
-        max_L=max(t.shape[0] for t in txt_locals)
-        txt_np=np.zeros((bsz,max_L,D_txt),dtype=np.float32)
-        msk_np=np.zeros((bsz,max_L),      dtype=np.float32)
-        for b,(tl,tm) in enumerate(zip(txt_locals,txt_masks)):
-            L=tl.shape[0]; txt_np[b,:L]=tl; msk_np[b,:L]=tm
-        txt_t=torch.from_numpy(txt_np).to(device)
-        msk_t=torch.from_numpy(msk_np).bool().to(device)
-        cand_idx=predictions[q_start:q_end,:n_cand]
-        img_np=np.stack([img_local_descs[cand_idx[b]] for b in range(bsz)],axis=0)
-        if skip_cls: img_np=img_np[:,:,1:,:]
-        img_t=torch.from_numpy(img_np).to(device); K=img_t.shape[1]
-        img_norm=F.normalize(img_t,dim=-1); txt_norm=F.normalize(txt_t,dim=-1)
-        txt_exp=txt_norm.unsqueeze(1).expand(-1,K,-1,-1)
-        sim=torch.einsum('bkld,bkpd->bklp',txt_exp,img_norm)
-        max_sim=sim.max(dim=-1).values
-        mask_exp=msk_t.unsqueeze(1).expand(-1,K,-1)
-        max_sim=max_sim*mask_exp; n_real=mask_exp.sum(dim=-1).clamp(min=1)
-        local_scores=(max_sim.sum(dim=-1)/n_real).cpu().numpy()
-        if alpha>0.0 and vision_descs is not None and text_descs is not None:
+        max_L = max(t.shape[0] for t in txt_locals)
+        txt_np = np.zeros((bsz, max_L, D_txt), dtype=np.float32)
+        msk_np = np.zeros((bsz, max_L),        dtype=np.float32)
+        for b, (tl, tm) in enumerate(zip(txt_locals, txt_masks)):
+            L = tl.shape[0]; txt_np[b, :L] = tl; msk_np[b, :L] = tm
+        txt_t = torch.from_numpy(txt_np).to(device)
+        msk_t = torch.from_numpy(msk_np).bool().to(device)
+        cand_idx = predictions[q_start:q_end, :n_cand]
+        img_np   = np.stack([img_local_descs[cand_idx[b]] for b in range(bsz)], axis=0)
+        if skip_cls: img_np = img_np[:, :, 1:, :]
+        img_t    = torch.from_numpy(img_np).to(device); K = img_t.shape[1]
+        img_norm = F.normalize(img_t, dim=-1); txt_norm = F.normalize(txt_t, dim=-1)
+        txt_exp  = txt_norm.unsqueeze(1).expand(-1, K, -1, -1)
+        sim      = torch.einsum('bkld,bkpd->bklp', txt_exp, img_norm)
+        max_sim  = sim.max(dim=-1).values
+        mask_exp = msk_t.unsqueeze(1).expand(-1, K, -1)
+        max_sim  = max_sim * mask_exp
+        n_real   = mask_exp.sum(dim=-1).clamp(min=1)
+        local_scores = (max_sim.sum(dim=-1) / n_real).cpu().numpy()
+        if alpha > 0.0 and vision_descs is not None and text_descs is not None:
             for b in range(bsz):
-                q_ds_idx=num_db+q_start+b
-                q_global=text_descs[q_ds_idx]; db_globals=vision_descs[cand_idx[b]]
-                q_n=q_global/(np.linalg.norm(q_global)+1e-8)
-                db_n=db_globals/(np.linalg.norm(db_globals,axis=1,keepdims=True)+1e-8)
-                global_sim=db_n@q_n
-                def _zn(x): std=x.std(); return (x-x.mean())/(std+1e-8) if std>1e-8 else x
-                local_scores[b]=alpha*_zn(global_sim)+(1.0-alpha)*_zn(local_scores[b])
+                q_ds_idx = num_db + q_start + b
+                q_global = text_descs[q_ds_idx]; db_globals = vision_descs[cand_idx[b]]
+                q_n  = q_global   / (np.linalg.norm(q_global) + 1e-8)
+                db_n = db_globals / (np.linalg.norm(db_globals, axis=1, keepdims=True) + 1e-8)
+                global_sim = db_n @ q_n
+                local_scores[b] = alpha * _zn_np(global_sim) + (1.0 - alpha) * _zn_np(local_scores[b])
         for b in range(bsz):
-            order=np.argsort(-local_scores[b])
-            reranked[q_start+b,:n_cand]=cand_idx[b][order]
+            order = np.argsort(-local_scores[b])
+            reranked[q_start + b, :n_cand]        = cand_idx[b][order]
+            reranked_scores[q_start + b, :n_cand] = local_scores[b][order]
         TIMING.record('rerank_maxsim_batch', bsz * n_cand, time.perf_counter() - t0)
+
     logger.info("MaxSim reranking complete.")
-    return reranked
-
-
-@torch.no_grad()
-def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
-                               vision_descriptors, text_descriptors,
-                               img_local_descs, text_local_desc,
-                               text_tokens_all=None, text_attentions=None,
-                               K=20, device="cuda"):
-    head = getattr(model.single_encoder, "filip_loss", None)
-    if head is None:
-        logger.warning("No filip_loss head; skipping diagnostic."); return
-    head.to(device).eval()
-    has_cls=getattr(model.single_encoder,"has_cls",True)
-    use_idf=getattr(head,"use_idf",False) and text_tokens_all is not None
-    dtype=next(head.parameters()).dtype
-    nd,nq=test_ds.num_database,test_ds.num_queries
-    K=min(K,predictions.shape[1])
-    img_l=torch.from_numpy(img_local_descs).to(device)
-    txt_l=torch.from_numpy(text_local_desc).to(device)
-    G=scores[:,:K].astype(np.float64); Fm=np.zeros((nq,K),dtype=np.float64)
-    for q in tqdm(range(nq),desc="filip-vs-global"):
-        gi=nd+q
-        if text_attentions is not None:
-            m=torch.from_numpy(text_attentions[gi]).to(device).bool()
-        else:
-            m=txt_l[gi].abs().sum(-1)>0
-        if m.sum()==0: continue
-        t=head.text_proj(_maybe(head,"t_norm",txt_l[gi][m].unsqueeze(0).to(dtype)))
-        t=F.normalize(t,dim=-1).squeeze(0)
-        if use_idf:
-            ids=torch.from_numpy(text_tokens_all[gi]).to(device)[m]
-            w=head.idf_weights[ids.clamp(0,head.idf_weights.numel()-1)].to(t.dtype)
-        else:
-            w=torch.ones(t.shape[0],device=device,dtype=t.dtype)
-        w=w/w.sum().clamp(min=1e-6)
-        cand=predictions[q,:K]; v=img_l[cand]
-        if has_cls: v=v[:,1:]
-        v=F.normalize(head.vision_proj(_maybe(head,"v_norm",v.to(dtype))),dim=-1)
-        sim=torch.einsum('nd,kmd->knm',t,v)
-        Fm[q]=(sim.max(dim=-1).values*w.unsqueeze(0)).sum(-1).float().cpu().numpy()
-    def _rank(a): return np.argsort(np.argsort(a,axis=1),axis=1).astype(np.float64)
-    def _rowcorr(a,b):
-        a=a-a.mean(1,keepdims=True); b=b-b.mean(1,keepdims=True)
-        den=(np.sqrt((a**2).sum(1))*np.sqrt((b**2).sum(1))); ok=den>1e-12
-        return ((a*b).sum(1)[ok]/den[ok]).mean()
-    logger.info("="*62)
-    logger.info(f"FILIP vs GLOBAL on the same top-{K} shortlist, {nq} queries")
-    logger.info(f"  pearson  (within-query) : {_rowcorr(Fm,G):+.4f}")
-    logger.info(f"  spearman (within-query) : {_rowcorr(_rank(Fm),_rank(G)):+.4f}")
-    logger.info(f"  top-1 agreement         : {(Fm.argmax(1)==0).mean():.3f}")
-    if getattr(test_ds,'get_positives',None) is not None:
-        pos=[set(np.asarray(p).ravel().tolist()) for p in test_ds.get_positives()]
-        g_ok=np.array([predictions[q,0] in pos[q] for q in range(nq)])
-        f_ok=np.array([predictions[q,int(Fm[q].argmax())] in pos[q] for q in range(nq)])
-        in_k=np.array([len(pos[q]&set(predictions[q,:K].tolist()))>0 for q in range(nq)])
-        repairable=(~g_ok)&in_k
-        logger.info(f"  R@1 global    : {100*g_ok.mean():.2f}")
-        logger.info(f"  R@1 filip     : {100*f_ok.mean():.2f}")
-        logger.info(f"  repaired      : {100*(f_ok&repairable).sum()/max(repairable.sum(),1):.2f}%")
-        logger.info(f"  damaged       : {100*((~f_ok)&g_ok).sum()/max(g_ok.sum(),1):.2f}%")
-    logger.info("="*62)
+    return reranked, reranked_scores
 
 
 @torch.no_grad()
@@ -890,7 +1052,8 @@ def rerank_by_internvl(
     test_ds, predictions, retrieval_scores, internvl_ckpt,
     max_rerank_k=20, rerank_batch=8, alpha=0.5,
     image_size=224, device='cuda',
-) -> np.ndarray:
+):
+    """InternVL2 reranker. Returns (reranked_predictions, reranked_scores)."""
     from train_internvl_probe import InternVLRerankerLightning
     from torchvision import transforms
     from PIL import Image as PILImage
@@ -906,42 +1069,113 @@ def rerank_by_internvl(
     q_texts      = test_ds.descriptions[num_db:]
     if len(q_texts) == 0:
         logger.warning("rerank_by_internvl: no query descriptions — skipping.")
-        return predictions.copy()
+        return predictions.copy(), None
     transform = transforms.Compose([
         transforms.Resize((image_size, image_size),
                           interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225)),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
     logger.info(f"InternVL2 reranking top-{n_cand} for {num_q} queries "
                 f"(batch={rerank_batch}, alpha={alpha})")
-    reranked = predictions.copy()
+    reranked        = predictions.copy()
+    reranked_scores = np.full((num_q, predictions.shape[1]), np.nan, dtype=np.float32)
+
     with torch.no_grad():
         for q_start in tqdm(range(0, num_q, rerank_batch), desc="InternVL2 rerank"):
             t0    = time.perf_counter()
-            q_end = min(q_start+rerank_batch, num_q); bsz = q_end-q_start
+            q_end = min(q_start + rerank_batch, num_q); bsz = q_end - q_start
             cand_idx = predictions[q_start:q_end, :n_cand]
             imgs_flat, texts_flat = [], []
             for b in range(bsz):
-                qt = q_texts[q_start+b]
+                qt = q_texts[q_start + b]
                 for k in range(n_cand):
                     img = transform(PILImage.open(
-                        db_img_paths[cand_idx[b,k]]).convert('RGB'))
+                        db_img_paths[cand_idx[b, k]]).convert('RGB'))
                     imgs_flat.append(img); texts_flat.append(qt)
             pv     = torch.stack(imgs_flat).to(device)
-            scores = reranker(pv, texts_flat).float().view(bsz, n_cand).cpu().numpy()
+            scores = reranker.predict(pv, texts_flat).float().view(bsz, n_cand).cpu().numpy()
             if alpha > 0.0:
                 global_scores = retrieval_scores[q_start:q_end, :n_cand]
                 for b in range(bsz):
-                    def _zn(x): std=x.std(); return (x-x.mean())/(std+1e-8) if std>1e-8 else x
-                    scores[b] = (alpha*_zn(global_scores[b].astype(np.float32))
-                                 + (1.0-alpha)*_zn(scores[b]))
+                    scores[b] = (alpha * _zn_np(global_scores[b].astype(np.float32))
+                                 + (1.0 - alpha) * _zn_np(scores[b]))
             for b in range(bsz):
-                order=np.argsort(-scores[b])
-                reranked[q_start+b,:n_cand]=cand_idx[b][order]
-            TIMING.record('rerank_internvl_batch', bsz * n_cand, time.perf_counter()-t0)
+                order = np.argsort(-scores[b])
+                reranked[q_start + b, :n_cand]        = cand_idx[b][order]
+                reranked_scores[q_start + b, :n_cand] = scores[b][order]
+            TIMING.record('rerank_internvl_batch', bsz * n_cand, time.perf_counter() - t0)
+
     logger.info("InternVL2 reranking complete.")
-    return reranked
+    return reranked, reranked_scores
+
+
+# ---------------------------------------------------------------------------
+# FILIP diagnostic (unchanged — not a reranker, no scores to return)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def filip_vs_global_diagnostic(model, test_ds, predictions, scores,
+                               vision_descriptors, text_descriptors,
+                               img_local_descs, text_local_desc,
+                               text_tokens_all=None, text_attentions=None,
+                               K=20, device="cuda"):
+    head = getattr(model.single_encoder, "filip_loss", None)
+    if head is None:
+        logger.warning("No filip_loss head; skipping diagnostic."); return
+    head.to(device).eval()
+    has_cls = getattr(model.single_encoder, "has_cls", True)
+    use_idf = getattr(head, "use_idf", False) and text_tokens_all is not None
+    dtype   = next(head.parameters()).dtype
+    nd, nq  = test_ds.num_database, test_ds.num_queries
+    K       = min(K, predictions.shape[1])
+    img_l   = torch.from_numpy(img_local_descs).to(device)
+    txt_l   = torch.from_numpy(text_local_desc).to(device)
+    G       = scores[:, :K].astype(np.float64)
+    Fm      = np.zeros((nq, K), dtype=np.float64)
+    for q in tqdm(range(nq), desc="filip-vs-global"):
+        gi = nd + q
+        if text_attentions is not None:
+            m = torch.from_numpy(text_attentions[gi]).to(device).bool()
+        else:
+            m = txt_l[gi].abs().sum(-1) > 0
+        if m.sum() == 0: continue
+        t = head.text_proj(_maybe(head, "t_norm", txt_l[gi][m].unsqueeze(0).to(dtype)))
+        t = F.normalize(t, dim=-1).squeeze(0)
+        if use_idf:
+            ids = torch.from_numpy(text_tokens_all[gi]).to(device)[m]
+            w   = head.idf_weights[ids.clamp(0, head.idf_weights.numel() - 1)].to(t.dtype)
+        else:
+            w = torch.ones(t.shape[0], device=device, dtype=t.dtype)
+        w    = w / w.sum().clamp(min=1e-6)
+        cand = predictions[q, :K]; v = img_l[cand]
+        if has_cls: v = v[:, 1:]
+        v  = F.normalize(head.vision_proj(_maybe(head, "v_norm", v.to(dtype))), dim=-1)
+        sim = torch.einsum('nd,kmd->knm', t, v)
+        Fm[q] = (sim.max(dim=-1).values * w.unsqueeze(0)).sum(-1).float().cpu().numpy()
+
+    def _rank(a): return np.argsort(np.argsort(a, axis=1), axis=1).astype(np.float64)
+    def _rowcorr(a, b):
+        a = a - a.mean(1, keepdims=True); b = b - b.mean(1, keepdims=True)
+        den = (np.sqrt((a**2).sum(1)) * np.sqrt((b**2).sum(1))); ok = den > 1e-12
+        return ((a * b).sum(1)[ok] / den[ok]).mean()
+
+    logger.info("=" * 62)
+    logger.info(f"FILIP vs GLOBAL on the same top-{K} shortlist, {nq} queries")
+    logger.info(f"  pearson  (within-query) : {_rowcorr(Fm, G):+.4f}")
+    logger.info(f"  spearman (within-query) : {_rowcorr(_rank(Fm), _rank(G)):+.4f}")
+    logger.info(f"  top-1 agreement         : {(Fm.argmax(1) == 0).mean():.3f}")
+    if getattr(test_ds, 'get_positives', None) is not None:
+        pos = [set(np.asarray(p).ravel().tolist()) for p in test_ds.get_positives()]
+        g_ok = np.array([predictions[q, 0] in pos[q] for q in range(nq)])
+        f_ok = np.array([predictions[q, int(Fm[q].argmax())] in pos[q] for q in range(nq)])
+        in_k = np.array([len(pos[q] & set(predictions[q, :K].tolist())) > 0 for q in range(nq)])
+        repairable = (~g_ok) & in_k
+        logger.info(f"  R@1 global    : {100 * g_ok.mean():.2f}")
+        logger.info(f"  R@1 filip     : {100 * f_ok.mean():.2f}")
+        logger.info(f"  repaired      : {100 * (f_ok & repairable).sum() / max(repairable.sum(), 1):.2f}%")
+        logger.info(f"  damaged       : {100 * ((~f_ok) & g_ok).sum() / max(g_ok.sum(), 1):.2f}%")
+    logger.info("=" * 62)
 
 
 # ---------------------------------------------------------------------------
@@ -984,8 +1218,8 @@ def main(args):
     if args.cross_modal == 3:
         num_img_tokens  = model.img_local_tokens
         num_text_tokens = model.txt_local_tokens
-        txt_local_dim   = model.txt_local_dim   # raw BGE dim (1024 large / 768 base)
-        img_local_dim   = model.img_local_dim   # raw DINOv2 dim (768 for ViT-B)
+        txt_local_dim   = model.txt_local_dim
+        img_local_dim   = model.img_local_dim
     else:
         num_img_tokens  = 197
         num_text_tokens = 77
@@ -1023,15 +1257,13 @@ def main(args):
         args.image_root      = "/home/shared/datasets/nordland/test"
         args.queries_csv     = "datasets/descriptions/nordland_descriptions.csv"
     elif args.data == 'sfxl':
-        args.database_folder = "/home/shared/datasets/SF-XL/processed/test/database"        
+        args.database_folder = "/home/shared/datasets/SF-XL/processed/test/database"
         args.image_root      = "/home/shared/datasets/SF-XL/processed/test"
-        # args.queries_folder  = "/home/shared/datasets/SF-XL/processed/test/queries_v1"
-        # args.queries_csv     = "datasets/descriptions/sfxl_queries_v1.csv"
         eval_conditions = [
             ("queries_v1", f"{args.image_root}/queries_v1", "datasets/descriptions/sfxl_queries_v1.csv"),
             ("queries_v2", f"{args.image_root}/queries_v2", "datasets/descriptions/sfxl_queries_v2.csv"),
             ("occlusion",  f"{args.image_root}/queries_occlusion", "datasets/descriptions/sfxl_queries_occlusion.csv"),
-            ("night",    f"{args.image_root}/queries_night", "datasets/descriptions/sfxl_queries_night.csv"),                    
+            ("night",      f"{args.image_root}/queries_night", "datasets/descriptions/sfxl_queries_night.csv"),
         ]
     elif args.data in ['svox', 'svox_all']:
         args.database_folder = "/home/shared/datasets/svox/images/test/gallery"
@@ -1117,8 +1349,7 @@ def main(args):
         skip_encoding = cache_loaded and not need_local
 
         if skip_encoding:
-            logger.info(
-                f"Stage-1 cache found — skipping gallery and query encoding.")
+            logger.info("Stage-1 cache found — skipping gallery and query encoding.")
 
         with torch.inference_mode():
             if skip_encoding:
@@ -1161,7 +1392,7 @@ def main(args):
                 desc_label = (f"Encoding {cond_name} queries"
                               if cond_name else "Extracting query descriptors")
                 t_query_start = time.perf_counter()
-                queries_subset_ds  = Subset(test_ds, list(range(num_db, num_db+num_q)))
+                queries_subset_ds  = Subset(test_ds, list(range(num_db, num_db + num_q)))
                 queries_dataloader = DataLoader(
                     dataset=queries_subset_ds,
                     num_workers=args.num_workers,
@@ -1199,28 +1430,30 @@ def main(args):
             if retrieval_predictions.shape[1] < max_results:
                 pad_w = max_results - retrieval_predictions.shape[1]
                 retrieval_predictions = np.pad(
-                    retrieval_predictions, ((0,0),(0,pad_w)), constant_values=0)
-                scores = np.pad(scores, ((0,0),(0,pad_w)), constant_values=0.0)
+                    retrieval_predictions, ((0, 0), (0, pad_w)), constant_values=0)
+                scores = np.pad(scores, ((0, 0), (0, pad_w)), constant_values=0.0)
         elif args.filip_retrieval and not skip_encoding:
             scores, retrieval_predictions = filip_full_retrieval(
                 model, test_ds, vision_descriptors, text_descriptors,
                 img_local_descs, text_local_descs, text_tokens_all,
                 max_results=max_results,
-                db_chunk=getattr(args,'filip_db_chunk',2048),
-                alpha=getattr(args,'filip_alpha',0.0),
-                db_on_gpu=getattr(args,'filip_db_on_gpu',True),
+                db_chunk=getattr(args, 'filip_db_chunk', 2048),
+                alpha=getattr(args, 'filip_alpha', 0.0),
+                db_on_gpu=getattr(args, 'filip_db_on_gpu', True),
                 device=args.device)
         elif not skip_encoding:
             scores, retrieval_predictions = get_queries_predictions(
                 model.encoder_dim, database_descriptors, all_descriptors,
                 queries_descriptors, max_results)
         else:
-            raise RuntimeError(
-                "Stage-1 cache not found but encoding was skipped.")
+            raise RuntimeError("Stage-1 cache not found but encoding was skipped.")
 
+        # ── Stage-1 cache (retrieval order, retrieval scores) ────────────────
         save_stage1_cache(
-            save_cache, retrieval_predictions, scores,
-            test_ds.images_paths[num_db:], test_ds.images_paths[:num_db],
+            save_cache,
+            retrieval_predictions, scores,
+            test_ds.images_paths[num_db:],
+            test_ds.images_paths[:num_db],
             topk=STAGE1_TOPK_SAVE)
 
         if getattr(args, 'filip_diag', 0) and not args.filip_retrieval:
@@ -1234,92 +1467,102 @@ def main(args):
                 device=args.device)
 
         reranking_predictions = retrieval_predictions.copy()
+        reranking_scores      = None
         reranking_enabled     = False
 
         if getattr(args, 'max_sim', False):
             reranking_enabled     = True
             max_rerank_k          = min(args.max_rerank, max_results)
-            reranking_predictions = rerank_by_max_sim(
+            reranking_predictions, reranking_scores = rerank_by_max_sim(
                 test_ds, reranking_predictions, img_local_descs,
                 text_local_descs, text_attentions,
-                vision_descs=vision_descriptors if getattr(args,'rerank_alpha',0.0)>0 else None,
-                text_descs  =text_descriptors   if getattr(args,'rerank_alpha',0.0)>0 else None,
+                vision_descs=vision_descriptors if getattr(args, 'rerank_alpha', 0.0) > 0 else None,
+                text_descs  =text_descriptors   if getattr(args, 'rerank_alpha', 0.0) > 0 else None,
                 max_rerank_k=max_rerank_k,
-                rerank_batch=getattr(args,'rerank_batch',64),
-                alpha=getattr(args,'rerank_alpha',0.0),
+                rerank_batch=getattr(args, 'rerank_batch', 64),
+                alpha=getattr(args, 'rerank_alpha', 0.0),
                 device=args.device,
-                skip_cls=getattr(args,'max_sim_skip_cls',True))
+                skip_cls=getattr(args, 'max_sim_skip_cls', True))
 
         if args.reranker_filip:
             reranking_enabled     = True
             max_rerank_k          = min(args.max_rerank, max_results)
-            reranking_predictions = rerank_by_filip(
+            reranking_predictions, reranking_scores = rerank_by_filip(
                 test_ds, reranking_predictions, img_local_descs,
                 text_local_descs, text_attentions,
-                vision_descs=vision_descriptors if getattr(args,'rerank_alpha',0.0)>0 else None,
-                text_descs  =text_descriptors   if getattr(args,'rerank_alpha',0.0)>0 else None,
+                vision_descs=vision_descriptors if getattr(args, 'rerank_alpha', 0.0) > 0 else None,
+                text_descs  =text_descriptors   if getattr(args, 'rerank_alpha', 0.0) > 0 else None,
                 max_rerank_k=max_rerank_k,
-                rerank_batch=getattr(args,'rerank_batch',64),
-                alpha=getattr(args,'rerank_alpha',0.0),
+                rerank_batch=getattr(args, 'rerank_batch', 64),
+                alpha=getattr(args, 'rerank_alpha', 0.0),
                 device=args.device,
-                skip_cls=getattr(args,'max_sim_skip_cls',True))
+                skip_cls=getattr(args, 'max_sim_skip_cls', True))
 
         if args.reranker_mllm:
             reranking_enabled     = True
             max_rerank_k          = min(args.max_rerank, max_results)
-            reranking_predictions = rerank_by_mllm(
+            reranking_predictions, reranking_scores = rerank_by_mllm(
                 test_ds, reranking_predictions,
                 max_rerank_k=max_rerank_k,
-                max_concurrent_requests=getattr(args, 'mllm_concurrent', 24),
-            )
+                max_concurrent_requests=getattr(args, 'mllm_concurrent', 24))
 
         if args.reranker_jev:
             reranking_enabled     = True
             max_rerank_k          = min(args.max_rerank, max_results)
-            reranking_predictions = rerank_by_jev(
+            reranking_predictions, reranking_scores = rerank_by_jev(
                 test_ds, reranking_predictions,
                 max_rerank_k=max_rerank_k,
-                batch_size=getattr(args,'jev_batch_size',32),
-                match_weight=getattr(args,'jev_match_weight',0.6),
+                batch_size=getattr(args, 'jev_batch_size', 32),
+                match_weight=getattr(args, 'jev_match_weight', 0.6),
                 device=args.device)
 
         if getattr(args, 'rerank_internvl', None):
             reranking_enabled     = True
             max_rerank_k          = min(args.max_rerank, max_results)
-            reranking_predictions = rerank_by_internvl(
+            reranking_predictions, reranking_scores = rerank_by_internvl(
                 test_ds, reranking_predictions, scores,
                 internvl_ckpt=args.rerank_internvl,
                 max_rerank_k=max_rerank_k,
-                rerank_batch=getattr(args,'internvl_batch',4),
-                alpha=getattr(args,'rerank_alpha',0.0),
+                rerank_batch=getattr(args, 'internvl_batch', 4),
+                alpha=getattr(args, 'rerank_alpha', 0.0),
                 image_size=args.image_size,
                 device=args.device)
 
-        if getattr(args,'reranker',False) and args.cross_modal==3 \
-                and args.max_sim==0:
+        if getattr(args, 'reranker', False) and args.cross_modal == 3 \
+                and args.max_sim == 0:
             reranking_enabled     = True
             max_rerank_k          = min(args.max_rerank, max_results)
-            reranking_predictions = rerank_by_lavpr(
+            reranking_predictions, reranking_scores = rerank_by_lavpr(
                 model, test_ds, reranking_predictions,
                 img_local_descs, text_local_descs, text_attentions,
                 vision_descs=vision_descriptors, text_descs=text_descriptors,
                 max_rerank_k=max_rerank_k,
-                rerank_batch=getattr(args,'rerank_batch',64),
-                alpha=getattr(args,'rerank_alpha',0.0),
+                rerank_batch=getattr(args, 'rerank_batch', 64),
+                alpha=getattr(args, 'rerank_alpha', 0.0),
                 device=args.device)
 
         if not reranking_enabled and (
-            bool(getattr(args,'reranker',       False))
-            or bool(getattr(args,'reranker_filip',False))
-            or bool(getattr(args,'reranker_mllm', False))
-            or bool(getattr(args,'reranker_jev',  False))
+            bool(getattr(args, 'reranker',       False))
+            or bool(getattr(args, 'reranker_filip', False))
+            or bool(getattr(args, 'reranker_mllm',  False))
+            or bool(getattr(args, 'reranker_jev',   False))
         ):
             reranking_enabled = True
 
         if reranking_enabled:
+            # ── Stage-2 cache (rerank order, rerank scores) ──────────────────
             save_rerank_cache(
                 log_dir / f"stage2_cache{cache_suffix}.csv",
-                reranking_predictions, None,
+                reranking_predictions, reranking_scores,
+                test_ds.images_paths[num_db:],
+                test_ds.images_paths[:num_db],
+                topk=STAGE1_TOPK_SAVE)
+
+            # ── Combined cache (retrieval order, both scores side-by-side) ───
+            save_combined_cache(
+                log_dir / f"combined_cache{cache_suffix}.csv",
+                retrieval_predictions, scores,
+                reranking_predictions, reranking_scores,
                 test_ds.images_paths[num_db:],
                 test_ds.images_paths[:num_db],
                 topk=STAGE1_TOPK_SAVE)
@@ -1328,7 +1571,7 @@ def main(args):
             final_predictions = (reranking_predictions
                                  if reranking_enabled else retrieval_predictions)
             test_ds.save_predictions(
-                final_predictions, log_dir/"msls_challenge_predictions.txt", k=25)
+                final_predictions, log_dir / "msls_challenge_predictions.txt", k=25)
         else:
             if args.use_labels:
                 positives_per_query = test_ds.get_positives()
@@ -1342,7 +1585,7 @@ def main(args):
                                 rec[i:] += 1; break
                     rec   = rec / test_ds.num_queries * 100
                     r_str = ", ".join([f"R@{val}: {r:.1f}"
-                                      for val,r in zip(args.recall_values,rec)])
+                                      for val, r in zip(args.recall_values, rec)])
                     return rec, r_str
 
                 retrieval_recalls, retrieval_recalls_str = compute_recalls(
@@ -1361,6 +1604,18 @@ def main(args):
                     all_cond_results.append(
                         (cond_name or "Overall",
                          retrieval_recalls_str, reranking_recalls_str))
+
+                    # ── Offline alpha ablation ────────────────────────────────
+                    if getattr(args, 'ablate_alpha', False):
+                        combined = load_combined_cache(
+                            log_dir / f"combined_cache{cache_suffix}.csv",
+                            test_ds.images_paths[:num_db])
+                        ablate_alpha(
+                            combined,
+                            positives_per_query=positives_per_query,
+                            recall_values=args.recall_values,
+                            alphas=getattr(args, 'ablate_alphas', None),
+                            normalize=getattr(args, 'ablate_norm', 'zscore'))
                 else:
                     logger.info(f"{prefix}Retrieval Recall: {retrieval_recalls_str}")
                     print(f"{prefix}Retrieval Recall: {retrieval_recalls_str}")
@@ -1387,15 +1642,15 @@ def main(args):
             save_dir = log_dir / cond_name if cond_name else log_dir
             save_dir.mkdir(parents=True, exist_ok=True)
             visualizations.save_preds(
-                final_predictions[:,:args.num_preds_to_save], test_ds,
+                final_predictions[:, :args.num_preds_to_save], test_ds,
                 save_dir, args.save_only_wrong_preds, args.use_labels,
                 test_ds.images_paths_csv, texts=test_ds.descriptions)
 
     if len(eval_conditions) > 1 and all_retrieval_recalls:
         mean_retrieval     = np.mean(all_retrieval_recalls, axis=0)
         mean_retrieval_str = ", ".join([f"R@{val}: {r:.1f}"
-                                        for val,r in zip(args.recall_values,
-                                                         mean_retrieval)])
+                                        for val, r in zip(args.recall_values,
+                                                          mean_retrieval)])
         header = (f"\n{'='*75}\n  SVOX Evaluation Summary "
                   f"(All {len(eval_conditions)} Conditions)\n{'='*75}")
         logger.info(header); print(header)
@@ -1410,8 +1665,8 @@ def main(args):
         if reranking_enabled and all_reranking_recalls:
             mean_reranking     = np.mean(all_reranking_recalls, axis=0)
             mean_reranking_str = ", ".join([f"R@{val}: {r:.1f}"
-                                            for val,r in zip(args.recall_values,
-                                                             mean_reranking)])
+                                            for val, r in zip(args.recall_values,
+                                                              mean_reranking)])
             mean_line = (f"  {'MEAN':<10} | Retrieval: {mean_retrieval_str} "
                          f"| Reranking: {mean_reranking_str}")
             logger.info(mean_line); print(mean_line)
@@ -1428,7 +1683,7 @@ def main(args):
         footer = f"{'='*75}\n"
         logger.info(footer); print(footer)
 
-    # ---- Print timing summary -----------------------------------------------
+    # ── Timing summary ────────────────────────────────────────────────────────
     timing_str = TIMING.summary()
     logger.info(timing_str)
     print(timing_str)
