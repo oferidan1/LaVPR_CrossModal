@@ -32,9 +32,9 @@ def parse_arguments():
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/msls/val/database")    
     # parser.add_argument("--queries_folder", type=str, default="/home/shared/datasets/msls/val/query")   
     # parser.add_argument("--image_root", type=str, default="/home/shared/datasets/msls/val/")    
-    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions.csv")
-    # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_fixed_1.csv")    
-    # # # #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_blur.csv")
+    # # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions.csv")
+    # # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_fixed_1.csv")    
+    # # # # #parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_blur.csv")
     # parser.add_argument("--queries_csv", type=str, default="datasets/descriptions/msls_val_descriptions_weather.csv")
 
     # parser.add_argument("--database_folder", type=str, default="/home/shared/datasets/msls_challenge")    

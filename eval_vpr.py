@@ -949,10 +949,16 @@ def main(args):
         args.image_root      = "/home/shared/datasets/nordland/test"
         args.queries_csv     = "datasets/descriptions/nordland_descriptions.csv"
     elif args.data == 'sfxl':
-        args.database_folder = "/home/shared/datasets/SF-XL/processed/test/database"
-        args.queries_folder  = "/home/shared/datasets/SF-XL/processed/test/queries_v1"
+        args.database_folder = "/home/shared/datasets/SF-XL/processed/test/database"        
         args.image_root      = "/home/shared/datasets/SF-XL/processed/test"
-        args.queries_csv     = "datasets/descriptions/sfxl_queries_v1.csv"
+        # args.queries_folder  = "/home/shared/datasets/SF-XL/processed/test/queries_v1"
+        # args.queries_csv     = "datasets/descriptions/sfxl_queries_v1.csv"
+        eval_conditions = [
+            ("queries_v1", f"{args.image_root}/queries_v1", "datasets/descriptions/sfxl_queries_v1.csv"),
+            ("queries_v2", f"{args.image_root}/queries_v2", "datasets/descriptions/sfxl_queries_v2.csv"),
+            ("occlusion",  f"{args.image_root}/queries_occlusion", "datasets/descriptions/sfxl_queries_occlusion.csv"),
+            ("night",    f"{args.image_root}/queries_night", "datasets/descriptions/sfxl_queries_night.csv"),                    
+        ]
     elif args.data in ['svox', 'svox_all']:
         args.database_folder = "/home/shared/datasets/svox/images/test/gallery"
         args.image_root      = "/home/shared/datasets/svox/images/test"

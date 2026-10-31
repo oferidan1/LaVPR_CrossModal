@@ -380,7 +380,7 @@ class InternVLReranker(nn.Module):
             return_tensors     = 'pt',
             padding            = True,
             truncation         = True,
-            max_length         = 256,
+            max_length         = 512,
             add_special_tokens = True,
         ).to(device)                                   # (B, L_text)
 

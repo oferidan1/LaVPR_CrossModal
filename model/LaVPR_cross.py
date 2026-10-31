@@ -348,7 +348,7 @@ class LaVPR_cross(pl.LightningModule):
 
         img_embeds = F.normalize(self.image_proj(img_raw), p=2, dim=1)  # (B, embeds_dim)
 
-        img_local_proj = None
+        img_local_proj = img_local
         if self._filip_enabled and img_local is not None:
             # (B, N, embeds_dim), L2-normed along the last dim
             img_local_proj = F.normalize(self.image_proj_local(img_local), p=2, dim=-1)
@@ -381,7 +381,7 @@ class LaVPR_cross(pl.LightningModule):
         text_embeds = F.normalize(self.text_proj(text_raw), p=2, dim=1)
 
         # Local projection for FILIP
-        text_local_proj = None
+        text_local_proj = text_local
         if self._filip_enabled:
             text_local_proj = F.normalize(self.text_proj_local(text_local), p=2, dim=-1)
 
