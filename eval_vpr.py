@@ -1240,7 +1240,8 @@ def main(args):
         args.database_folder = "/home/shared/datasets/pitts30k/images/val/database"
         args.queries_folder  = "/home/shared/datasets/pitts30k/images/val/queries"
         args.image_root      = "/home/shared/datasets/pitts30k/images/val"
-        args.queries_csv     = "datasets/descriptions/pitts30k_val_800_queries.csv"
+        #args.queries_csv     = "datasets/descriptions/pitts30k_val_800_queries.csv"
+        args.queries_csv     = "datasets/descriptions/pitts30k_val_descriptions.csv"
     elif args.data in ['msls', 'msls_val']:
         args.database_folder = "/home/shared/datasets/msls/val/database"
         args.queries_folder  = "/home/shared/datasets/msls/val/query"
@@ -1684,9 +1685,9 @@ def main(args):
         logger.info(footer); print(footer)
 
     # ── Timing summary ────────────────────────────────────────────────────────
-    timing_str = TIMING.summary()
-    logger.info(timing_str)
-    print(timing_str)
+    # timing_str = TIMING.summary()
+    # logger.info(timing_str)
+    # print(timing_str)
 
 
 if __name__ == "__main__":

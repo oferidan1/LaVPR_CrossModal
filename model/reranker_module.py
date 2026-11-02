@@ -20,7 +20,7 @@ Two reranker architectures available via --model_type:
 Both share the same:
   - Frozen LaVPR_cross backbone (DINOv2 + BGE)
   - Precomputed local token input (no backbone at train time)
-  - Margin / BCE loss
+  - Margin / BCE / Listwise loss
   - Training loop and validation
 """
 
@@ -384,6 +384,18 @@ class CrossModalRerankModule(pl.LightningModule):
 
     Training uses precomputed local tokens — backbone never runs at train time.
     Validation runs backbone live on Pitts30k and reports R@k before/after reranking.
+
+    Loss options (--loss_name)
+    --------------------------
+    margin   : Ranking loss — best positive must score ≥ margin above all negatives.
+               Directly optimises R@1. Easy negatives already below margin are ignored.
+
+    bce      : Binary cross-entropy — each candidate scored independently.
+               All positives contribute equally. Better for R@5/10.
+
+    listwise : Softmax cross-entropy over the full shortlist (KL divergence form).
+               Targets = uniform distribution over positives, negatives get 0.
+               Models the full ranking jointly; good when multiple positives exist.
     """
 
     def __init__(
@@ -405,8 +417,8 @@ class CrossModalRerankModule(pl.LightningModule):
         faiss_gpu:       bool  = False,
 
         # ---- Loss
-        loss_name:       str   = 'margin',        # 'margin' | 'bce'
-        margin:          float = 0.3,
+        loss_name:       str   = 'margin',        # 'margin' | 'bce' | 'listwise'
+        margin:          float = 0.3,             # used only when loss_name='margin'
 
         # ---- Optimiser
         lr:              float = 1e-4,
@@ -485,9 +497,11 @@ class CrossModalRerankModule(pl.LightningModule):
             return self._margin_loss(scores, place_ids, query_place_id)
         elif self.loss_name == 'bce':
             return self._bce_loss(scores, place_ids, query_place_id)
+        elif self.loss_name == 'listwise':
+            return self._listwise_loss(scores, place_ids, query_place_id)
         else:
             raise ValueError(f"Unknown loss '{self.loss_name}'. "
-                             f"Choose 'margin' or 'bce'.")
+                             f"Choose 'margin', 'bce', or 'listwise'.")
 
     def _margin_loss(self, scores, place_ids, query_place_id, margin=None):
         """
@@ -526,6 +540,48 @@ class CrossModalRerankModule(pl.LightningModule):
         bce        = F.binary_cross_entropy_with_logits(
             scores, labels, reduction='none')
         return (bce * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+
+    def _listwise_loss(self, scores, place_ids, query_place_id):
+        """
+        Per-query softmax cross-entropy over the full shortlist (listwise / KL form).
+
+            Loss = KL( targets || softmax(scores) )
+
+        Targets = uniform distribution over positives; negatives get 0 weight.
+        All candidates (positives and negatives) contribute to the softmax
+        denominator, so the model must jointly rank the entire shortlist.
+
+        Compared to margin loss: no hand-tuned margin, softer gradients from
+        all negatives, and naturally handles multiple positives per place.
+        Compared to BCE: models relative ordering, not just absolute scores.
+        Best when K is large (≥ 20) and there are multiple GT positives.
+        """
+        query_pid = query_place_id.unsqueeze(1)   # (B, 1)
+        is_pos    = place_ids.eq(query_pid)        # (B, K)
+        is_valid  = place_ids >= 0                 # (B, K)
+
+        total = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+        valid = 0
+
+        for b in range(scores.shape[0]):
+            pos_mask = is_pos[b] & is_valid[b]
+            neg_mask = ~is_pos[b] & is_valid[b]
+
+            if not pos_mask.any() or not neg_mask.any():
+                continue
+
+            # Include only valid entries in the softmax
+            valid_mask_b = pos_mask | neg_mask
+            scores_b     = scores[b][valid_mask_b]           # (P+N,)
+            is_pos_valid = pos_mask[valid_mask_b].float()    # (P+N,)
+
+            # Uniform target over positives
+            targets   = is_pos_valid / is_pos_valid.sum().clamp(min=1)
+            log_probs = F.log_softmax(scores_b, dim=0)
+            total     = total + -(targets * log_probs).sum()
+            valid    += 1
+
+        return total / max(valid, 1)
 
     # ------------------------------------------------------------------
     # Training step
