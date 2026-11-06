@@ -50,6 +50,7 @@ class LaVPR_wrapper():
                     map_location=args.device,
                     strict=True,
                 )
+                self.vlm_encoder.text_max_tokens_len = args.max_tokens_len
                 self.vlm_encoder = self.vlm_encoder.eval().to(args.device)
                 self.reranker_network = None
 

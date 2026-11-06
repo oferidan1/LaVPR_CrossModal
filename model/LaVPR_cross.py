@@ -20,6 +20,7 @@ _IMAGE_ENCODER_DIM = {
 _TEXT_ENCODER_DIM = {
     'bge-l': 1024,  # BAAI/bge-large-en-v1.5  (BERT-large)
     'bge-b':  768,  # BAAI/bge-base-en-v1.5   (BERT-base)
+    'bge-s':  384,  # BAAI/bge-smakk-en-v1.5   (BERT-small)
 }
 
 
@@ -174,6 +175,7 @@ class LaVPR_cross(pl.LightningModule):
 
         # ---- Optional modules
         is_llp: int = 0,
+        text_max_tokens_len=512,
     ):
         super().__init__()
 
@@ -207,6 +209,7 @@ class LaVPR_cross(pl.LightningModule):
         self.unimodal_loss = unimodal_loss
         self.pos_loss = pos_loss
         self.is_llp = is_llp
+        self.text_max_tokens_len = text_max_tokens_len
 
         # FILIP: only meaningful when the image encoder exposes patch tokens
         self._filip_enabled = (filip_loss > 0.0) and ('dinov2' in self.image_model_name)
@@ -365,7 +368,7 @@ class LaVPR_cross(pl.LightningModule):
         text_tokens      : tokenizer output dict
         """
         text_tokens = self.tokenizer(
-            text, padding=True, truncation=True, return_tensors='pt'
+            text, padding=True, truncation=True, return_tensors='pt', max_length=self.text_max_tokens_len
         ).to(self.device)
 
         model_output = self.text_encoder(
