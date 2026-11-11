@@ -45,12 +45,13 @@ def parse_arguments():
     a("--lora_r",              type=int,   default=64,                                                     help="LoRA rank")
     # Loss
     a("--loss_name",           type=str,   default="MultiSimilarityLossCM",                               help="loss function name")
-    a("--unimodal_loss",       type=float, default=0.0,                                                    help="auxiliary unimodal text loss weight (0=disabled)")
-    a("--pos_loss",            type=int,   default=0,                                                      help="positive-flip loss: 0=no / 1=yes")
+    a("--unimodal_loss",       type=float, default=0.0,       help="auxiliary unimodal text loss weight (0=disabled)")
+    a("--pos_loss",            type=int,   default=0,         help="positive-flip loss: 0=no / 1=yes")
     # Misc
-    a("--resume",              type=str,   default=None,                                                   help="checkpoint path to resume from")
-    a("--is_llp",              type=int,   default=0,                                                      help="LLP (CLS-reweighting) pooling: 0=no / 1=yes")
-    a("--filip_loss",          type=float,   default=0,                                                    help="filip loss : 0=no / 1=yes")
+    a("--resume",              type=str,   default=None,      help="checkpoint path to resume from")
+    a("--is_llp",              type=int,   default=0,         help="LLP (CLS-reweighting) pooling: 0=no / 1=yes")
+    a("--filip_loss",          type=float,   default=0,       help="filip loss : 0=no / 1=yes")
+    a("--vlm_image_only",      type=int,   default=0,           help="Use only the VLM vision encoder (clip/longclip) paired with BGE: 0=no / 1=yes")
     
 
     return parser.parse_args()
@@ -109,7 +110,8 @@ if __name__ == '__main__':
         unimodal_loss=args.unimodal_loss,
         pos_loss=args.pos_loss,
         is_llp=args.is_llp,
-        filip_loss=args.filip_loss
+        filip_loss=args.filip_loss,
+        vlm_image_only=args.vlm_image_only
     )
 
     if args.resume is not None:

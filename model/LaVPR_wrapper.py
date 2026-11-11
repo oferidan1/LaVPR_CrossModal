@@ -55,12 +55,14 @@ class LaVPR_wrapper():
                 self.reranker_network = None
 
             # Expose local token dims for eval buffer allocation
-            from model.LaVPR_cross import _IMAGE_ENCODER_DIM, _text_hidden_dim
-            img_key               = self.vlm_encoder.image_model_name
-            self.img_local_dim    = _IMAGE_ENCODER_DIM.get(img_key, 768)
+            #from model.LaVPR_cross import _IMAGE_ENCODER_DIM, _text_hidden_dim
+            # img_key               = self.vlm_encoder.image_model_name
+            # self.img_local_dim    = _IMAGE_ENCODER_DIM.get(img_key, 768)
             self.img_local_tokens = 256   # DINOv2-B at 224px (14x14 patches)
-            self.txt_local_dim    = _text_hidden_dim(self.vlm_encoder.text_model_name)
+            # self.txt_local_dim    = _text_hidden_dim(self.vlm_encoder.text_model_name)
             self.txt_local_tokens = 512   # BGE max sequence length
+            self.img_local_dim    = self.vlm_encoder.image_proj.in_features
+            self.txt_local_dim    = self.vlm_encoder.text_proj.in_features
 
         elif args.cross_modal == 4:
             # ---- LaVPR_text: frozen BGE + Conv adapter, text-only retrieval ----
